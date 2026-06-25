@@ -1,27 +1,4 @@
 # Standard library
-from risk_modeling.mandelbrot import scan_market
-from risk_modeling import AlphaRiskEngine, calculate_mansfield_rs, monitor_mean_reversion, calculate_rs_bollinger_bands, get_rs_signals, detect_rs_hook
-from data_pipeline import get_daily_returns, get_price_history, get_price_history_with_benchmark, get_premarket_data, get_live_intraday
-from frontier_plots import plot_institutional_frontier
-import numpy as np
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-import statsmodels.api as sm
-import streamlit as st
-import appdirs as ad
-import requests
-import yfinance as yf
-import yaml
-from sklearn.covariance import LedoitWolf
-from pypfopt import (
-    black_litterman,
-    risk_models,
-    BlackLittermanModel,
-    EfficientFrontier,
-    objective_functions,
-)
-from enable_repo_root import ensure_repo_root
 import datetime
 import os
 import sys
@@ -32,10 +9,35 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+# Repository startup helper
+from enable_repo_root import ensure_repo_root
 ensure_repo_root(REPO_ROOT)
 
-
 # Third-party libraries
+import appdirs as ad
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import requests
+import streamlit as st
+import statsmodels.api as sm
+import yfinance as yf
+import yaml
+from sklearn.covariance import LedoitWolf
+from pypfopt import (
+    black_litterman,
+    risk_models,
+    BlackLittermanModel,
+    EfficientFrontier,
+    objective_functions,
+)
+
+# Local application modules
+from frontier_plots import plot_institutional_frontier
+from data_pipeline import get_daily_returns, get_price_history, get_price_history_with_benchmark, get_premarket_data, get_live_intraday
+from risk_modeling import AlphaRiskEngine, calculate_mansfield_rs, monitor_mean_reversion, calculate_rs_bollinger_bands, get_rs_signals, detect_rs_hook
+from risk_modeling.mandelbrot import scan_market
 
 # Apply default request headers for all requests sessions so yfinance uses headers
 DEFAULT_REQUEST_HEADERS = {
@@ -947,10 +949,11 @@ with tab9:
                 f"**Last Update:** {datetime.datetime.now().strftime('%H:%M:%S')} EST")
 
             # 4. Display Professional Price Table
-            
+
             df_live = pd.DataFrame(price_report).sort_values(
                 by="Day Change (%)", ascending=False)
             df_live.dropna(subset=['Current Price'], inplace=True)
+
             def style_live_report(val):
                 if isinstance(val, float):
                     color = 'green' if val > 0 else 'red'
