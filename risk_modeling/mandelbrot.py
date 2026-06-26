@@ -3,12 +3,30 @@ import warnings
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from scipy.stats import linregress
+from scipy.stats import linregress, norm
 from datetime import datetime, timedelta
+from pathlib import Path
 import pytz
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = REPO_ROOT / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _get_cache_path(file_name: str) -> Path:
+    target_path = DATA_DIR / file_name
+    legacy_paths = [Path(file_name), REPO_ROOT / file_name]
+    for legacy_path in legacy_paths:
+        if legacy_path.exists() and legacy_path != target_path:
+            try:
+                legacy_path.replace(target_path)
+            except OSError:
+                pass
+    return target_path
+
 # ============================================================================
 # 1. PARAMETERS & THRESHOLDS
 # ============================================================================
@@ -114,7 +132,7 @@ def calculate_tail_index_robust(returns: np.ndarray, lookback: int = 500):
 
 def get_data_persistent(ticker, interval="1m", period="2y"):
     """Bridges the Yahoo 7-day limit for 1m data using local Parquet files."""
-    file_path = f"cache_{ticker}_{interval}.csv"
+    file_path = _get_cache_path(f"cache_{ticker}_{interval}.csv")
     now = datetime.now(pytz.utc)
 
     if os.path.exists(file_path):
@@ -184,48 +202,72 @@ def calculate_shannon_entropy(returns, bins=10):
 
 def calculate_vpin_lite(returns, volumes, window=50):
     """
-    Safe VPIN: Returns 0.5 (Neutral) if volume is missing.
+    Quiet Markets: VPIN will oscillate between 0.15 and 0.40.
+    Trending Markets: VPIN will move toward 0.50 - 0.70.
+    Toxic/Pre-Crash (The SPY scenario): VPIN will climb above 0.80.
     """
-    if len(returns) < window:
+    
+    r = np.array(returns[-window:])
+    v = np.array(volumes[-window:])
+
+    # 1. Calculate rolling volatility (std dev of returns)
+    # We need this to know if a move is "large" or "small"
+    sigma = np.std(r)
+    if sigma < 1e-9: # Avoid division by zero in flat markets
         return 0.5
-    r = returns[-window:]
-    v = volumes[-window:]
 
+    # 2. Bulk Volume Classification (BVC) 
+    # This splits volume: e.g., a small move up might be 55% buy, 45% sell.
+    # A massive move up might be 99% buy, 1% sell.
+    buy_fraction = norm.cdf(r / sigma)
+    
+    buy_v = v * buy_fraction
+    sell_v = v * (1 - buy_fraction)
+
+    # 3. Calculate Imbalance
     total_vol = np.sum(v)
-
-    # FIX: Check for Zero Volume to avoid NaN
     if total_vol < 1e-9:
-        return 0.5  # Return neutral if no volume data exists
+        return 0.5
 
-    # Estimate Buy/Sell Volume based on price change sign
-    buy_vol = np.where(r > 0, v, 0)
-    sell_vol = np.where(r < 0, v, 0)
-
-    imbalance = np.abs(buy_vol - sell_vol)
-    vpin = np.sum(imbalance) / total_vol
+    oi_imbalance = np.abs(buy_v - sell_v)
+    vpin = np.sum(oi_imbalance) / total_vol
+    
     return vpin
 
 
-def calculate_cvd_proxy(data_df, window=100):
-    """
-    Safe CVD: Returns 0 slope if volume is missing.
-    """
+def calculate_cvd_refined(data_df, window=100):
     df = data_df.tail(window).copy()
+    if len(df) < window or df['Volume'].sum() < 1e-9:
+        return 0.0, 0.0
 
-    # Check if we have any volume at all
-    if df['Volume'].sum() < 1e-9:
-        return 0.0, 0.0  # No volume = No delta
-
-    # Standard CVD logic
-    midpoint = (df['High'] + df['Low']) / 2
-    denominator = (df['High'] - df['Low'] + 1e-10)
-    multiplier = ((df['Close'] - df['Low']) -
-                  (df['High'] - df['Close'])) / denominator
-    delta = multiplier * df['Volume']
+    # 1. Use BVC for better Delta (aligns with your VPIN)
+    returns = df['Close'].pct_change().fillna(0)
+    sigma = returns.std() + 1e-10
+    
+    # Probability of buy volume (0 to 1)
+    buy_prob = norm.cdf(returns / sigma)
+    delta = (2 * buy_prob - 1) * df['Volume'] # Scales from -Volume to +Volume
+    
     cvd = delta.cumsum()
 
-    cvd_slope = linregress(np.arange(len(cvd)), cvd.values).slope
-    return cvd_slope, cvd.iloc[-1]
+    # 2. Normalize CVD to handle scaling (Z-score or Min-Max)
+    # We want to know the "direction" regardless of total volume
+    cvd_array = cvd.values
+    x = np.arange(len(cvd_array))
+    
+    # Calculate Slope
+    slope, intercept, r_value, p_value, std_err = linregress(x, cvd_array)
+    
+    # 3. Sensitivity Adjustment: The "CVD Intensity"
+    # Instead of raw slope, use the R-squared or Correlation Coefficient
+    # This tells you how "solid" the CVD trend is.
+    # If r_value is -0.9, the CVD is crashing in a perfect line.
+    
+    # Normalize slope by the average volume to make it asset-agnostic
+    avg_vol = df['Volume'].mean()
+    normalized_slope = slope / avg_vol 
+
+    return normalized_slope, r_value
 
 # ============================================================================
 # UPDATED SCANNER WITH JUDGMENT LOGIC
@@ -233,23 +275,58 @@ def calculate_cvd_proxy(data_df, window=100):
 
 
 def compute_judgment(prices, volumes, data_1m, h_val, alpha):
+    """
+    Refined Market Regime Judgment Engine
+    """
+    # 1. Fetch Core Metrics
     returns = np.diff(np.log(prices))
-    cvd_slope, _ = calculate_cvd_proxy(data_1m)
+    cvd_slope, cvd_confidence = calculate_cvd_refined(data_1m) # Using the R-Value/Confidence
     entropy = calculate_shannon_entropy(returns[-200:])
-    vpin = calculate_vpin_lite(returns, volumes[-len(returns):])
+    vpin = calculate_vpin_lite(returns, volumes[-len(returns):]) # Using BVC version
+    
+    # 2. Determine Price Direction (Last 10 bars)
+    price_change = (prices[-1] - prices[-10]) / prices[-10]
+    is_price_up = price_change > 0.001  # 0.1% threshold to avoid noise
+    is_price_down = price_change < -0.001
+    
+    # 3. Define Thresholds
+    CVD_THRESHOLD = 0.05       # Minimum slope to care about
+    CONFIDENCE_THRESHOLD = 0.5 # Minimum R-Value to trust CVD
+    VPIN_TOXIC = 0.75          # Level where liquidity becomes fragile
+    
+    # 4. Hierarchical Judgment Logic
+    judgment = "NEUTRAL / STABLE"
 
-    judgment = "STABLE"
+    # --- REGIME A: THE TOXIC TRAP (Highest Priority) ---
+    if vpin > VPIN_TOXIC:
+        if is_price_up and cvd_slope < -CVD_THRESHOLD:
+            judgment = "TOXIC DISTRIBUTION (Price up, but Smart Money is exiting aggressively)"
+        elif is_price_down and cvd_slope > CVD_THRESHOLD:
+            judgment = "TOXIC ACCUMULATION (Price down, but Smart Money is absorbing everything)"
+        else:
+            judgment = "TOXIC FLOW (High probability of a structural Jump soon)"
 
-    if len(prices) >= 10 and prices[-1] < prices[-10] and cvd_slope > 0:
-        judgment = "BULLISH ABSORPTION (Institutions are buying the dip)"
-    elif len(prices) >= 10 and prices[-1] > prices[-10] and cvd_slope < 0:
-        judgment = "BEARISH EXHAUSTION (Retail is chasing, Big Money is exiting)"
+    # --- REGIME B: DIVERGENCE (Medium Priority) ---
+    elif abs(cvd_slope) > CVD_THRESHOLD and cvd_confidence > CONFIDENCE_THRESHOLD:
+        if is_price_up and cvd_slope < -CVD_THRESHOLD:
+            judgment = "BEARISH DIVERGENCE (Weak rally, lack of aggressive buyers)"
+        elif is_price_down and cvd_slope > CVD_THRESHOLD:
+            judgment = "BULLISH ABSORPTION (Institutional buying support detected)"
+        elif is_price_up and cvd_slope > CVD_THRESHOLD:
+            judgment = "HEALTHY MOMENTUM (Price and Volume are in sync)"
+        elif is_price_down and cvd_slope < -CVD_THRESHOLD:
+            judgment = "AGGRESSIVE SELLING (Trend is backed by real volume)"
 
-    if h_val > 0.60 and entropy > 3.0:
-        judgment = "NOISY TREND (Hurst is high but unreliable/chaotic)"
-
-    if vpin > 0.75:
-        judgment = "TOXIC FLOW (High probability of a structural Jump soon)"
+    # --- REGIME C: TREND QUALITY (Hurst/Entropy) ---
+    elif h_val > 0.60:
+        if entropy > 2.8: # High Entropy = Chaos
+            judgment = "NOISY TREND (Persistence is high but price action is erratic)"
+        else:
+            judgment = "BULLISH PERSISTENCE (Clean, high-confidence trend)"
+            
+    # --- REGIME D: EXHAUSTION ---
+    elif h_val < 0.45 and entropy < 2.2:
+        judgment = "MEAN REVERSION (Trend is dead, price likely to return to average)"
 
     return judgment, entropy, vpin, cvd_slope
 
@@ -261,43 +338,55 @@ def scan_with_judgment(ticker):
 # 4. MAIN SCANNER
 # ============================================================================
 
-
 def generate_suggestion(regime, judgment, entropy, alpha, h_val, vpin, cvd_slope):
     """
-    Synthesizes all fractal metrics into a concrete action.
+    Synthesizes fractal metrics into actionable institutional-grade advice.
     """
-    # 1. CRITICAL RISK CHECK (Regime 5 or Toxic Flow)
-    if "5 - TAIL RISK" in regime:
-        if "BULLISH ABSORPTION" in judgment and entropy < 1.5:
-            return "🔥 SPECULATIVE BUY", "Tail Risk is high but Institutions are absorbing the sell-off. High risk/reward."
-        if vpin > 0.80:
-            return "🚫 AVOID / EXIT", "Toxic flow and Tail Risk. The 'trapdoor' is open. Do not catch the knife."
-        return "⚠️ CAUTION / PROTECT", "Unstable regime. Tighten stops or hedge with puts."
+    
+    # --- 1. THE KILL SWITCH: TOXIC FLOW & STRUCTURAL JUMP RISK ---
+    # Toxicity overrides all other "Bullish" regimes because liquidity is failing.
+    if "TOXIC" in judgment or vpin > 0.80:
+        if "DISTRIBUTION" in judgment:
+            return "🚨 EXIT / AGGRESSIVE SELL", "Structural Jump Risk: Smart money is exiting into a hollow rally. Rug-pull imminent."
+        if "ACCUMULATE" in judgment or "ABSORPTION" in judgment:
+            return "🛡️ HEDGE / PROTECT", "Toxic flow detected during accumulation. High volatility ahead; use protective puts."
+        return "🚫 AVOID / STAY CASH", "Order flow is predatory (VPIN > 0.8). Market makers are withdrawing liquidity."
 
-    # 2. TREND PERSISTENCE CHECK (Regime 1 & 2)
+    # --- 2. TAIL RISK & EXTREME INSTABILITY (Regime 5) ---
+    if "5 - TAIL RISK" in regime:
+        if "BULLISH ABSORPTION" in judgment:
+            return "🔥 SPECULATIVE BUY", "Tail Risk is high but Institutions are catching the knife. High risk/reward."
+        return "⚠️ CAUTION", "Non-Normal return distribution. Probability of an extreme 'fat-tail' move is high."
+
+    # --- 3. TREND PERSISTENCE (Regime 1 & 2) ---
     if "1 - BULLISH PERSISTENCE" in regime:
-        if "BEARISH EXHAUSTION" in judgment:
-            return "📉 REDUCE / TAKE PROFIT", "Trend is real but Big Money is exiting into the retail chase."
-        if h_val > 0.62 and cvd_slope > 0:
-            return "🚀 STRONG BUY / HOLD", "High-conviction trend with institutional backing. Ride the memory."
+        if "BEARISH DIVERGENCE" in judgment or "DISTRIBUTION" in judgment:
+            return "📉 REDUCE / TAKE PROFIT", "Trend is real (Hurst > 0.6) but aggressive sellers are dominating the tape."
+        if "HEALTHY MOMENTUM" in judgment:
+            return "🚀 STRONG BUY / HOLD", "Price and Order Flow are in sync. High conviction uptrend."
         return "✅ HOLD / BUY DIPS", "Healthy persistent uptrend."
 
     if "2 - BEARISH PERSISTENCE" in regime:
         if "BULLISH ABSORPTION" in judgment:
-            return "⏳ WATCH FOR REVERSAL", "Downtrend is persistent but institutions are beginning to buy the floor."
-        return "🛑 SELL / SHORT", "Persistent downward memory. No sign of a bottom yet."
+            return "⏳ WATCH FOR REVERSAL", "Downtrend is persistent but smart money is building a floor. Look for Hurst to drop."
+        if "AGGRESSIVE SELLING" in judgment:
+            return "🛑 SELL / SHORT", "Downward momentum is backed by aggressive market orders. No bottom in sight."
+        return "🛑 STAY SHORT", "Persistent bearish memory."
 
-    # 3. EQUILIBRIUM CHECK (Regime 3 & 4)
-    if "4 - UNSTABLE" in regime:
-        return "🔄 SCALP ONLY", "Mean-reversion regime. Buy low, sell high within the range. No long-term trend."
+    # --- 4. QUALITY OF TREND (Entropy Check) ---
+    if "NOISY" in judgment or entropy > 2.8:
+        return "🔄 REDUCE POSITION SIZE", "Trend exists but is highly chaotic. Expect frequent stop-outs."
+
+    # --- 5. EQUILIBRIUM & MEAN REVERSION (Regime 3 & 4) ---
+    if "4 - UNSTABLE" in regime or "MEAN REVERSION" in judgment:
+        return "↕️ SCALP RANGE", "Market is mean-reverting. Sell resistance, buy support. Avoid trend-following."
 
     if "3 - NEUTRAL" in regime:
         if "BULLISH ABSORPTION" in judgment:
-            return "➕ ACCUMULATE", "Random walk but smart money is quietly building positions."
-        return "💤 NEUTRAL", "Market is a coin flip. Wait for a Hurst breakout (>0.55) or Tail Risk."
+            return "➕ ACCUMULATE", "Price is sideways but aggressive buyers are soaking up supply."
+        return "💤 NEUTRAL", "Fractal noise. Wait for Hurst to break above 0.55 or below 0.45."
 
-    return "🔎 MONITOR", "Metrics are inconclusive. Wait for fractal clarity."
-
+    return "🔎 MONITOR", "Metrics are inconclusive. Wait for fractal alignment."
 
 def scan_market(ticker, show_judgment=True):
     print(f"--- Scanning {ticker} Mandelbrot Status ---")
@@ -368,8 +457,10 @@ def scan_market(ticker, show_judgment=True):
     if show_judgment:
         judgment, entropy, vpin, cvd_slope = compute_judgment(
             prices, volumes, data_1m, h_val, alpha_eff)
+        cvd_arrow = "⬆️" if cvd_slope > 0 else "⬇️" if cvd_slope < 0 else "→"
+        cvd_label = "UP" if cvd_slope > 0 else "DOWN" if cvd_slope < 0 else "FLAT"
         print(f"Entropy: {entropy:.2f} (Low is better) | VPIN: {vpin:.2f}")
-        print(f"CVD Trend: {'UP' if cvd_slope > 0 else 'DOWN'}")
+        print(f"CVD Trend: {cvd_slope: .2f} {cvd_arrow} {cvd_label}")
         print(f"VERDICT: {judgment}")
 
         # 6. ADD SUGGESTION
@@ -385,7 +476,7 @@ def scan_market(ticker, show_judgment=True):
 if __name__ == "__main__":
     # Test on your Core Universe
     import time
-    tickers = ["MU", 'GOOG']
+    tickers = ["MU", 'SPY']
     while True:
         for t in tickers:
             scan_market(t)

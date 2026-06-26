@@ -95,6 +95,23 @@ def get_regime_icon(regime: str) -> str:
     return "❔"
 
 
+def get_cvd_icon(cvd_value: str) -> str:
+    try:
+        if isinstance(cvd_value, str):
+            if "UP" in cvd_value.upper() or "⬆️" in cvd_value:
+                return "⬆️"
+            if "DOWN" in cvd_value.upper() or "⬇️" in cvd_value:
+                return "⬇️"
+            if "FLAT" in cvd_value.upper() or "→" in cvd_value:
+                return "→"
+            # Parse fallback: numeric slope sign
+            slope = float(cvd_value.split()[0])
+            return "⬆️" if slope > 0 else "⬇️" if slope < 0 else "→"
+    except Exception:
+        pass
+    return "→"
+
+
 # --- CONFIGURATION & STYLING ---
 st.set_page_config(page_title="Alpha Risk Engine (ARE)", layout="wide")
 
@@ -998,7 +1015,8 @@ with tab9:
     st.divider()
     st.subheader("Risk Alert Portal")
     st.markdown(
-        "**Regime Icon Legend:** 🟢 Bullish | 🔴 Bearish | 🟡 Neutral | ⚠️ Unstable | 🚨 Tail Risk | 🔎 Other"
+        """**Regime Icon Legend:** 🟢 Bullish | 🔴 Bearish | 🟡 Neutral | ⚠️ Unstable | 🚨 Tail Risk | 🔎 Other  
+        **CVD Trend Icons:** ⬆️ Up | ⬇️ Down | → Flat"""
     )
     st.write(f"**Monitor List:** {', '.join(sorted(monitor_list))}")
 
@@ -1023,6 +1041,7 @@ with tab9:
             "Hurst": "N/A",
             "Tail Index": "N/A",
             "Intraday Vol": "N/A",
+            "CVD Trend": "N/A",
             "Regime": "UNKNOWN",
             "Verdict": "N/A",
             "Suggestion": "N/A",
@@ -1039,6 +1058,8 @@ with tab9:
                 parsed["Price"] = line.split("Price:")[1].strip()
             elif "Intraday Vol" in line:
                 parsed["Intraday Vol"] = line.split("Intraday Vol")[1].strip()
+            elif "CVD Trend:" in line:
+                parsed["CVD Trend"] = line.split("CVD Trend:")[1].strip()
             elif "VERDICT:" in line:
                 parsed["Verdict"] = line.split("VERDICT:")[1].strip()
             elif "SUGGESTION:" in line:
@@ -1049,6 +1070,8 @@ with tab9:
         st.write(f"**Hurst (Trend):** {parsed['Hurst']}")
         st.write(f"**Tail Index:** {parsed['Tail Index']}")
         st.write(f"**Intraday Volatility:** {parsed['Intraday Vol']}")
+        cvd_icon = get_cvd_icon(parsed['CVD Trend'])
+        st.write(f"**CVD Trend:** {parsed['CVD Trend']} {cvd_icon}")
         st.markdown("**Judgment & Suggestion**")
         st.write(
             f"**Regime:** {get_regime_icon(parsed['Regime'])} {parsed['Regime']}")
@@ -1084,6 +1107,8 @@ with tab9:
             verdict = "N/A"
             suggestion = "N/A"
             reason = "N/A"
+            cvd = "N/A"
+            cvd_icon = "→"
 
             for line in lines:
                 if "RESULT REGIME:" in line:
@@ -1098,19 +1123,23 @@ with tab9:
                     verdict = line.split("VERDICT:")[1].strip()
                 elif "SUGGESTION:" in line:
                     suggestion = line.split("SUGGESTION:")[1].strip()
+                elif "CVD Trend:" in line:
+                    cvd = line.split("CVD Trend:")[1].strip()
+                    cvd_icon = get_cvd_icon(cvd)
                 elif "REASON:" in line:
                     reason = line.split("REASON:")[1].strip()
-
-            all_signals.append({
-                "Ticker": ticker,
-                "Price": price,
-                "Hurst": hurst,
-                "Tail Index": tail_idx,
-                "Signal/Regime": f"{regime} {get_regime_icon(regime)}",
-                "Verdict": verdict,
-                "Suggestion": suggestion,
-                "Reason": reason
-            })
+            if price != "N/A" and regime != "UNKNOWN":
+                all_signals.append({
+                    "Ticker": ticker,
+                    "Price": price,
+                    "Hurst": hurst,
+                    "Tail Index": tail_idx,
+                    "CVD Trend": f"{cvd_icon} {cvd}",
+                    "Signal/Regime": f"{regime} {get_regime_icon(regime)}",
+                    "Verdict": verdict,
+                    "Suggestion": suggestion,
+                    "Reason": reason
+                })
 
         # Display signals table
         df_signals = pd.DataFrame(all_signals).sort_values(

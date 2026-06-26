@@ -6,10 +6,27 @@ import yfinance as yf
 from scipy.stats import linregress
 import time
 import os
+from pathlib import Path
 import pytz
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = REPO_ROOT / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _get_cache_path(file_name: str) -> Path:
+    target_path = DATA_DIR / file_name
+    legacy_paths = [Path(file_name), REPO_ROOT / file_name]
+    for legacy_path in legacy_paths:
+        if legacy_path.exists() and legacy_path != target_path:
+            try:
+                legacy_path.replace(target_path)
+            except OSError:
+                pass
+    return target_path
 
 # ============================================================================
 # CONFIGURATION
@@ -43,7 +60,7 @@ def get_data_persistent(ticker, interval="1m", period="2y"):
     """
     Persistent cache that handles 1m (7-day chunks) and 1d (multi-year) history.
     """
-    file_path = f"cache_{ticker}_{interval}.parquet"
+    file_path = _get_cache_path(f"cache_{ticker}_{interval}.parquet")
     now = datetime.now(pytz.utc)
 
     if interval == "1m":

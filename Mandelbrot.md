@@ -1,5 +1,4 @@
-🧠 Mandelbrot Fractal Engine: Indicator Guide
-================
+# 🧠 Mandelbrot Fractal Engine: Indicator Guide
 
 This system uses **Fractal Geometry** and **Information Theory** to identify market regimes. It moves beyond traditional "indicators" by measuring the **statistical structure** of price action.
 
