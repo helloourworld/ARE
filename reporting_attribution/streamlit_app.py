@@ -1027,57 +1027,22 @@ with tab9:
         if selected_benchmark in monitor_list else 0,
     )
     if st.button("Run Risk Alert Scan"):
-        import io
-        from contextlib import redirect_stdout
+        result = scan_market(alert_ticker)
 
-        output_buffer = io.StringIO()
-        with redirect_stdout(output_buffer):
-            scan_market(alert_ticker)
-        scanner_output = output_buffer.getvalue()
-        # st.text(scanner_output)
-
-        parsed = {
-            "Price": "N/A",
-            "Hurst": "N/A",
-            "Tail Index": "N/A",
-            "Intraday Vol": "N/A",
-            "CVD Trend": "N/A",
-            "Regime": "UNKNOWN",
-            "Verdict": "N/A",
-            "Suggestion": "N/A",
-            "Reason": "N/A"
-        }
-        for line in scanner_output.strip().split('\n'):
-            if "RESULT REGIME:" in line:
-                parsed["Regime"] = line.split("RESULT REGIME:")[1].strip()
-            elif "Hurst (Trend):" in line:
-                parsed["Hurst"] = line.split("Hurst (Trend):")[1].strip()
-            elif "Tail Index:" in line:
-                parsed["Tail Index"] = line.split("Tail Index:")[1].strip()
-            elif "Price:" in line and "Current Price" not in line:
-                parsed["Price"] = line.split("Price:")[1].strip()
-            elif "Intraday Vol" in line:
-                parsed["Intraday Vol"] = line.split("Intraday Vol")[1].strip()
-            elif "CVD Trend:" in line:
-                parsed["CVD Trend"] = line.split("CVD Trend:")[1].strip()
-            elif "VERDICT:" in line:
-                parsed["Verdict"] = line.split("VERDICT:")[1].strip()
-            elif "SUGGESTION:" in line:
-                parsed["Suggestion"] = line.split("SUGGESTION:")[1].strip()
-            elif "REASON:" in line:
-                parsed["Reason"] = line.split("REASON:")[1].strip()
-        st.write(f"**Price:** {parsed['Price']}")
-        st.write(f"**Hurst (Trend):** {parsed['Hurst']}")
-        st.write(f"**Tail Index:** {parsed['Tail Index']}")
-        st.write(f"**Intraday Volatility:** {parsed['Intraday Vol']}")
-        cvd_icon = get_cvd_icon(parsed['CVD Trend'])
-        st.write(f"**CVD Trend:** {parsed['CVD Trend']} {cvd_icon}")
+        st.write(f"**Price:** {result['Price']:.2f}")
+        st.write(f"**Hurst (Trend):** {result['Hurst']:.3f}")
+        st.write(f"**Tail Index:** {result['Tail Index']:.3f}")
+        st.write(f"**Intraday Volatility:** {result['Intraday Vol']:.5f}")
+        cvd_icon = get_cvd_icon(result['CVD Trend'])
+        st.write(f"**CVD Trend:** {result['CVD Trend']} {cvd_icon}")
         st.markdown("**Judgment & Suggestion**")
         st.write(
-            f"**Regime:** {get_regime_icon(parsed['Regime'])} {parsed['Regime']}")
-        st.write(f"**Verdict:** {parsed['Verdict']}")
-        st.write(f"**Suggestion:** {parsed['Suggestion']}")
-        st.write(f"**Reason:** {parsed['Reason']}")
+            f"**Regime:** {get_regime_icon(result['Regime'])} {result['Regime']}")
+        st.write(f"**Verdict:** {result['Verdict']}")
+        st.write(f"**Suggestion:** {result['Suggestion']}")
+        st.write(f"**Reason:** {result['Reason']}")
+        if result.get("Fragility Alert"):
+            st.error(f"⚠️ {result['Fragility Alert']} | Score: {result['Fragility Score']:.2f}")
 
     st.divider()
     st.subheader("Scan All Tickers & List Signals")
@@ -1090,55 +1055,25 @@ with tab9:
 
         all_signals = []
         for ticker in sorted(monitor_list):
-            output_buffer = io.StringIO()
-            with redirect_stdout(output_buffer):
-                try:
-                    scan_market(ticker)
-                except Exception as e:
-                    print(f"Error scanning {ticker}: {e}")
+            try:
+                result = scan_market(ticker)
+            except Exception as e:
+                print(f"Error scanning {ticker}: {e}")
+                continue
 
-            # Parse the output to extract regime signal
-            output = output_buffer.getvalue()
-            lines = output.strip().split('\n')
-            regime = "UNKNOWN"
-            hurst = "N/A"
-            tail_idx = "N/A"
-            price = "N/A"
-            verdict = "N/A"
-            suggestion = "N/A"
-            reason = "N/A"
-            cvd = "N/A"
-            cvd_icon = "→"
-
-            for line in lines:
-                if "RESULT REGIME:" in line:
-                    regime = line.split("RESULT REGIME:")[1].strip()
-                elif "Hurst (Trend):" in line:
-                    hurst = line.split("Hurst (Trend):")[1].strip()
-                elif "Tail Index:" in line:
-                    tail_idx = line.split("Tail Index:")[1].strip()
-                elif "Price:" in line and "Current Price" not in line:
-                    price = line.split("Price:")[1].strip()
-                elif "VERDICT:" in line:
-                    verdict = line.split("VERDICT:")[1].strip()
-                elif "SUGGESTION:" in line:
-                    suggestion = line.split("SUGGESTION:")[1].strip()
-                elif "CVD Trend:" in line:
-                    cvd = line.split("CVD Trend:")[1].strip()
-                    cvd_icon = get_cvd_icon(cvd)
-                elif "REASON:" in line:
-                    reason = line.split("REASON:")[1].strip()
-            if price != "N/A" and regime != "UNKNOWN":
+            if result and result.get("Regime"):
+                cvd_icon = get_cvd_icon(result.get("CVD Trend", "N/A"))
                 all_signals.append({
                     "Ticker": ticker,
-                    "Price": price,
-                    "Hurst": hurst,
-                    "Tail Index": tail_idx,
-                    "CVD Trend": f"{cvd_icon} {cvd}",
-                    "Signal/Regime": f"{regime} {get_regime_icon(regime)}",
-                    "Verdict": verdict,
-                    "Suggestion": suggestion,
-                    "Reason": reason
+                    "Price": f"{result['Price']:.2f}",
+                    "Hurst": f"{result['Hurst']:.3f}",
+                    "Tail Index": f"{result['Tail Index']:.3f}",
+                    "CVD Trend": f"{cvd_icon} {result['CVD Trend']}",
+                    "Signal/Regime": f"{result['Regime']} {get_regime_icon(result['Regime'])}",
+                    "Verdict": result['Verdict'],
+                    "Suggestion": result['Suggestion'],
+                    "Reason": result['Reason'],
+                    "Fragility": result.get('Fragility Alert', '')
                 })
 
         # Display signals table

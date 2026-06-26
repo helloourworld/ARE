@@ -80,7 +80,39 @@ def analyze_trend_integrity(ticker="SPY", benchmark="RSP"):
         "Confidence": confidence
     }
 
-# Execute
-analysis = analyze_trend_integrity()
-for key, value in analysis.items():
-    print(f"{key}: {value}")
+
+def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+
+def calculate_liquidity_signals(asset_df: pd.DataFrame, benchmark_df: pd.DataFrame) -> dict:
+    asset_df = _normalize_yf_df(asset_df.copy())
+    benchmark_df = _normalize_yf_df(benchmark_df.copy())
+
+    benchmark_close = benchmark_df['Close']
+    if isinstance(benchmark_close, pd.DataFrame):
+        if benchmark_close.shape[1] > 1:
+            print(f"WARNING: benchmark['Close'] has {benchmark_close.shape[1]} columns; using the first Close series.")
+        benchmark_close = benchmark_close.iloc[:, 0]
+
+    benchmark_close = benchmark_close.reindex(asset_df.index).ffill().bfill()
+    asset_df['CMF'] = ta.cmf(asset_df['High'], asset_df['Low'], asset_df['Close'], asset_df['Volume'], length=20)
+    asset_df['Breadth_Ratio'] = benchmark_close / asset_df['Close']
+    asset_df['Breadth_Slope'] = ta.slope(asset_df['Breadth_Ratio'], length=5)
+    asset_df['RSI'] = ta.rsi(asset_df['Close'], length=14)
+
+    return {
+        'cmf': float(asset_df['CMF'].iloc[-1]),
+        'breadth_ratio': float(asset_df['Breadth_Ratio'].iloc[-1]),
+        'breadth_slope': float(asset_df['Breadth_Slope'].iloc[-1]),
+        'rsi': float(asset_df['RSI'].iloc[-1])
+    }
+
+
+if __name__ == "__main__":
+    analysis = analyze_trend_integrity()
+    for key, value in analysis.items():
+        print(f"{key}: {value}")

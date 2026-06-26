@@ -1,4 +1,5 @@
 import os
+import sys
 import warnings
 import numpy as np
 import pandas as pd
@@ -7,6 +8,14 @@ from scipy.stats import linregress, norm
 from datetime import datetime, timedelta
 from pathlib import Path
 import pytz
+
+try:
+    from .liquidity import calculate_liquidity_signals
+except (ImportError, ValueError):
+    package_root = Path(__file__).resolve().parent.parent
+    if str(package_root) not in sys.path:
+        sys.path.insert(0, str(package_root))
+    from liquidity import calculate_liquidity_signals
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -45,6 +54,7 @@ TAIL_SAFE = 1.70              # Required for Regime 1/2 stability
 # Volatility: For Active vs. Dormant Risk
 VOL_LOOKBACK = 30             # 30-minute window for "Current Vol"
 VOL_THRESHOLD = 0.0015        # Threshold to define "Active" movement
+FRAGILITY_THRESHOLD = 2.5     # Fragility if negative money flow is large relative to low vol
 
 # ============================================================================
 # 2. FRACTAL MATHEMATICS
@@ -274,7 +284,7 @@ def calculate_cvd_refined(data_df, window=100):
 # ============================================================================
 
 
-def compute_judgment(prices, volumes, data_1m, h_val, alpha):
+def compute_judgment(prices, volumes, data_1m, h_val, alpha, cmf=0.0, breadth_slope=0.0):
     """
     Refined Market Regime Judgment Engine
     """
@@ -293,6 +303,7 @@ def compute_judgment(prices, volumes, data_1m, h_val, alpha):
     CVD_THRESHOLD = 0.05       # Minimum slope to care about
     CONFIDENCE_THRESHOLD = 0.5 # Minimum R-Value to trust CVD
     VPIN_TOXIC = 0.75          # Level where liquidity becomes fragile
+    weak_liquidity = (cmf < 0) and (breadth_slope < 0)
     
     # 4. Hierarchical Judgment Logic
     judgment = "NEUTRAL / STABLE"
@@ -305,6 +316,14 @@ def compute_judgment(prices, volumes, data_1m, h_val, alpha):
             judgment = "TOXIC ACCUMULATION (Price down, but Smart Money is absorbing everything)"
         else:
             judgment = "TOXIC FLOW (High probability of a structural Jump soon)"
+
+    # --- REGIME A1: LIQUIDITY FADING ---
+    elif weak_liquidity and is_price_up and vpin > 0.6:
+        judgment = "WEAK RALLY / LIQUIDITY FADING"
+    elif weak_liquidity and is_price_up:
+        judgment = "WEAK RALLY (Liquidity is not confirming price)"
+    elif weak_liquidity and is_price_down:
+        judgment = "LIQUIDITY DRAIN (Selling pressure and weak internals)"
 
     # --- REGIME B: DIVERGENCE (Medium Priority) ---
     elif abs(cvd_slope) > CVD_THRESHOLD and cvd_confidence > CONFIDENCE_THRESHOLD:
@@ -425,6 +444,18 @@ def scan_market(ticker, show_judgment=True):
     # 2. Intraday Volatility (Standard Deviation of log returns over 30 mins)
     recent_vol = np.std(returns_1m[-VOL_LOOKBACK:])
 
+    # Fragility: negative money flow during low volatility
+    benchmark_df = get_data_persistent("RSP", "1d")
+    if benchmark_df.empty:
+        liquidity_signals = {'cmf': 0.0, 'breadth_ratio': 1.0, 'breadth_slope': 0.0, 'rsi': 50.0}
+    else:
+        liquidity_signals = calculate_liquidity_signals(data_1d, benchmark_df)
+
+    cash_cmf = liquidity_signals['cmf']
+    fragility_score = abs(cash_cmf) / max(recent_vol, 1e-12)
+    if h_val < 0.53 and cash_cmf < -0.15 and fragility_score > FRAGILITY_THRESHOLD:
+        print("ALERT: CRITICAL FRAGILITY - High Risk of Phase Transition (Gap Down)")
+
     # 3. Directional Check (Slope of last hour)
     slope = linregress(np.arange(60), prices[-60:]).slope
 
@@ -454,12 +485,31 @@ def scan_market(ticker, show_judgment=True):
     print(f"Intraday Vol:  {recent_vol:.5f}")
     print(f"RESULT REGIME: {regime}")
 
+    # Compute liquidity signals for better tape/flow context.
+    result = {
+        "Price": float(prices[-1]),
+        "Hurst": float(h_val),
+        "Tail Index": float(alpha_eff),
+        "Intraday Vol": float(recent_vol),
+        "Regime": regime,
+        "Fragility Score": float(fragility_score),
+        "Fragility Alert": "",
+        "Verdict": "N/A",
+        "Suggestion": "N/A",
+        "Reason": "N/A",
+        "CVD Trend": "N/A"
+    }
+
     if show_judgment:
         judgment, entropy, vpin, cvd_slope = compute_judgment(
-            prices, volumes, data_1m, h_val, alpha_eff)
+            prices, volumes, data_1m, h_val, alpha_eff,
+            cmf=liquidity_signals['cmf'],
+            breadth_slope=liquidity_signals['breadth_slope']
+        )
         cvd_arrow = "⬆️" if cvd_slope > 0 else "⬇️" if cvd_slope < 0 else "→"
         cvd_label = "UP" if cvd_slope > 0 else "DOWN" if cvd_slope < 0 else "FLAT"
         print(f"Entropy: {entropy:.2f} (Low is better) | VPIN: {vpin:.2f}")
+        print(f"Liquidity CMF: {liquidity_signals['cmf']:.3f} | Breadth Slope: {liquidity_signals['breadth_slope']:.5f}")
         print(f"CVD Trend: {cvd_slope: .2f} {cvd_arrow} {cvd_label}")
         print(f"VERDICT: {judgment}")
 
@@ -469,8 +519,18 @@ def scan_market(ticker, show_judgment=True):
         print(f"\nSUGGESTION: {action}")
         print(f"REASON:     {reason}")
 
+        result.update({
+            "Verdict": judgment,
+            "Suggestion": action,
+            "Reason": reason,
+            "CVD Trend": f"{cvd_slope:.2f} {cvd_label}"
+        })
+
+    if h_val < 0.53 and cash_cmf < -0.15 and fragility_score > FRAGILITY_THRESHOLD:
+        result["Fragility Alert"] = "CRITICAL FRAGILITY"
+
     print("-" * 45)
-    return regime
+    return result
 
 
 if __name__ == "__main__":
