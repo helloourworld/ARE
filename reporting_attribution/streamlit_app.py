@@ -1029,20 +1029,23 @@ with tab9:
     if st.button("Run Risk Alert Scan"):
         result = scan_market(alert_ticker)
 
-        st.write(f"**Price:** {result['Price']:.2f}")
-        st.write(f"**Hurst (Trend):** {result['Hurst']:.3f}")
-        st.write(f"**Tail Index:** {result['Tail Index']:.3f}")
-        st.write(f"**Intraday Volatility:** {result['Intraday Vol']:.5f}")
-        cvd_icon = get_cvd_icon(result['CVD Trend'])
-        st.write(f"**CVD Trend:** {result['CVD Trend']} {cvd_icon}")
-        st.markdown("**Judgment & Suggestion**")
-        st.write(
-            f"**Regime:** {get_regime_icon(result['Regime'])} {result['Regime']}")
-        st.write(f"**Verdict:** {result['Verdict']}")
-        st.write(f"**Suggestion:** {result['Suggestion']}")
-        st.write(f"**Reason:** {result['Reason']}")
-        if result.get("Fragility Alert"):
-            st.error(f"⚠️ {result['Fragility Alert']} | Score: {result['Fragility Score']:.2f}")
+        if not isinstance(result, dict):
+            st.error(f"Scan failed: {result}")
+        else:
+            st.write(f"**Price:** {result['Price']:.2f}")
+            st.write(f"**Hurst (Trend):** {result['Hurst']:.3f}")
+            st.write(f"**Tail Index:** {result['Tail Index']:.3f}")
+            st.write(f"**Intraday Volatility:** {result['Intraday Vol']:.5f}")
+            cvd_icon = get_cvd_icon(result['CVD Trend'])
+            st.write(f"**CVD Trend:** {result['CVD Trend']} {cvd_icon}")
+            st.markdown("**Judgment & Suggestion**")
+            st.write(
+                f"**Regime:** {get_regime_icon(result['Regime'])} {result['Regime']}")
+            st.write(f"**Verdict:** {result['Verdict']}")
+            st.write(f"**Suggestion:** {result['Suggestion']}")
+            st.write(f"**Reason:** {result['Reason']}")
+            if result.get("Fragility Alert"):
+                st.error(f"⚠️ {result['Fragility Alert']} | Score: {result['Fragility Score']:.2f}")
 
     st.divider()
     st.subheader("Scan All Tickers & List Signals")
@@ -1061,7 +1064,7 @@ with tab9:
                 print(f"Error scanning {ticker}: {e}")
                 continue
 
-            if result and result.get("Regime"):
+            if isinstance(result, dict) and result.get("Regime"):
                 cvd_icon = get_cvd_icon(result.get("CVD Trend", "N/A"))
                 all_signals.append({
                     "Ticker": ticker,
