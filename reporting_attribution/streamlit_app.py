@@ -1143,7 +1143,9 @@ with tab9:
 
         # Display signals table
         df_signals = pd.DataFrame(all_signals).sort_values(
-            by=["Signal/Regime", "Ticker"])
+            by=["Signal/Regime", "Verdict", "Ticker"],
+            ascending=[True, True, True]
+        )
         st.subheader("📊 All Risk Alert Signals")
         st.dataframe(df_signals, hide_index=True, width='stretch')
 
