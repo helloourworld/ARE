@@ -1,15 +1,9 @@
-import os
 import sys
 import warnings
-from zoneinfo import ZoneInfo
 import numpy as np
-import pandas as pd
-import yfinance as yf
 from scipy.stats import linregress, norm
-from datetime import datetime, timedelta
 from pathlib import Path
 
-from .data_cache import get_data_persistent
 
 try:
     from .liquidity import calculate_liquidity_signals
@@ -21,7 +15,17 @@ except ImportError:
         if str(package_root) not in sys.path:
             sys.path.insert(0, str(package_root))
         from liquidity import calculate_liquidity_signals
-
+try:
+    from ..data_pipeline.data_cache import get_data_persistent
+except ImportError:
+    try:
+        from data_pipeline.data_cache import get_data_persistent
+    except ImportError:
+        package_root = Path(__file__).resolve().parent.parent
+        if str(package_root) not in sys.path:
+            sys.path.insert(0, str(package_root))
+        from data_pipeline.data_cache import get_data_persistent
+        
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -30,16 +34,7 @@ DATA_DIR = REPO_ROOT / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _get_cache_path(file_name: str) -> Path:
-    target_path = DATA_DIR / file_name
-    legacy_paths = [Path(file_name), REPO_ROOT / file_name]
-    for legacy_path in legacy_paths:
-        if legacy_path.exists() and legacy_path != target_path:
-            try:
-                legacy_path.replace(target_path)
-            except OSError:
-                pass
-    return target_path
+
 
 # ============================================================================
 # 1. PARAMETERS & THRESHOLDS

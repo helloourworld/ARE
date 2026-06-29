@@ -1,14 +1,16 @@
 import pandas as pd
 import pandas_ta as ta
-import yfinance as yf
+
+from data_pipeline.data_cache import get_data_persistent
 
 def analyze_trend_integrity(ticker="SPY", benchmark="RSP"):
     # 1. Fetch Data (SPY and Equal-Weight RSP)
-    spy = yf.download(ticker, period="1y", interval="1d")
-    spy.columns = spy.columns.droplevel(1)  # Drop the multi-level column index if present
-    rsp = yf.download(benchmark, period="1y", interval="1d")
-    rsp.columns = rsp.columns.droplevel(1)  # Drop the multi-level column index if present
-
+    # spy = yf.download(ticker, period="1y", interval="1d")
+    # spy.columns = spy.columns.droplevel(1)  # Drop the multi-level column index if present
+    # rsp = yf.download(benchmark, period="1y", interval="1d")
+    # rsp.columns = rsp.columns.droplevel(1)  # Drop the multi-level column index if present
+    spy = get_data_persistent(ticker, period="1y", interval="1d")
+    rsp = get_data_persistent(benchmark, period="1y", interval="1d")
     # 2. Basic Trend (The 'Old' Logic)
     spy['EMA_21'] = ta.ema(spy['Close'], length=21)
     spy['EMA_50'] = ta.ema(spy['Close'], length=50)

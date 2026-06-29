@@ -15,7 +15,7 @@ from .rs_trend import (
     calculate_rs_bollinger_bands,
     detect_rs_hook,
 )
-from .data_cache import get_data_persistent
+from ..data_pipeline.data_cache import get_data_persistent
 
 __all__ = [
     "AlphaRiskEngine",

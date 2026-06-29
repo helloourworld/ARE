@@ -1,10 +1,21 @@
 import uuid
-
+from pathlib import Path
+import sys
 import streamlit as st
 import pandas as pd
 import numpy as np
 from numpy.linalg import inv
-from .ef_utils import market_cap
+from ef_utils import market_cap
+try:
+    from ..data_pipeline.data_cache import get_data_persistent
+except ImportError:
+    try:
+        from data_pipeline.data_cache import get_data_persistent
+    except ImportError:
+        package_root = Path(__file__).resolve().parent.parent
+        if str(package_root) not in sys.path:
+            sys.path.insert(0, str(package_root))
+        from data_pipeline.data_cache import get_data_persistent
 
 deployment = 1000
 
@@ -109,20 +120,29 @@ st.session_state.conf_df = edited_df
 if st.button("Run Individualized Optimization"):
     with st.spinner("Analyzing Variance-Covariance Matrix..."):
         # Fetching Data (2026 'Close' fix)
-        df = yf.download(st.session_state.universe, period="2y", prepost=True)['Close'].dropna()
-        returns = df.pct_change().dropna()
+        for t in st.session_state.universe:
+            _df = get_data_persistent(t)[['Close']].dropna()
+            _df.columns = [t]
+            # print(_df)
+            df = pd.concat([df, _df], axis=1) if 'df' in locals() else _df
+        
+        returns = df.pct_change(fill_method=None).dropna()
         
         market_caps, w_mkt = market_cap(st.session_state.universe)
         
-        print("Market Caps and Weights:")
+        st.text("Market Caps and Weights:")
         for t, mc, w in zip(st.session_state.universe, market_caps, w_mkt):
-            print(f"{t}: {mc:.0f} -> {w:.2%}")
+            st.text(f"{t}: {mc:.0f} -> {w:.2%}")
             
         # Calculate Momentum View (Risk Adjusted)
+        df = df.dropna()
         mom_signal = (df.iloc[-1] / df.iloc[-252]) - 1
+        st.text("Momentum Signals (Annualized):")
+        for t, m in zip(st.session_state.universe, mom_signal):
+            st.text(f"{t}: {m:.2%}")
         vol = returns.std() * np.sqrt(252)
         views = mom_signal / vol
-        
+        # print(returns.head())
         # Run BL
         bl_weights = black_litterman_individual(returns, views, edited_df['Confidence'].values, w_mkt=w_mkt)
         

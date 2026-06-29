@@ -6,7 +6,7 @@ from numpy.linalg import inv
 # 1. Setup Data
 tickers = ['MSFT', 'GOOG', 'NVDA', 'AVGO', 'VRT', 'XEQT.TO', 'ENB.TO']
 data = yf.download(tickers, period="2y", prepost=True)['Close']
-returns = data.pct_change().dropna()
+returns = data.pct_change(fill_method=None).dropna()
 cov = returns.cov() * 252
 delta = 2.5  # Risk aversion coefficient (standard is 2.5)
 
