@@ -9,6 +9,8 @@ from scipy.stats import linregress, norm
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from .data_cache import get_data_persistent
+
 try:
     from .liquidity import calculate_liquidity_signals
 except ImportError:
@@ -142,56 +144,6 @@ def calculate_tail_index_robust(returns: np.ndarray, lookback: int = 500):
 # 3. PERSISTENT DATA CACHE
 # ============================================================================
 
-
-def get_data_persistent(ticker, interval="1m", period="2y"):
-    """Bridges the Yahoo 7-day limit for 1m data using local Parquet files."""
-    file_path = _get_cache_path(f"cache_{ticker}_{interval}.csv")
-    now = datetime.now(tzinfo=ZoneInfo("America/Halifax"))
-
-    if os.path.exists(file_path):
-        local_df = pd.read_csv(file_path, index_col=0, parse_dates=True)
-        if local_df.index.tz is None:
-            local_df.index = local_df.index.tz_localize('UTC')
-
-        last_ts = local_df.index[-1]
-        # Skip update if we ran this in the last 2 mins (intraday) or 12h (daily)
-        wait_time = timedelta(
-            minutes=2) if interval == "1m" else timedelta(hours=12)
-        if now - last_ts < wait_time:
-            return local_df
-
-        # Calculate safe start (Yahoo limit for 1m is 7 days per request)
-        start_date = max(last_ts, now - timedelta(days=7)
-                         ) if interval == "1m" else last_ts
-        new_data = yf.download(ticker, start=start_date,
-                               interval=interval, prepost=True, progress=False)
-
-        if not new_data.empty:
-            if isinstance(new_data.columns, pd.MultiIndex):
-                new_data.columns = new_data.columns.get_level_values(0)
-            if new_data.index.tz is None:
-                new_data.index = new_data.index.tz_localize('UTC')
-            combined = pd.concat([local_df, new_data])
-            # Drop duplicates (keeping the most recent version of a minute/day)
-            combined = combined[~combined.index.duplicated(
-                keep='last')].sort_index()
-            combined.to_csv(file_path)
-            return combined
-        # If the update failed, return the previous cache instead of crashing.
-        return local_df
-    else:
-        # First time download
-        p = "7d" if interval == "1m" else period
-        df = yf.download(ticker, period=p, interval=interval,
-                         prepost=True, progress=False)
-        if df is None or df.empty:
-            return pd.DataFrame()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        if df.index.tz is None:
-            df.index = df.index.tz_localize('UTC')
-        df.to_csv(file_path)
-        return df
 # ============================================================================
 # NEW JUDGMENT INDICATORS
 # ============================================================================

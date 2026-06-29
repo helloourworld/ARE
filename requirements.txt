@@ -10,4 +10,4 @@ statsmodels
 pyportfolioopt
 pyyaml
 appdirs
-zoneinfo
+pandas_ta
