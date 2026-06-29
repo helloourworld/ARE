@@ -1,21 +1,24 @@
 import os
 import sys
 import warnings
+from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from scipy.stats import linregress, norm
 from datetime import datetime, timedelta
 from pathlib import Path
-import pytz
 
 try:
     from .liquidity import calculate_liquidity_signals
-except (ImportError, ValueError):
-    package_root = Path(__file__).resolve().parent.parent
-    if str(package_root) not in sys.path:
-        sys.path.insert(0, str(package_root))
-    from liquidity import calculate_liquidity_signals
+except ImportError:
+    try:
+        from risk_modeling.liquidity import calculate_liquidity_signals
+    except ImportError:
+        package_root = Path(__file__).resolve().parent.parent
+        if str(package_root) not in sys.path:
+            sys.path.insert(0, str(package_root))
+        from liquidity import calculate_liquidity_signals
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -143,7 +146,7 @@ def calculate_tail_index_robust(returns: np.ndarray, lookback: int = 500):
 def get_data_persistent(ticker, interval="1m", period="2y"):
     """Bridges the Yahoo 7-day limit for 1m data using local Parquet files."""
     file_path = _get_cache_path(f"cache_{ticker}_{interval}.csv")
-    now = datetime.now(pytz.utc)
+    now = datetime.now(tzinfo=ZoneInfo("America/Halifax"))
 
     if os.path.exists(file_path):
         local_df = pd.read_csv(file_path, index_col=0, parse_dates=True)
