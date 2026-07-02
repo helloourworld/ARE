@@ -441,6 +441,7 @@ def scan_market(ticker, show_judgment=True):
         "Hurst": float(h_val),
         "Tail Index": float(alpha_eff),
         "Intraday Vol": float(recent_vol),
+        "VPIN": float(0.0),
         "Regime": regime,
         "Fragility Score": float(fragility_score),
         "Fragility Alert": "",
@@ -473,7 +474,8 @@ def scan_market(ticker, show_judgment=True):
             "Verdict": judgment,
             "Suggestion": action,
             "Reason": reason,
-            "CVD Trend": f"{cvd_slope:.2f} {cvd_label}"
+            "CVD Trend": f"{cvd_slope:.2f} {cvd_label}",
+            "VPIN": float(vpin)
         })
 
     if h_val < 0.53 and cash_cmf < -0.15 and fragility_score > FRAGILITY_THRESHOLD:

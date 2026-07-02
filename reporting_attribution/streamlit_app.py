@@ -112,6 +112,48 @@ def get_cvd_icon(cvd_value: str) -> str:
     return "→"
 
 
+def render_metric_with_threshold(name: str, value: float, threshold_text: str, color: str, precision: int = 3):
+    formatted_value = f"{value:.{precision}f}" if isinstance(value, (float, int)) else value
+    st.markdown(
+        f"**{name}:** <span style='color:{color}; font-weight:bold'>{formatted_value}</span> "
+        f"<span style='color:#888;'>({threshold_text})</span>",
+        unsafe_allow_html=True
+    )
+
+
+def format_hurst_color(value: float) -> str:
+    if value >= 0.60:
+        return "green"
+    if value >= 0.53:
+        return "orange"
+    return "red"
+
+
+def format_tail_color(value: float) -> str:
+    if value >= 1.70:
+        return "green"
+    if value >= 1.55:
+        return "orange"
+    return "red"
+
+
+def format_vpin_color(value: float) -> str:
+    if value >= 0.75:
+        return "red"
+    if value >= 0.60:
+        return "orange"
+    return "green"
+
+
+def format_vol_color(value: float) -> str:
+    vol_threshold = 0.0015
+    if value >= vol_threshold * 2:
+        return "red"
+    if value >= vol_threshold:
+        return "orange"
+    return "green"
+
+
 # --- CONFIGURATION & STYLING ---
 st.set_page_config(page_title="Alpha Risk Engine (ARE)", layout="wide")
 
@@ -1033,9 +1075,34 @@ with tab9:
             st.error(f"Scan failed: {result}")
         else:
             st.write(f"**Price:** {result['Price']:.2f}")
-            st.write(f"**Hurst (Trend):** {result['Hurst']:.3f}")
-            st.write(f"**Tail Index:** {result['Tail Index']:.3f}")
-            st.write(f"**Intraday Volatility:** {result['Intraday Vol']:.5f}")
+            render_metric_with_threshold(
+                "Hurst (Trend)",
+                result['Hurst'],
+                "> 0.60 = Strong Trend, < 0.45 = Mean Reversion",
+                format_hurst_color(result['Hurst']),
+                precision=3
+            )
+            render_metric_with_threshold(
+                "Tail Index",
+                result['Tail Index'],
+                ">= 1.70 = Stable, < 1.55 = Tail Risk",
+                format_tail_color(result['Tail Index']),
+                precision=3
+            )
+            render_metric_with_threshold(
+                "VPIN",
+                result['VPIN'],
+                "< 0.40 = Low Toxicity, > 0.75 = Toxic",
+                format_vpin_color(result['VPIN']),
+                precision=3
+            )
+            render_metric_with_threshold(
+                "Intraday Volatility",
+                result['Intraday Vol'],
+                "Threshold: 0.0015",
+                format_vol_color(result['Intraday Vol']),
+                precision=5
+            )
             cvd_icon = get_cvd_icon(result['CVD Trend'])
             st.write(f"**CVD Trend:** {result['CVD Trend']} {cvd_icon}")
             st.markdown("**Judgment & Suggestion**")
@@ -1071,6 +1138,7 @@ with tab9:
                     "Price": f"{result['Price']:.2f}",
                     "Hurst": f"{result['Hurst']:.3f}",
                     "Tail Index": f"{result['Tail Index']:.3f}",
+                    "VPIN": f"{result.get('VPIN', 0.0):.3f}",
                     "CVD Trend": f"{cvd_icon} {result['CVD Trend']}",
                     "Signal/Regime": f"{result['Regime']} {get_regime_icon(result['Regime'])}",
                     "Verdict": result['Verdict'],
