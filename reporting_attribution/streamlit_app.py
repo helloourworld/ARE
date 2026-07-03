@@ -112,6 +112,40 @@ def get_cvd_icon(cvd_value: str) -> str:
     return "→"
 
 
+def normalize_timestamp_for_index(value, index):
+    ts = pd.to_datetime(value)
+    if getattr(index, "tz", None) is not None and index.tz is not None and ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return ts
+
+
+def get_reference_price(series: pd.Series):
+    if series is None or series.empty:
+        return None, "Unknown"
+
+    idx = series.index
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    else:
+        idx = idx.tz_convert("UTC")
+
+    est_index = idx.tz_convert("America/New_York")
+    last_ts = est_index[-1]
+    current_date = last_ts.date()
+    premarket = last_ts.time() < datetime.time(9, 30)
+
+    prev_close_vals = [i for i, d in enumerate(est_index.date) if d < current_date]
+    prev_close = series.iloc[prev_close_vals[-1]] if prev_close_vals else None
+
+    today_open_mask = [d == current_date and t >= datetime.time(9, 30)
+                       for d, t in zip(est_index.date, est_index.time)]
+    today_open = series.iloc[[i for i, m in enumerate(today_open_mask) if m][0]] if any(today_open_mask) else None
+
+    if premarket or today_open is None:
+        return prev_close, "Previous Close"
+    return today_open, "Open Price"
+
+
 def render_metric_with_threshold(name: str, value: float, threshold_text: str, color: str, precision: int = 3):
     formatted_value = f"{value:.{precision}f}" if isinstance(value, (float, int)) else value
     st.markdown(
@@ -975,36 +1009,45 @@ with tab9:
             benchmark_change = 0
 
             # Calculate Benchmark change first for relative comparison
-            bench_current = live_data[selected_benchmark].iloc[-1]
-            # Start of the 2d window
-            bench_prev = live_data[selected_benchmark].iloc[0]
-            benchmark_change = (bench_current / bench_prev - 1) * 100
+            bench_series = live_data[selected_benchmark].dropna()
+            bench_current = bench_series.iloc[-1]
+            bench_ref_price, bench_ref_label = get_reference_price(bench_series)
+            benchmark_change = (bench_current / bench_ref_price - 1) * 100 if bench_ref_price is not None else float('nan')
 
             for t in monitor_list:
                 if t == selected_benchmark:
                     continue  # Skip benchmark in the individual report
-                current_p = live_data[t].iloc[-1]
-                # Last known valid price from previous day
-                prev_p = live_data[t].dropna().iloc[0]
+                ticker_series = live_data[t].dropna()
+                if ticker_series.empty:
+                    continue
+                current_p = ticker_series.iloc[-1]
+                ref_price, _ = get_reference_price(ticker_series)
+                prev_p = ref_price if ref_price is not None else ticker_series.iloc[0]
                 change_abs = current_p - prev_p
-                change_pct = (change_abs / prev_p) * 100
+                change_pct = (change_abs / prev_p) * 100 if prev_p else float('nan')
                 rel_perf = change_pct - benchmark_change  # Alpha check
 
                 price_report.append({
                     "Ticker": t,
                     "Current Price": round(current_p, 2),
-                    "Day Change (%)": round(change_pct, 2),
-                    "Rel. to Bench (%)": round(rel_perf, 2),
+                    "Day Change (%)": round(change_pct, 2) if not pd.isna(change_pct) else float('nan'),
+                    "Rel. to Bench (%)": round(rel_perf, 2) if not pd.isna(rel_perf) else float('nan'),
                     "Status": "🔥 Outperforming" if rel_perf > 0 else "❄️ Lagging"
                 })
 
             # 3. Visualization: Metrics Row
             st.subheader(f"System Pulse vs. {selected_benchmark}")
             col1, col2, col3 = st.columns(3)
-            col1.metric(f"Benchmark: {selected_benchmark}",
-                        f"{bench_current:.2f}", f"{benchmark_change:.2f}%")
-            col2.metric("Portfolio Sentiment",
-                        "BULLISH" if benchmark_change > 0.3 else "NEUTRAL" if benchmark_change >= -0.3 else "BEARISH")
+            col1.metric(
+                f"Benchmark: {selected_benchmark}",
+                f"{bench_current:.2f}",
+                f"{benchmark_change:.2f}% ({bench_ref_label})" if not pd.isna(benchmark_change) else "N/A"
+            )
+            col2.metric(
+                "Reference Basis",
+                f"{bench_ref_label}",
+                f"{bench_ref_price:.2f}" if bench_ref_price is not None else "N/A"
+            )
             col3.write(
                 f"**Last Update:** {datetime.datetime.now().strftime('%H:%M:%S')} EST")
 
