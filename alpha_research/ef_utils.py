@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import sys
 from pathlib import Path
+import yfinance as yf
 
 # Add repo root to path
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -9,6 +10,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from data_pipeline import get_price_history
+from data_pipeline.data_cache import normalize_timestamp_for_index
 
 TRADING_DAYS = 252
 
@@ -18,7 +20,8 @@ def download_price_data(tickers, start_date="2020-01-01"):
     if data.empty:
         raise ValueError(f"No price data returned for tickers: {tickers}")
 
-    data = data[data.index >= pd.to_datetime(start_date)]
+    start_ts = normalize_timestamp_for_index(start_date, data.index)
+    data = data[data.index >= start_ts]
     prices = data
     prices = prices.dropna(axis=0, how="any")
     if prices.empty:

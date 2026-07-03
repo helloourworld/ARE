@@ -8,7 +8,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data_pipeline.data_cache import get_data_persistent
+from data_pipeline.data_cache import get_data_persistent, normalize_timestamp_for_index
 
 FIB_LEVELS = [0.236, 0.382, 0.5, 0.618, 0.786]
 
@@ -16,7 +16,8 @@ def load_gold(start="2018-01-01"):
     df = get_data_persistent("GC=F", interval="1d", period="5y", force_refresh=False)
     if df.empty:
         return pd.DataFrame()
-    df = df[df.index >= pd.to_datetime(start)]
+    start_ts = normalize_timestamp_for_index(start, df.index)
+    df = df[df.index >= start_ts]
     df = df[["Open", "High", "Low", "Close", "Volume"]]
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.droplevel(1)  # Drop multi-index if exists

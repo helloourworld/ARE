@@ -12,7 +12,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 try:
-    from data_pipeline.data_cache import get_data_persistent
+    from data_pipeline.data_cache import get_data_persistent, normalize_timestamp_for_index
 except ImportError:
     from data_pipeline import get_data_persistent
 
@@ -213,7 +213,8 @@ def load_yf_spy_history(ticker="SPY", start_date="2024-01-01"):
     if history.empty:
         return pd.DataFrame()
     # Filter by start_date
-    history = history[history.index >= pd.to_datetime(start_date)]
+    start_ts = normalize_timestamp_for_index(start_date, history.index)
+    history = history[history.index >= start_ts]
     history = history[["Open", "High", "Low", "Close", "Volume"]].dropna()
     return history
 

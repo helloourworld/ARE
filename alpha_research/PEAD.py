@@ -8,7 +8,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data_pipeline.data_cache import get_data_persistent
+from data_pipeline.data_cache import get_data_persistent, normalize_timestamp_for_index
 
 # 1. Configuration
 ticker = "NVDA"
@@ -21,7 +21,8 @@ start_date = "2024-01-01"
 df = get_data_persistent(ticker, interval="1d", period="2y", force_refresh=False)
 if df.empty:
     raise SystemExit(f"No price data downloaded for {ticker} since {start_date}")
-df = df[df.index >= pd.to_datetime(start_date)]
+start_ts = normalize_timestamp_for_index(start_date, df.index)
+df = df[df.index >= start_ts]
 df = df[["Open", "High", "Low", "Close", "Volume"]]
 if isinstance(df.columns, pd.MultiIndex):
     df.columns = df.columns.droplevel(1)  # Drop the 'Adj Close' multi-index if it exists 
@@ -43,7 +44,7 @@ earnings_data = [
 ]
 results = []
 for event in earnings_data:
-    e_date = pd.to_datetime(event['date'])
+    e_date = normalize_timestamp_for_index(event['date'], df.index)
     if e_date not in df.index:
             print(f"Skipping {e_date.date()}: no trading data for earnings date")
             continue

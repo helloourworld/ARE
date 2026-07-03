@@ -1,7 +1,5 @@
-import sys
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
 import pandas as pd
 import yfinance as yf
 import numpy as np
@@ -37,11 +35,18 @@ def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def normalize_timestamp_for_index(value, index):
+    ts = pd.to_datetime(value)
+    if getattr(index, "tz", None) is not None and index.tz is not None and ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return ts
+
+
 def get_data_persistent(ticker, interval="1d", period="2y", force_refresh=False):
     """Load OHLCV data from a local cache first, then refresh from Yahoo Finance as needed."""
     safe_ticker = str(ticker).replace("/", "_").replace("=", "_")
     file_path = _get_cache_path(f"cache_{safe_ticker}_{interval}.csv")
-    now = datetime.now(ZoneInfo("America/Halifax"))
+    now = pd.Timestamp.now(tz="UTC")
 
     try:
         if file_path.exists() and not force_refresh:
@@ -51,12 +56,12 @@ def get_data_persistent(ticker, interval="1d", period="2y", force_refresh=False)
             if local_df.empty:
                 return local_df
 
-            last_ts = local_df.index[-2] # because the latest volume bar may be incomplete, we use the second to last timestamp for comparison
+            last_ts = pd.Timestamp(local_df.index[-2])
             wait_time = timedelta(minutes=2) if interval == "1m" else timedelta(hours=12)
             if now - last_ts < wait_time:
                 return local_df
 
-            start_date = max(last_ts, now - timedelta(days=7)) if interval == "1m" else last_ts
+            start_date = (max(last_ts, now - pd.Timedelta(days=7)) if interval == "1m" else last_ts)
             if hasattr(start_date, "to_pydatetime"):
                 start_date = start_date.to_pydatetime()
 
@@ -122,8 +127,8 @@ def get_daily_returns(tickers, benchmark, start_date):
     
     prices_df = pd.DataFrame(price_data)
     # Filter by start_date
-    start = pd.to_datetime(start_date)
-    prices_df = prices_df[prices_df.index >= start].dropna()
+    start_ts = normalize_timestamp_for_index(start_date, prices_df.index)
+    prices_df = prices_df[prices_df.index >= start_ts].dropna()
     
     return prices_df.pct_change(fill_method=None).dropna()
 
@@ -307,12 +312,3 @@ def force_refresh_ticker(ticker, interval="1d"):
         Updated DataFrame or empty DataFrame on error
     """
     return get_data_persistent(ticker, interval=interval, period="2y", force_refresh=True)
-
-
-    ticker = sys.argv[1] if len(sys.argv) > 1 else "SPY"
-    interval = sys.argv[2] if len(sys.argv) > 2 else "1m"
-    period = sys.argv[3] if len(sys.argv) > 3 else "7d"
-    force_refresh = bool(int(sys.argv[4])) if len(sys.argv) > 4 else False
-
-    df = get_data_persistent(ticker, interval, period, force_refresh)
-    print(df.tail())        
