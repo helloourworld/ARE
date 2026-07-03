@@ -1,8 +1,16 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
+import sys
+from pathlib import Path
 from datetime import datetime, timedelta
+
+# Add repo root to path
+REPO_ROOT = Path(__file__).resolve().parents[0]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from data_pipeline import get_price_history
 
 # --- SYSTEM CONFIG ---
 st.set_page_config(page_title="ARE Macro Terminal", layout="wide")
@@ -23,11 +31,12 @@ def fetch_macro_data():
     
     tickers = list(ticker_map.keys())
     # Download 5 days to calculate delta/change
-    data = yf.download(tickers, period="5d", interval="1d", prepost=True)['Close']
+    data = get_price_history(tickers, period="5d", interval="1d")
     stats = {}
     for t_id, name in ticker_map.items():
-        current_val = data[t_id].dropna().iloc[-1]
-        prev_val = data[t_id].dropna().iloc[-2]
+        if t_id in data.columns:
+            current_val = data[t_id].dropna().iloc[-1]
+            prev_val = data[t_id].dropna().iloc[-2]
         delta = current_val - prev_val
         delta_pct = (delta / prev_val) * 100
         
@@ -116,7 +125,7 @@ st.subheader("Post-Earnings Drift: Tech Leaders")
 def get_chart_data():
     # Comparing current AI leaders
     tks = ["AMD", "GOOG", "MSFT", "SNDK"]
-    d = yf.download(tks, period="1mo", interval="1d", prepost=True)['Close']
+    d = get_price_history(tks, period="1mo", interval="1d")
     # Normalize to 100 for comparison
     return (d / d.dropna().iloc[0] * 100)
 

@@ -1,16 +1,25 @@
 import numpy as np
 import pandas as pd
-import yfinance as yf
+import sys
+from pathlib import Path
+
+# Add repo root to path
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from data_pipeline import get_price_history
 
 TRADING_DAYS = 252
 
 
 def download_price_data(tickers, start_date="2020-01-01"):
-    data = yf.download(tickers, start=start_date, progress=False, prepost=True)
+    data = get_price_history(tickers, period="5y", interval="1d")
     if data.empty:
         raise ValueError(f"No price data returned for tickers: {tickers}")
 
-    prices = data["Close"]
+    data = data[data.index >= pd.to_datetime(start_date)]
+    prices = data
     prices = prices.dropna(axis=0, how="any")
     if prices.empty:
         raise ValueError("Downloaded price data contains no complete rows after dropping NA values.")

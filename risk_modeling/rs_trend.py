@@ -1,6 +1,17 @@
 import pandas as pd
 import numpy as np
-import yfinance as yf
+import sys
+from pathlib import Path
+
+# Add repo root to path for imports
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    from data_pipeline import get_price_history_with_benchmark
+except ImportError:
+    from data_pipeline import get_price_history_with_benchmark
 
 def calculate_professional_rs(ticker_data, benchmark_data, window=52):
     """
@@ -27,17 +38,18 @@ def calculate_professional_rs(ticker_data, benchmark_data, window=52):
 
 # --- Integrated Execution ---
 def get_rs_signals(tickers, benchmark='SPY'):
-    data = yf.download(tickers + [benchmark], period="2y", auto_adjust=True, prepost=True)['Close']
+    data = get_price_history_with_benchmark(tickers, benchmark, period="2y", interval="1d")
     results = []
     
     for t in tickers:
-        mrs, slope = calculate_professional_rs(data[t], data[benchmark])
-        results.append({
-            "Ticker": t,
-            "RS_Score": mrs.iloc[-1],
-            "RS_Trend": "Improving" if slope.iloc[-1] > 0 else "Decaying",
-            "Institutional_Signal": "Accumulate" if mrs.iloc[-1] > 0 and slope.iloc[-1] > 0 else "Avoid"
-        })
+        if t in data.columns:
+            mrs, slope = calculate_professional_rs(data[t], data[benchmark])
+            results.append({
+                "Ticker": t,
+                "RS_Score": mrs.iloc[-1],
+                "RS_Trend": "Improving" if slope.iloc[-1] > 0 else "Decaying",
+                "Institutional_Signal": "Accumulate" if mrs.iloc[-1] > 0 and slope.iloc[-1] > 0 else "Avoid"
+            })
     
     return pd.DataFrame(results)
 

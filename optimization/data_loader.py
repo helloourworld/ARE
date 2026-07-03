@@ -1,8 +1,16 @@
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import sys
+from pathlib import Path
 from scipy.stats import norm
 from datetime import datetime, timedelta
+
+# Add repo root to path
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from data_pipeline import get_price_history, get_ohlcv_history
 
 class AREDataLoader:
     def __init__(self):
@@ -16,7 +24,7 @@ class AREDataLoader:
         SHY: 1-3 Year Treasury Bond ETF
         """
         print("Fetching Macro and Equity data...")
-        data = yf.download(tickers, period="1y", interval="1d", prepost=True)['Close']
+        data = get_price_history(tickers, period="1y", interval="1d")
         
         # Calculate Returns and Volatility for HMM
         features = pd.DataFrame()
@@ -71,7 +79,7 @@ class AREDataLoader:
         Fetches 1-minute data for VPIN toxicity analysis.
         """
         print(f"Fetching Intraday 1-min data for {ticker}...")
-        data = yf.download(ticker, period="5d", interval="1m", prepost=True)
+        data = get_ohlcv_history(ticker, period="5d", interval="1m", force_refresh=False)
         
         # yfinance doesn't provide trade side (buy/sell), so we use the 
         # 'Tick Rule' (Price > Prev Price = Buy)

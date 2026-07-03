@@ -1,7 +1,15 @@
-import yfinance as yf
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import sys
+from pathlib import Path
+
+# Add repo root to path
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from data_pipeline.data_cache import get_daily_returns
 
 # -----------------------------
 # 1. Download market data
@@ -9,10 +17,10 @@ import matplotlib.pyplot as plt
 assets = ["AAPL", "MSFT", "GOOG", "AMZN", "TSLA"]
 start = "2020-01-01"
 
-data = yf.download(assets, start=start, prepost=True)["Close"]
+data = get_daily_returns(assets, assets[0], start)
 
 # Compute daily returns
-returns = data.pct_change().dropna()
+returns = data
 
 # Annualize covariance
 Sigma = returns.cov() * 252

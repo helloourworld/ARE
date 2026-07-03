@@ -1,7 +1,15 @@
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import sys
+from pathlib import Path
 from requests import Session
+
+# Add repo root to path
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from data_pipeline import get_price_history
 
 class MomentumEngine:
     def __init__(self, tickers):
@@ -9,8 +17,8 @@ class MomentumEngine:
         self.tickers = tickers
 
     def get_data(self):
-        # Do not pass a session to yf.download to avoid YFDataException
-        data = yf.download(self.tickers, period="2y", progress=False)['Close']
+        # Fetch through persistent cache
+        data = get_price_history(self.tickers, period="2y", interval="1d")
         return data
 
     def calculate_momentum(self, df):

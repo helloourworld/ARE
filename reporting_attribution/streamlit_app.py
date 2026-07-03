@@ -160,7 +160,8 @@ st.set_page_config(page_title="Alpha Risk Engine (ARE)", layout="wide")
 
 # --- LOAD CONFIGURATION ---
 def load_config():
-    with open("config.yaml", "r") as f:
+    config_path = REPO_ROOT / "config.yaml"
+    with open(config_path, "r") as f:
         return yaml.safe_load(f)
 
 

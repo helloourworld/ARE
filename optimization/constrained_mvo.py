@@ -1,11 +1,20 @@
 import yaml
 import pandas as pd
-import yfinance as yf
+import sys
+from pathlib import Path
 from pypfopt import EfficientFrontier, risk_models, expected_returns, objective_functions
+
+# Add repo root to path
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from data_pipeline import get_price_history
 
 def run_constrained_optimization():
     # 1. Load Configuration
-    with open("config.yaml", "r") as f:
+    config_path = REPO_ROOT / "config.yaml"
+    with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
     
     tickers = list(cfg['constraints'].keys())
@@ -13,7 +22,7 @@ def run_constrained_optimization():
     targets = {k: v['target'] for k, v in cfg['constraints'].items()}
 
     # 2. Ingest Data
-    data = yf.download(tickers, start="2024-01-01", prepost=True)['Close']
+    data = get_price_history(tickers, period="2y", interval="1d")
     # returns = data.pct_change().dropna()
 
     # 3. Calculate Risk/Return Proxies

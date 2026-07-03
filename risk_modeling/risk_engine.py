@@ -1,14 +1,27 @@
 import pandas as pd
 import numpy as np
-import yfinance as yf
 import statsmodels.api as sm
 # Robust covariance estimator to address "Correlation > 1" issue
 from sklearn.covariance import LedoitWolf
 import matplotlib.pyplot as plt
 import yaml
 import scipy
+import sys
+from pathlib import Path
+
+# Add repo root to path for imports
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    from data_pipeline.data_cache import get_daily_returns as get_daily_returns_cached
+except ImportError:
+    from data_pipeline import get_daily_returns as get_daily_returns_cached
+
 # Load configuration
-with open("config.yaml", "r") as f:
+config_path = REPO_ROOT / "config.yaml"
+with open(config_path, "r") as f:
     cfg = yaml.safe_load(f)
 
 
@@ -24,11 +37,9 @@ class AlphaRiskEngine:
             252  # Daily proxy for risk-free rate
 
     def ingest_data(self):
-        """Fetch adjusted close prices and calculate daily returns."""
+        """Fetch adjusted close prices and calculate daily returns using persistent cache."""
         # print(f"Ingesting data for: {self.tickers}")
-        raw_data = yf.download(
-            self.tickers + [self.benchmark], start=self.start_date, prepost=True)['Close']
-        self.returns = raw_data.dropna().pct_change().dropna()
+        self.returns = get_daily_returns_cached(self.tickers, self.benchmark, self.start_date)
         # print("Data Ingested. Sample Returns:")
         # print(self.returns.head())
         return self.returns

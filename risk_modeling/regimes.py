@@ -2,8 +2,19 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import logging
-import yfinance as yf
 import warnings
+import sys
+from pathlib import Path
+
+# Add repo root to path for imports
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    from data_pipeline.data_cache import get_data_persistent
+except ImportError:
+    from data_pipeline import get_data_persistent
 
 # Suppress noisy Future/Deprecation warnings during test runs
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -197,8 +208,12 @@ class MandelbrotSwingStandalone:
 
 
 def load_yf_spy_history(ticker="SPY", start_date="2024-01-01"):
-    """Download SPY OHLCV history from yfinance for testing."""
-    history = yf.download(ticker, start=start_date, progress=False, auto_adjust=True, prepost=True)
+    """Load ticker OHLCV history from persistent cache for testing."""
+    history = get_data_persistent(ticker, interval="1d", period="2y", force_refresh=False)
+    if history.empty:
+        return pd.DataFrame()
+    # Filter by start_date
+    history = history[history.index >= pd.to_datetime(start_date)]
     history = history[["Open", "High", "Low", "Close", "Volume"]].dropna()
     return history
 

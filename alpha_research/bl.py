@@ -1,11 +1,19 @@
 import numpy as np
 import pandas as pd
-import yfinance as yf
+import sys
+from pathlib import Path
 from numpy.linalg import inv
+
+# Add repo root to path
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from data_pipeline import get_price_history
 
 # 1. Setup Data
 tickers = ['MSFT', 'GOOG', 'NVDA', 'AVGO', 'VRT', 'XEQT.TO', 'ENB.TO']
-data = yf.download(tickers, period="2y", prepost=True)['Close']
+data = get_price_history(tickers, period="2y", interval="1d")
 returns = data.pct_change(fill_method=None).dropna()
 cov = returns.cov() * 252
 delta = 2.5  # Risk aversion coefficient (standard is 2.5)

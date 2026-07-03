@@ -1,6 +1,14 @@
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import sys
+from pathlib import Path
+
+# Add repo root to path
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from data_pipeline.data_cache import get_data_persistent
 
 # 1. Configuration
 ticker = "NVDA"
@@ -10,10 +18,13 @@ surprise_threshold = 0.05  # We want a "Beat" of at least 5%
 # 2. Download Historical Price Data
 # We look at the last 2 years to see the recent AI boom drift
 start_date = "2024-01-01"
-df = yf.download(ticker, start=start_date, progress=False)
+df = get_data_persistent(ticker, interval="1d", period="2y", force_refresh=False)
 if df.empty:
     raise SystemExit(f"No price data downloaded for {ticker} since {start_date}")
-df.columns = df.columns.droplevel(1)  # Drop the 'Adj Close' multi-index if it exists 
+df = df[df.index >= pd.to_datetime(start_date)]
+df = df[["Open", "High", "Low", "Close", "Volume"]]
+if isinstance(df.columns, pd.MultiIndex):
+    df.columns = df.columns.droplevel(1)  # Drop the 'Adj Close' multi-index if it exists 
 df.index = pd.to_datetime(df.index)
 print(f"Loaded {len(df)} rows from {df.index.min().date()} to {df.index.max().date()}")
 
