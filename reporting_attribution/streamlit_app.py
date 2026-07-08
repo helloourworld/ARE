@@ -35,7 +35,7 @@ from pypfopt import (
 
 # Local application modules
 from frontier_plots import plot_institutional_frontier
-from data_pipeline import get_daily_returns, get_price_history, get_price_history_with_benchmark, get_premarket_data, get_live_intraday
+from data_pipeline import get_daily_returns, get_price_history, get_price_history_with_benchmark, get_premarket_data, get_live_intraday, get_data_persistent
 from risk_modeling import AlphaRiskEngine, calculate_mansfield_rs, monitor_mean_reversion, calculate_rs_bollinger_bands, get_rs_signals, detect_rs_hook
 from risk_modeling.mandelbrot import scan_market
 from risk_modeling.bolling_bands import compute_rolling_vpin, compute_rolling_cvd
@@ -265,6 +265,11 @@ selected_tickers = st.sidebar.multiselect(
     default=cfg['defaults']['selected_portfolio']
 )
 
+# VPIN / CVD controls
+st.sidebar.header("VPIN / CVD Controls")
+smoothing_window = st.sidebar.slider("Smoothing window (bars)", min_value=1, max_value=21, value=3, step=1)
+vpin_window_minutes = st.sidebar.slider("VPIN lookback window (minutes)", min_value=5, max_value=1440, value=250, step=5)
+vpin_bucket_count = st.sidebar.slider("VPIN bucket count", min_value=10, max_value=200, value=50, step=5)
 
 # Use start_date from config
 returns = get_daily_returns(
@@ -1166,11 +1171,11 @@ with tab9:
             try:
                 intraday_df = get_data_persistent(alert_ticker, "1m")
                 if intraday_df is not None and not intraday_df.empty:
-                    vpin_series = compute_rolling_vpin(intraday_df, vpin_window=vpin_bucket_count, window_minutes=vpin_window_minutes)
+                    vpin_series = compute_rolling_vpin(intraday_df, vpin_window=50, window_minutes=250)
                     cvd_series = compute_rolling_cvd(intraday_df)
                     # Smooth series
-                    vpin_s = vpin_series.rolling(window=smoothing_window, min_periods=1).mean()
-                    cvd_s = cvd_series.rolling(window=smoothing_window, min_periods=1).mean()
+                    vpin_s = vpin_series.rolling(window=3, min_periods=1).mean()
+                    cvd_s = cvd_series.rolling(window=3, min_periods=1).mean()
 
                     st.subheader("Intraday VPIN & CVD")
                     fig = make_subplots(specs=[[{"secondary_y": True}]])
@@ -1194,11 +1199,6 @@ with tab9:
                 st.error(f"⚠️ {result['Fragility Alert']} | Score: {result['Fragility Score']:.2f}")
 
     st.divider()
-    # Controls for VPIN/CVD plotting
-    smoothing_window = st.sidebar.slider("Smoothing window (bars)", min_value=1, max_value=21, value=3, step=1)
-    vpin_window_minutes = st.sidebar.slider("VPIN lookback window (minutes)", min_value=5, max_value=1440, value=250, step=5)
-    vpin_bucket_count = st.sidebar.slider("VPIN bucket count", min_value=10, max_value=200, value=50, step=5)
-
     st.subheader("Scan All Tickers & List Signals")
     save_plots = st.checkbox("Save VPIN/CVD plots for all tickers", value=False)
     if st.button("Scan All Tickers & List Signals"):

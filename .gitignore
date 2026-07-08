@@ -18,3 +18,4 @@ build/
 *.parquet
 *.csv
 *.json
+./data/
