@@ -16,6 +16,16 @@ except ImportError:
             sys.path.insert(0, str(package_root))
         from liquidity import calculate_liquidity_signals
 try:
+    from .bolling_bands import get_hybrid_risk_signal
+except ImportError:
+    try:
+        from risk_modeling.bolling_bands import get_hybrid_risk_signal
+    except ImportError:
+        package_root = Path(__file__).resolve().parent.parent
+        if str(package_root) not in sys.path:
+            sys.path.insert(0, str(package_root))
+        from bolling_bands import get_hybrid_risk_signal
+try:
     from ..data_pipeline.data_cache import get_data_persistent
 except ImportError:
     try:
@@ -164,7 +174,7 @@ def calculate_vpin_lite(returns, volumes, window=50):
     """
     Quiet Markets: VPIN will oscillate between 0.15 and 0.40.
     Trending Markets: VPIN will move toward 0.50 - 0.70.
-    Toxic/Pre-Crash (The SPY scenario): VPIN will climb above 0.80.
+    Toxic/Pre-Crash: VPIN will climb above 0.80.
     """
     
     r = np.array(returns[-window:])
@@ -378,6 +388,27 @@ def scan_market(ticker, show_judgment=True):
         print("ERROR: Not enough daily history.")
         return "ERROR - Insufficient 1d data"
 
+    hybrid_signal_result = {
+        "Hybrid Signal": "N/A",
+        "Hybrid Reason": "Unable to compute hybrid signal.",
+        "Hybrid VPIN": 0.0,
+        "Hybrid CVD Trend": "N/A",
+        "Hybrid Upper Band": None,
+        "Hybrid Lower Band": None,
+    }
+    try:
+        hybrid = get_hybrid_risk_signal(data_1m)
+        hybrid_signal_result.update({
+            "Hybrid Signal": hybrid.get("signal", "N/A"),
+            "Hybrid Reason": hybrid.get("signal_reason", "N/A"),
+            "Hybrid VPIN": float(hybrid.get("vpin", 0.0)),
+            "Hybrid CVD Trend": hybrid.get("cvd_trend", "N/A"),
+            "Hybrid Upper Band": float(hybrid.get("upper_band", np.nan)),
+            "Hybrid Lower Band": float(hybrid.get("lower_band", np.nan)),
+        })
+    except Exception as exc:
+        print(f"Hybrid signal computation failed: {exc}")
+
     prices = data_1m['Close'].values
     volumes = data_1m['Volume'].values
     returns_1m = np.diff(np.log(prices))
@@ -448,8 +479,9 @@ def scan_market(ticker, show_judgment=True):
         "Verdict": "N/A",
         "Suggestion": "N/A",
         "Reason": "N/A",
-        "CVD Trend": "N/A"
+        "CVD Trend": "N/A",
     }
+    result.update(hybrid_signal_result)
 
     if show_judgment:
         judgment, entropy, vpin, cvd_slope = compute_judgment(

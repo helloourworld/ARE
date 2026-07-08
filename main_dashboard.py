@@ -10,7 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[0]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data_pipeline import get_price_history
+from data_pipeline import get_price_history, get_10y_yield
 
 # --- SYSTEM CONFIG ---
 st.set_page_config(page_title="ARE Macro Terminal", layout="wide")
@@ -18,15 +18,13 @@ st.set_page_config(page_title="ARE Macro Terminal", layout="wide")
 # --- LIVE DATA INGESTION ENGINE ---
 @st.cache_data(ttl=3600)  # Automates update: Refreshes every 3600 seconds (1 hour)
 def fetch_macro_data():
-    # Ticker Mapping: ^TNX (10Y Yield), BZ=F (Brent), GC=F (Gold), ^VIX (Volatility)
-    # USDCAD=X (FX), ^GSPC (S&P 500)
+    # Ticker Mapping: BZ=F (Brent), GC=F (Gold), ^VIX (Volatility), USDCAD=X (FX)
     ticker_map = {
-        "^TNX": "US 10Y Yield",
         "BZ=F": "Brent Crude",
         "GC=F": "Gold",
         "^VIX": "VIX Index",
         "USDCAD=X": "USD/CAD",
-        "AMD": "Apple (AMD)"
+        "AMD": "AMD"
     }
     
     tickers = list(ticker_map.keys())
@@ -34,22 +32,25 @@ def fetch_macro_data():
     data = get_price_history(tickers, period="5d", interval="1d")
     stats = {}
     for t_id, name in ticker_map.items():
-        if t_id in data.columns:
-            current_val = data[t_id].dropna().iloc[-1]
-            prev_val = data[t_id].dropna().iloc[-2]
+        if t_id not in data.columns:
+            raise ValueError(f"Missing ticker data for {t_id} ({name})")
+
+        series = data[t_id].dropna()
+        if len(series) < 2:
+            raise ValueError(f"Not enough data points for {t_id} ({name}) to compute delta")
+
+        current_val = series.iloc[-1]
+        prev_val = series.iloc[-2]
         delta = current_val - prev_val
         delta_pct = (delta / prev_val) * 100
-        
-        # Correction for Yield: ^TNX returns 43.5 for 4.35%
-        if t_id == "^TNX":
-            current_val = current_val / 10
-            delta = delta / 10
             
         stats[name] = {
             "val": current_val,
             "delta": delta,
             "delta_pct": delta_pct
         }
+
+    stats["US 10Y Yield"] = get_10y_yield()
     return stats
 
 # --- RUN AUTO-UPDATE ---
@@ -67,9 +68,9 @@ st.caption(f"Strategy: Global Equity Alpha | Analyst: CFA Lead")
 m1, m2, m3, m4 = st.columns(4)
 
 with m1:
-    st.metric("Apple (AMD)", 
-              f"${live_stats['Apple (AMD)']['val']:.2f}", 
-              f"{live_stats['Apple (AMD)']['delta_pct']:+.2f}%")
+    st.metric("AMD", 
+              f"${live_stats['AMD']['val']:.2f}", 
+              f"{live_stats['AMD']['delta_pct']:+.2f}%")
     st.caption("Post-Earnings Momentum")
 
 with m2:

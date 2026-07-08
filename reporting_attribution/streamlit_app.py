@@ -38,6 +38,10 @@ from frontier_plots import plot_institutional_frontier
 from data_pipeline import get_daily_returns, get_price_history, get_price_history_with_benchmark, get_premarket_data, get_live_intraday
 from risk_modeling import AlphaRiskEngine, calculate_mansfield_rs, monitor_mean_reversion, calculate_rs_bollinger_bands, get_rs_signals, detect_rs_hook
 from risk_modeling.mandelbrot import scan_market
+from risk_modeling.bolling_bands import compute_rolling_vpin, compute_rolling_cvd
+from data_pipeline.data_cache import DATA_DIR
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # Apply default request headers for all requests sessions so yfinance uses headers
 DEFAULT_REQUEST_HEADERS = {
@@ -1141,6 +1145,15 @@ with tab9:
                 precision=3
             )
             render_metric_with_threshold(
+                "Hybrid Signal VPIN",
+                result.get('Hybrid VPIN', 0.0),
+                "< 0.45 = Accumulate bias, > 0.70 = Exit bias",
+                format_vpin_color(result.get('Hybrid VPIN', 0.0)),
+                precision=3
+            )
+            st.write(f"**Hybrid Signal:** {result.get('Hybrid Signal', 'N/A')} | {result.get('Hybrid Reason', '')}")
+            st.write(f"**Hybrid CVD Trend:** {result.get('Hybrid CVD Trend', 'N/A')}")
+            render_metric_with_threshold(
                 "Intraday Volatility",
                 result['Intraday Vol'],
                 "Threshold: 0.0015",
@@ -1149,6 +1162,28 @@ with tab9:
             )
             cvd_icon = get_cvd_icon(result['CVD Trend'])
             st.write(f"**CVD Trend:** {result['CVD Trend']} {cvd_icon}")
+            # Intraday VPIN & CVD plots
+            try:
+                intraday_df = get_data_persistent(alert_ticker, "1m")
+                if intraday_df is not None and not intraday_df.empty:
+                    vpin_series = compute_rolling_vpin(intraday_df, vpin_window=vpin_bucket_count, window_minutes=vpin_window_minutes)
+                    cvd_series = compute_rolling_cvd(intraday_df)
+                    # Smooth series
+                    vpin_s = vpin_series.rolling(window=smoothing_window, min_periods=1).mean()
+                    cvd_s = cvd_series.rolling(window=smoothing_window, min_periods=1).mean()
+
+                    st.subheader("Intraday VPIN & CVD")
+                    fig = make_subplots(specs=[[{"secondary_y": True}]])
+                    fig.add_trace(go.Scatter(x=vpin_s.index, y=vpin_s.values, name='VPIN (smoothed)', line=dict(color='orange')),
+                                  secondary_y=False)
+                    fig.add_trace(go.Scatter(x=cvd_s.index, y=cvd_s.values, name='CVD (smoothed)', line=dict(color='blue')),
+                                  secondary_y=True)
+                    fig.update_yaxes(title_text="VPIN", secondary_y=False)
+                    fig.update_yaxes(title_text="CVD", secondary_y=True)
+                    fig.update_layout(height=360, margin=dict(l=40, r=40, t=30, b=20))
+                    st.plotly_chart(fig, use_container_width=True)
+            except Exception as e:
+                st.write(f"VPIN/CVD plot failed: {e}")
             st.markdown("**Judgment & Suggestion**")
             st.write(
                 f"**Regime:** {get_regime_icon(result['Regime'])} {result['Regime']}")
@@ -1159,7 +1194,13 @@ with tab9:
                 st.error(f"⚠️ {result['Fragility Alert']} | Score: {result['Fragility Score']:.2f}")
 
     st.divider()
+    # Controls for VPIN/CVD plotting
+    smoothing_window = st.sidebar.slider("Smoothing window (bars)", min_value=1, max_value=21, value=3, step=1)
+    vpin_window_minutes = st.sidebar.slider("VPIN lookback window (minutes)", min_value=5, max_value=1440, value=250, step=5)
+    vpin_bucket_count = st.sidebar.slider("VPIN bucket count", min_value=10, max_value=200, value=50, step=5)
+
     st.subheader("Scan All Tickers & List Signals")
+    save_plots = st.checkbox("Save VPIN/CVD plots for all tickers", value=False)
     if st.button("Scan All Tickers & List Signals"):
         import io
         from contextlib import redirect_stdout
@@ -1179,17 +1220,39 @@ with tab9:
                 cvd_icon = get_cvd_icon(result.get("CVD Trend", "N/A"))
                 all_signals.append({
                     "Ticker": ticker,
-                    "Price": f"{result['Price']:.2f}",
-                    "Hurst": f"{result['Hurst']:.3f}",
-                    "Tail Index": f"{result['Tail Index']:.3f}",
+                    "Price": f"{result.get('Price', 0.0):.2f}",
+                    "Hurst": f"{result.get('Hurst', 0.0):.3f}",
+                    "Tail Index": f"{result.get('Tail Index', 0.0):.3f}",
                     "VPIN": f"{result.get('VPIN', 0.0):.3f}",
-                    "CVD Trend": f"{cvd_icon} {result['CVD Trend']}",
-                    "Signal/Regime": f"{result['Regime']} {get_regime_icon(result['Regime'])}",
-                    "Verdict": result['Verdict'],
-                    "Suggestion": result['Suggestion'],
-                    "Reason": result['Reason'],
+                    "Hybrid VPIN": f"{result.get('Hybrid VPIN', 0.0):.3f}",
+                    "Hybrid Signal": result.get('Hybrid Signal', 'N/A'),
+                    "Hybrid CVD Trend": result.get('Hybrid CVD Trend', 'N/A'),
+                    "CVD Trend": f"{cvd_icon} {result.get('CVD Trend', 'N/A')}",
+                    "Signal/Regime": f"{result.get('Regime')} {get_regime_icon(result.get('Regime'))}",
+                    "Verdict": result.get('Verdict', ''),
+                    "Suggestion": result.get('Suggestion', ''),
+                    "Reason": result.get('Reason', ''),
                     "Fragility": result.get('Fragility Alert', '')
                 })
+
+                # Optionally save plots per ticker
+                if save_plots:
+                    try:
+                        intraday = get_data_persistent(ticker, "1m")
+                        if intraday is not None and not intraday.empty:
+                            vpin_s = compute_rolling_vpin(intraday, vpin_window=vpin_bucket_count, window_minutes=vpin_window_minutes).rolling(window=smoothing_window, min_periods=1).mean()
+                            cvd_s = compute_rolling_cvd(intraday).rolling(window=smoothing_window, min_periods=1).mean()
+                            fig = make_subplots(specs=[[{"secondary_y": True}]])
+                            fig.add_trace(go.Scatter(x=vpin_s.index, y=vpin_s.values, name='VPIN (smoothed)', line=dict(color='orange')), secondary_y=False)
+                            fig.add_trace(go.Scatter(x=cvd_s.index, y=cvd_s.values, name='CVD (smoothed)', line=dict(color='blue')), secondary_y=True)
+                            fig.update_yaxes(title_text="VPIN", secondary_y=False)
+                            fig.update_yaxes(title_text="CVD", secondary_y=True)
+                            out_dir = DATA_DIR / 'hybrid_plots'
+                            out_dir.mkdir(parents=True, exist_ok=True)
+                            out_file = out_dir / f"{ticker}_vpin_cvd.html"
+                            fig.write_html(str(out_file))
+                    except Exception as e:
+                        print(f"Failed saving plot for {ticker}: {e}")
 
         # Display signals table
         df_signals = pd.DataFrame(all_signals).sort_values(

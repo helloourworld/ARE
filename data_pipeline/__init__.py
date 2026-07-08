@@ -9,6 +9,7 @@ from .data_utils import (
     get_price_history_with_benchmark,
     get_premarket_data,
     get_live_intraday,
+    get_10y_yield,
 )
 
 from .data_cache import (
@@ -28,4 +29,5 @@ __all__ = [
     "get_data_persistent",
     "get_ohlcv_history",
     "force_refresh_ticker",
+    "get_10y_yield"
 ]

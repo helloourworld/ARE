@@ -15,6 +15,7 @@ from .rs_trend import (
     calculate_rs_bollinger_bands,
     detect_rs_hook,
 )
+from .bolling_bands import get_hybrid_risk_signal
 from data_pipeline.data_cache import get_data_persistent
 
 __all__ = [
@@ -25,5 +26,6 @@ __all__ = [
     "monitor_mean_reversion",
     "calculate_rs_bollinger_bands",
     "detect_rs_hook",
+    "get_hybrid_risk_signal",
     "get_data_persistent",
 ]
