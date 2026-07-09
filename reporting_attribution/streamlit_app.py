@@ -1186,7 +1186,7 @@ with tab9:
                     fig.update_yaxes(title_text="VPIN", secondary_y=False)
                     fig.update_yaxes(title_text="CVD", secondary_y=True)
                     fig.update_layout(height=360, margin=dict(l=40, r=40, t=30, b=20))
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width=700)
             except Exception as e:
                 st.write(f"VPIN/CVD plot failed: {e}")
             st.markdown("**Judgment & Suggestion**")

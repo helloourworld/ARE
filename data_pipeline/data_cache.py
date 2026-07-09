@@ -1,15 +1,40 @@
-from datetime import timedelta
+"""
+Persistent data cache for OHLCV history.
+
+This module centralizes persistent price data access through a local CSV cache under data/.
+It refreshes data from Yahoo Finance when needed and uses Interactive Brokers as a fallback
+source for OHLCV history when the IB API is available.
+
+Usage example:
+
+    from data_pipeline.data_cache import get_price_history
+
+    prices = get_price_history(["AAPL", "MSFT"], period="1y", interval="1d")
+    print(prices.tail())
+"""
+
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Thread
+import time
+
 import pandas as pd
 import yfinance as yf
-import numpy as np
+
+try:
+    from ibapi.client import EClient
+    from ibapi.contract import Contract
+    from ibapi.wrapper import EWrapper
+except Exception:
+    EClient = None
+    EWrapper = None
+    Contract = None
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_ROOT / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Global cache tracking for multi-ticker operations
-_MULTI_TICKER_CACHE = {}
+IB_CLIENT_AVAILABLE = EClient is not None and EWrapper is not None and Contract is not None
 
 
 def _get_cache_path(file_name: str) -> Path:
@@ -26,13 +51,34 @@ def _get_cache_path(file_name: str) -> Path:
 
 def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
-        return df
+        return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
         df = df.copy()
         df.columns = df.columns.get_level_values(0)
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC")
     return df
+
+
+def _normalize_ib_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if "datetime" in df.columns:
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+        df = df.set_index("datetime")
+    if not isinstance(df.index, pd.DatetimeIndex):
+        return pd.DataFrame()
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+
+    df = df.rename(columns={
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "volume": "Volume",
+    })
+    return df.loc[:, [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]]
 
 
 def normalize_timestamp_for_index(value, index):
@@ -42,60 +88,278 @@ def normalize_timestamp_for_index(value, index):
     return ts
 
 
+def _load_cached_csv(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path, index_col=0, parse_dates=True)
+    return _normalize_yf_df(df)
+
+
+def _normalize_tickers(tickers):
+    """Normalize ticker input to a list of symbols."""
+    if isinstance(tickers, str):
+        return [tickers]
+    return list(tickers) if tickers else []
+
+
+def _load_close_series(tickers, interval="1d", period="2y", force_refresh=False):
+    """Load closing price series for symbols through the persistent cache.
+
+    Each ticker is loaded via get_data_persistent, so this method inherits the
+    local CSV refresh, IB fallback, and Yahoo Finance fetch behavior.
+    """
+    tickers = _normalize_tickers(tickers)
+    if not tickers:
+        return pd.DataFrame()
+
+    price_data = {}
+    for ticker in tickers:
+        df = get_data_persistent(ticker, interval=interval, period=period, force_refresh=force_refresh)
+        if not df.empty:
+            price_data[ticker] = df["Close"]
+    return pd.DataFrame(price_data)
+
+
+def _cache_dataframe(df: pd.DataFrame, file_path: Path) -> pd.DataFrame:
+    df.to_csv(file_path)
+    return df
+
+
+def _refresh_from_yf(ticker: str, start_date, interval: str) -> pd.DataFrame:
+    return yf.download(
+        ticker,
+        start=start_date,
+        interval=interval,
+        prepost=True,
+        progress=False,
+    )
+
+
+def _refresh_local_cache(local_df: pd.DataFrame, ticker: str, interval: str, file_path: Path) -> pd.DataFrame:
+    last_ts = local_df.index[-1]
+    wait_time = timedelta(minutes=2) if interval == "1m" else timedelta(hours=12)
+    if pd.Timestamp.now(tz="UTC") - last_ts < wait_time:
+        return local_df
+
+    start_date = max(last_ts, pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=7)) if interval == "1m" else last_ts
+    if hasattr(start_date, "to_pydatetime"):
+        start_date = start_date.to_pydatetime()
+
+    new_data = _refresh_from_yf(ticker, start_date, interval)
+    if new_data.empty:
+        return local_df
+
+    new_data = new_data[1:]
+    new_data = _normalize_yf_df(new_data)
+    combined = pd.concat([local_df, new_data])
+    combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+    return _cache_dataframe(combined, file_path)
+
+
+def _fetch_yf_initial(ticker: str, interval: str, period: str) -> pd.DataFrame:
+    fetch_period = "7d" if interval == "1m" else period
+    print(f"initializing download for {ticker} with interval {interval} and period {fetch_period}")
+    return yf.download(ticker, period=fetch_period, interval=interval, prepost=True, progress=True)
+
+
+def _map_interval_to_ib_barsize(interval: str) -> str | None:
+    return {
+        "1m": "1 min",
+        "2m": "2 mins",
+        "3m": "3 mins",
+        "5m": "5 mins",
+        "10m": "10 mins",
+        "15m": "15 mins",
+        "30m": "30 mins",
+        "1h": "1 hour",
+        "4h": "4 hours",
+        "1d": "1 day",
+        "1wk": "1 week",
+        "1mo": "1 month",
+    }.get(str(interval).lower())
+
+
+def _normalize_duration(period: str) -> str:
+    if not period:
+        return "2 Y"
+    s = str(period).strip().lower()
+    if s.endswith("mo"):
+        return f"{int(s[:-2])} M"
+    if s.endswith("wk"):
+        return f"{int(s[:-2])} W"
+    if s.endswith("d") and not s.endswith("wd"):
+        return f"{int(s[:-1])} D"
+    if s.endswith("y"):
+        return f"{int(s[:-1])} Y"
+    return str(period).upper()
+
+
+if IB_CLIENT_AVAILABLE:
+    class IBKRApp(EWrapper, EClient):
+        """Simple Interactive Brokers wrapper for historical data requests."""
+
+        def __init__(self):
+            EClient.__init__(self, self)
+            self.data = []
+            self.finished = False
+
+        def historicalData(self, reqId, bar):
+            self.data.append({
+                "datetime": bar.date,
+                "open": bar.open,
+                "high": bar.high,
+                "low": bar.low,
+                "close": bar.close,
+                "volume": bar.volume,
+            })
+
+        def historicalDataEnd(self, reqId, start, end):
+            self.finished = True
+else:
+    class IBKRApp:
+        """Fallback placeholder when the IB API is not installed."""
+
+        def __init__(self):
+            raise RuntimeError("IB API is not available")
+
+        def historicalData(self, reqId, bar):
+            raise RuntimeError("IB API is not available")
+
+        def historicalDataEnd(self, reqId, start, end):
+            raise RuntimeError("IB API is not available")
+
+
+def run_loop(app):
+    """Run the IB API event loop in a separate thread."""
+    app.run()
+
+
+def get_data_from_ib(ticker: str, interval: str = "1d", period: str = "2y") -> pd.DataFrame:
+    """Fetch historical OHLCV from Interactive Brokers as a backup source."""
+    if not IB_CLIENT_AVAILABLE:
+        print("IB API unavailable: install ibapi to enable fallback.")
+        return pd.DataFrame()
+
+    bar_size = _map_interval_to_ib_barsize(interval)
+    if bar_size is None:
+        print(f"Unsupported IB interval: {interval}")
+        return pd.DataFrame()
+
+    duration = _normalize_duration(period)
+    app = IBKRApp()
+    try:
+        app.connect("127.0.0.1", 4002, clientId=999)
+    except Exception as exc:
+        print(f"IB connect failed: {exc}")
+        return pd.DataFrame()
+
+    api_thread = Thread(target=run_loop, args=(app,))
+    api_thread.daemon = True
+    api_thread.start()
+    time.sleep(1)
+
+    contract = Contract()
+    contract.symbol = ticker
+    contract.secType = "STK"
+    contract.exchange = "SMART"
+    contract.currency = "USD"
+
+    end_time = datetime.now(timezone.utc).strftime("%Y%m%d %H:%M:%S")
+    try:
+        app.reqHistoricalData(
+            reqId=1,
+            contract=contract,
+            endDateTime=end_time,
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow="TRADES",
+            useRTH=0,
+            formatDate=1,
+            keepUpToDate=0,
+            chartOptions=[],
+            timezoneId="America/New_York",
+        )
+    except Exception as exc:
+        print(f"IB historical request failed: {exc}")
+        try:
+            app.disconnect()
+        except Exception:
+            pass
+        return pd.DataFrame()
+
+    timeout = time.time() + 30
+    while not app.finished and time.time() < timeout:
+        time.sleep(0.5)
+
+    try:
+        app.disconnect()
+    except Exception:
+        pass
+
+    if not app.data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(app.data)
+    df = _normalize_ib_df(df)
+    if df.empty:
+        return pd.DataFrame()
+
+    return df[~df.index.duplicated(keep="last")].sort_index()
+
+
 def get_data_persistent(ticker, interval="1d", period="2y", force_refresh=False):
-    """Load OHLCV data from a local cache first, then refresh from Yahoo Finance as needed."""
+    """Load OHLCV data from the local cache, refreshing or fetching as needed.
+
+    Workflow:
+    1. Read cached CSV data if available.
+    2. Refresh stale cache from Yahoo Finance.
+    3. If no cache exists, try IB fallback first.
+    4. Finally, download initial history from Yahoo Finance.
+    """
     safe_ticker = str(ticker).replace("/", "_").replace("=", "_")
     file_path = _get_cache_path(f"cache_{safe_ticker}_{interval}.csv")
     now = pd.Timestamp.now(tz="UTC")
 
     try:
         if file_path.exists() and not force_refresh:
-            local_df = pd.read_csv(file_path, index_col=0, parse_dates=True)
-            local_df = _normalize_yf_df(local_df)
-
+            local_df = _load_cached_csv(file_path)
             if local_df.empty:
                 return local_df
 
-            last_ts = pd.Timestamp(local_df.index[-2])
-            wait_time = timedelta(minutes=2) if interval == "1m" else timedelta(hours=12)
-            if now - last_ts < wait_time:
-                return local_df
-
-            start_date = (max(last_ts, now - pd.Timedelta(days=7)) if interval == "1m" else last_ts)
-            if hasattr(start_date, "to_pydatetime"):
-                start_date = start_date.to_pydatetime()
-
-            new_data = yf.download(
-                ticker,
-                start=start_date,
-                interval=interval,
-                prepost=True,
-                progress=False,
-            )
-            if not new_data.empty:
-                new_data = new_data[1:]  # skip the first row to avoid duplicates
-                new_data = _normalize_yf_df(new_data)
-                combined = pd.concat([local_df, new_data])
-                combined = combined[~combined.index.duplicated(keep="last")].sort_index()
-                combined.to_csv(file_path)
-                return combined
+            refreshed_df = _refresh_local_cache(local_df, ticker, interval, file_path)
+            if not refreshed_df.empty:
+                return refreshed_df
             return local_df
-        p = "7d" if interval == "1m" else period
-        print(f"initializing download for {ticker} with interval {interval} and period {p}")
-        df = yf.download(ticker, period=p, interval=interval, prepost=True, progress=True)
-        if df is None or df.empty:
+
+        if IB_CLIENT_AVAILABLE:
+            ib_df = get_data_from_ib(ticker, interval=interval, period=period)
+            if not ib_df.empty:
+                ib_df = _normalize_yf_df(ib_df)
+                return _cache_dataframe(ib_df, file_path)
+
+        yf_df = _fetch_yf_initial(ticker, interval, period)
+        if yf_df is None or yf_df.empty:
             return pd.DataFrame()
-        df = _normalize_yf_df(df)
-        df.to_csv(file_path)
-        return df
-    except Exception as e:
-        print("Download/cache error:", repr(e))
+        yf_df = _normalize_yf_df(yf_df)
+        return _cache_dataframe(yf_df, file_path)
+    except Exception as exc:
+        print("Download/cache error:", repr(exc))
         return pd.DataFrame()
 
 
 # ============================================================================
 # CONSOLIDATED DATA FETCHING INTERFACE - All methods route through cache
 # ============================================================================
+
+__all__ = [
+    "get_data_from_ib",
+    "get_data_persistent",
+    "get_daily_returns",
+    "get_price_history",
+    "get_price_history_with_benchmark",
+    "get_ohlcv_history",
+    "get_premarket_data",
+    "get_live_intraday",
+    "force_refresh_ticker",
+]
 
 def get_daily_returns(tickers, benchmark, start_date):
     """
@@ -110,27 +374,15 @@ def get_daily_returns(tickers, benchmark, start_date):
     Returns:
         DataFrame of daily returns
     """
-    if isinstance(tickers, str):
-        tickers = [tickers]
-    
+    tickers = _normalize_tickers(tickers)
     all_tickers = list(set(tickers + [benchmark]))
-    
-    # Fetch all tickers through persistent cache
-    price_data = {}
-    for ticker in all_tickers:
-        df = get_data_persistent(ticker, interval="1d", period="5y", force_refresh=False)
-        if not df.empty:
-            price_data[ticker] = df['Close']
-    
-    if not price_data:
+    price_data = _load_close_series(all_tickers, interval="1d", period="5y", force_refresh=False)
+    if price_data.empty:
         return pd.DataFrame()
-    
-    prices_df = pd.DataFrame(price_data)
-    # Filter by start_date
-    start_ts = normalize_timestamp_for_index(start_date, prices_df.index)
-    prices_df = prices_df[prices_df.index >= start_ts].dropna()
-    
-    return prices_df.pct_change(fill_method=None).dropna()
+
+    start_ts = normalize_timestamp_for_index(start_date, price_data.index)
+    price_data = price_data[price_data.index >= start_ts].dropna()
+    return price_data.pct_change(fill_method=None).dropna()
 
 
 def get_price_history(tickers, period="2y", interval="1d"):
@@ -146,19 +398,7 @@ def get_price_history(tickers, period="2y", interval="1d"):
     Returns:
         DataFrame of closing prices
     """
-    if isinstance(tickers, str):
-        tickers = [tickers]
-    
-    price_data = {}
-    for ticker in tickers:
-        df = get_data_persistent(ticker, interval=interval, period=period, force_refresh=False)
-        if not df.empty:
-            price_data[ticker] = df['Close']
-    
-    if not price_data:
-        return pd.DataFrame()
-    
-    return pd.DataFrame(price_data)
+    return _load_close_series(tickers, interval=interval, period=period, force_refresh=False)
 
 
 def get_price_history_with_benchmark(tickers, benchmark, period="2y", interval="1d"):
@@ -175,21 +415,7 @@ def get_price_history_with_benchmark(tickers, benchmark, period="2y", interval="
     Returns:
         DataFrame of closing prices including benchmark
     """
-    if isinstance(tickers, str):
-        tickers = [tickers]
-    
-    all_tickers = tickers + [benchmark]
-    price_data = {}
-    
-    for ticker in all_tickers:
-        df = get_data_persistent(ticker, interval=interval, period=period, force_refresh=False)
-        if not df.empty:
-            price_data[ticker] = df['Close']
-    
-    if not price_data:
-        return pd.DataFrame()
-    
-    return pd.DataFrame(price_data)
+    return _load_close_series(tickers + [benchmark], interval=interval, period=period, force_refresh=False)
 
 
 def get_ohlcv_history(tickers, period="2y", interval="1d", force_refresh=False):
@@ -206,9 +432,10 @@ def get_ohlcv_history(tickers, period="2y", interval="1d", force_refresh=False):
     Returns:
         DataFrame with OHLCV data
     """
-    if isinstance(tickers, str):
-        tickers = [tickers]
-    
+    tickers = _normalize_tickers(tickers)
+    if not tickers:
+        return pd.DataFrame()
+
     ohlcv_data = {}
     for ticker in tickers:
         df = get_data_persistent(ticker, interval=interval, period=period, force_refresh=force_refresh)
@@ -218,12 +445,10 @@ def get_ohlcv_history(tickers, period="2y", interval="1d", force_refresh=False):
     if not ohlcv_data:
         return pd.DataFrame()
     
-    # For single ticker, return directly; for multiple, combine with MultiIndex
     if len(ohlcv_data) == 1:
         return list(ohlcv_data.values())[0]
     
-    combined = pd.concat(ohlcv_data, axis=1)
-    return combined
+    return pd.concat(ohlcv_data, axis=1)
 
 
 def get_premarket_data(tickers):
@@ -237,31 +462,17 @@ def get_premarket_data(tickers):
     Returns:
         Tuple of (intraday_data, daily_history) or (None, None) on error
     """
+    tickers = _normalize_tickers(tickers)
     if not tickers:
         return None, None
     
-    if isinstance(tickers, str):
-        tickers = [tickers]
-    
     try:
-        # 1-minute data with pre/post market through cache
-        intraday_data = {}
-        for ticker in tickers:
-            df = get_data_persistent(ticker, interval="1m", period="7d", force_refresh=False)
-            if not df.empty:
-                intraday_data[ticker] = df['Close']
-        
-        # 2-day daily data through cache
-        daily_data = {}
-        for ticker in tickers:
-            df = get_data_persistent(ticker, interval="1d", period="2d", force_refresh=False)
-            if not df.empty:
-                daily_data[ticker] = df['Close']
-        
-        intraday_result = pd.DataFrame(intraday_data) if intraday_data else None
-        daily_result = pd.DataFrame(daily_data) if daily_data else None
-        
-        return intraday_result, daily_result
+        intraday_result = _load_close_series(tickers, interval="1m", period="7d", force_refresh=False)
+        daily_result = _load_close_series(tickers, interval="1d", period="2d", force_refresh=False)
+        return (
+            intraday_result if not intraday_result.empty else None,
+            daily_result if not daily_result.empty else None,
+        )
     except Exception as e:
         print(f"Premarket data error: {e}")
         return None, None
@@ -280,20 +491,13 @@ def get_live_intraday(tickers, period="2d", force_refresh=True):
     Returns:
         DataFrame of 1-minute interval closing prices
     """
+    tickers = _normalize_tickers(tickers)
     if not tickers:
         return None
     
-    if isinstance(tickers, str):
-        tickers = [tickers]
-    
     try:
-        price_data = {}
-        for ticker in tickers:
-            df = get_data_persistent(ticker, interval="1m", period=period, force_refresh=force_refresh)
-            if not df.empty:
-                price_data[ticker] = df['Close']
-        
-        return pd.DataFrame(price_data) if price_data else None
+        result = _load_close_series(tickers, interval="1m", period=period, force_refresh=force_refresh)
+        return result if not result.empty else None
     except Exception as e:
         print(f"Live intraday error: {e}")
         return None
