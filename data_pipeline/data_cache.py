@@ -38,6 +38,10 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 IB_CLIENT_AVAILABLE = EClient is not None and EWrapper is not None and Contract is not None
 IS_WINDOWS = platform.system().lower().startswith("win")
 IB_FALLBACK_ENABLED = IB_CLIENT_AVAILABLE and not IS_WINDOWS
+IB_YF_SUFFIX_MAP = {
+    "TO": {"primaryExchange": "TSE", "currency": "CAD"},
+    "NE": {"primaryExchange": "AEQN", "currency": "CAD"},
+}
 
 
 def _get_cache_path(file_name: str) -> Path:
@@ -230,6 +234,32 @@ def _normalize_duration(period: str) -> str:
     return str(period).upper()
 
 
+def _build_ib_contract_from_ticker(ticker: str):
+    """Map Yahoo-style ticker symbols to IB contract fields."""
+    ticker_str = str(ticker).strip().upper()
+    if not ticker_str:
+        return None
+
+    base_symbol = ticker_str
+    mapping = {"primaryExchange": "NASDAQ", "currency": "USD"}
+
+    if "." in ticker_str:
+        maybe_symbol, maybe_suffix = ticker_str.rsplit(".", 1)
+        if maybe_suffix in IB_YF_SUFFIX_MAP:
+            base_symbol = maybe_symbol
+            mapping = IB_YF_SUFFIX_MAP[maybe_suffix]
+        else:
+            return None
+
+    contract = Contract()
+    contract.symbol = base_symbol
+    contract.secType = "STK"
+    contract.exchange = "SMART"
+    contract.primaryExchange = mapping["primaryExchange"]
+    contract.currency = mapping["currency"]
+    return contract
+
+
 if IB_CLIENT_AVAILABLE:
     class IBKRApp(EWrapper, EClient):
         """Simple Interactive Brokers wrapper for historical data requests."""
@@ -311,12 +341,14 @@ def get_data_from_ib(ticker: str, interval: str = "1d", period: str = "2y") -> p
     api_thread.start()
     time.sleep(1)
 
-    contract = Contract()
-    contract.symbol = ticker
-    contract.secType = "STK"
-    contract.exchange = "SMART"
-    contract.primaryExchange = "NASDAQ"
-    contract.currency = "USD"
+    contract = _build_ib_contract_from_ticker(ticker)
+    if contract is None:
+        print(f"Skipping IB fallback for {ticker}: unsupported Yahoo suffix for IB mapping.")
+        try:
+            app.disconnect()
+        except Exception:
+            pass
+        return pd.DataFrame()
 
     # IB UTC notation requires a dash and no trailing timezone token.
     end_time = datetime.now(timezone.utc).strftime("%Y%m%d-%H:%M:%S")
