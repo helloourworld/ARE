@@ -55,24 +55,40 @@ def _get_cache_path(file_name: str) -> Path:
 def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
+    
+    df = df.copy()  # Always work with a copy to avoid SettingWithCopyWarning
+    
     if isinstance(df.columns, pd.MultiIndex):
-        df = df.copy()
         df.columns = df.columns.get_level_values(0)
-    if df.index.tz is None:
-        df.index = df.index.tz_localize("UTC")
+    
+    # Ensure index is timezone-aware UTC
+    if isinstance(df.index, pd.DatetimeIndex):
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        elif df.index.tz != "UTC":
+            df.index = df.index.tz_convert("UTC")
+    
     return df
 
 
 def _normalize_ib_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
+    
+    df = df.copy()  # Always work with a copy
+    
     if "datetime" in df.columns:
-        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
         df = df.set_index("datetime")
+    
     if not isinstance(df.index, pd.DatetimeIndex):
         return pd.DataFrame()
+    
+    # Ensure index is timezone-aware UTC
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC")
+    elif df.index.tz != "UTC":
+        df.index = df.index.tz_convert("UTC")
 
     df = df.rename(columns={
         "open": "Open",
@@ -93,7 +109,11 @@ def normalize_timestamp_for_index(value, index):
 
 def _load_cached_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, index_col=0, parse_dates=True)
-    return _normalize_yf_df(df)
+    # Ensure timezone is always localized to UTC after loading from CSV
+    df = _normalize_yf_df(df)
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    return df
 
 
 def _normalize_tickers(tickers):
@@ -125,11 +145,23 @@ def _cache_dataframe(df: pd.DataFrame, file_path: Path) -> pd.DataFrame:
     df.to_csv(file_path)
     return df
 
-
+ERROR -1 2104 Market data farm connection is OK:usfarm
+ERROR -1 2106 HMDS data farm connection is OK:ushmds
+ERROR -1 2158 Sec-def data farm connection is OK:secdefil
+ERROR 1 2174 Warning: You submitted request with date-time attributes without explicit time zone. Please switch to use yyyymmdd-hh:mm:ss in UTC or use instrument time zone, like US/Eastern. Implied time zone functionality will be removed in the next API release
+ERROR 1 200 No security definition has been found for the request
 def _refresh_from_yf(ticker: str, start_date, interval: str) -> pd.DataFrame:
+    """Refresh data from Yahoo Finance with proper date handling."""
+    # Convert timezone-aware Timestamp to string format that yfinance expects
+    if hasattr(start_date, "strftime"):
+        # It's a datetime/Timestamp object - convert to YYYY-MM-DD string
+        start_date_str = start_date.strftime("%Y-%m-%d")
+    else:
+        start_date_str = str(start_date)
+    
     return yf.download(
         ticker,
-        start=start_date,
+        start=start_date_str,
         interval=interval,
         prepost=True,
         progress=False,
@@ -138,13 +170,20 @@ def _refresh_from_yf(ticker: str, start_date, interval: str) -> pd.DataFrame:
 
 def _refresh_local_cache(local_df: pd.DataFrame, ticker: str, interval: str, file_path: Path) -> pd.DataFrame:
     last_ts = local_df.index[-1]
+    
+    # Ensure last_ts is timezone-aware
+    if last_ts.tzinfo is None:
+        last_ts = pd.Timestamp(last_ts, tz="UTC")
+    
+    # Ensure comparison with timezone-aware now
+    now_utc = pd.Timestamp.now(tz="UTC")
     wait_time = timedelta(minutes=2) if interval == "1m" else timedelta(hours=12)
-    if pd.Timestamp.now(tz="UTC") - last_ts < wait_time:
+    
+    if now_utc - last_ts < wait_time:
         return local_df
 
-    start_date = max(last_ts, pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=7)) if interval == "1m" else last_ts
-    if hasattr(start_date, "to_pydatetime"):
-        start_date = start_date.to_pydatetime()
+    # Use the Timestamp object directly - _refresh_from_yf will handle conversion
+    start_date = max(last_ts, now_utc - pd.Timedelta(days=7)) if interval == "1m" else last_ts
 
     new_data = _refresh_from_yf(ticker, start_date, interval)
     if new_data.empty:
