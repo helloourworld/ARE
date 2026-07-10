@@ -145,7 +145,8 @@ def _cache_dataframe(df: pd.DataFrame, file_path: Path) -> pd.DataFrame:
     df.to_csv(file_path)
     return df
 
-
+IB request error reqId=1 code=10314: End Date/Time: The date, time, or time-zone entered is invalid. The correct format is yyyymmdd hh:mm:ss xx/xxxx where yyyymmdd and xx/xxxx are optional. E.g.: 20031126 15:59:00 US/Eastern  Note that there is a space between the date and time, and between the time and time-zone.  If no date is specified, current date is assumed. If no time-zone is specified, local time-zone is assumed(deprecated).  You can also provide yyyymmddd-hh:mm:ss time is in UTC. Note that there is a dash between the date and time in UTC notation.
+initializing download for CHPS.TO with interval 1m and period 7d
 def _refresh_from_yf(ticker: str, start_date, interval: str) -> pd.DataFrame:
     """Refresh data from Yahoo Finance with proper date handling."""
     # Convert timezone-aware Timestamp to string format that yfinance expects
