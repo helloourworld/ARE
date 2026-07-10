@@ -145,11 +145,7 @@ def _cache_dataframe(df: pd.DataFrame, file_path: Path) -> pd.DataFrame:
     df.to_csv(file_path)
     return df
 
-ERROR -1 2104 Market data farm connection is OK:usfarm
-ERROR -1 2106 HMDS data farm connection is OK:ushmds
-ERROR -1 2158 Sec-def data farm connection is OK:secdefil
-ERROR 1 2174 Warning: You submitted request with date-time attributes without explicit time zone. Please switch to use yyyymmdd-hh:mm:ss in UTC or use instrument time zone, like US/Eastern. Implied time zone functionality will be removed in the next API release
-ERROR 1 200 No security definition has been found for the request
+
 def _refresh_from_yf(ticker: str, start_date, interval: str) -> pd.DataFrame:
     """Refresh data from Yahoo Finance with proper date handling."""
     # Convert timezone-aware Timestamp to string format that yfinance expects
@@ -242,6 +238,7 @@ if IB_CLIENT_AVAILABLE:
             EClient.__init__(self, self)
             self.data = []
             self.finished = False
+            self.request_error = None
 
         def historicalData(self, reqId, bar):
             self.data.append({
@@ -255,6 +252,14 @@ if IB_CLIENT_AVAILABLE:
 
         def historicalDataEnd(self, reqId, start, end):
             self.finished = True
+
+        def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
+            # 2104/2106/2158 are IB connectivity status messages, not fatal request errors.
+            if errorCode in {2104, 2106, 2158}:
+                return
+            self.request_error = (reqId, errorCode, errorString)
+            if reqId in {1, -1}:
+                self.finished = True
 else:
     class IBKRApp:
         """Fallback placeholder when the IB API is not installed."""
@@ -284,6 +289,10 @@ def get_data_from_ib(ticker: str, interval: str = "1d", period: str = "2y") -> p
         print("IB API unavailable: install ibapi to enable fallback.")
         return pd.DataFrame()
 
+    # Skip IB fallback for symbols that are typically not valid IB stock contracts.
+    if str(ticker).startswith("^") or any(ch in str(ticker) for ch in ["=", "/"]):
+        return pd.DataFrame()
+
     bar_size = _map_interval_to_ib_barsize(interval)
     if bar_size is None:
         print(f"Unsupported IB interval: {interval}")
@@ -306,9 +315,10 @@ def get_data_from_ib(ticker: str, interval: str = "1d", period: str = "2y") -> p
     contract.symbol = ticker
     contract.secType = "STK"
     contract.exchange = "SMART"
+    contract.primaryExchange = "NASDAQ"
     contract.currency = "USD"
 
-    end_time = datetime.now(timezone.utc).strftime("%Y%m%d %H:%M:%S")
+    end_time = datetime.now(timezone.utc).strftime("%Y%m%d-%H:%M:%S UTC")
     request_kwargs = {
         "reqId": 1,
         "contract": contract,
@@ -342,6 +352,15 @@ def get_data_from_ib(ticker: str, interval: str = "1d", period: str = "2y") -> p
     timeout = time.time() + 30
     while not app.finished and time.time() < timeout:
         time.sleep(0.5)
+
+    if app.request_error is not None:
+        req_id, code, message = app.request_error
+        print(f"IB request error reqId={req_id} code={code}: {message}")
+        try:
+            app.disconnect()
+        except Exception:
+            pass
+        return pd.DataFrame()
 
     try:
         app.disconnect()
