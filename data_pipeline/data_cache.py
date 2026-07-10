@@ -16,6 +16,7 @@ Usage example:
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Thread
+import platform
 import time
 
 import pandas as pd
@@ -35,6 +36,8 @@ DATA_DIR = REPO_ROOT / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 IB_CLIENT_AVAILABLE = EClient is not None and EWrapper is not None and Contract is not None
+IS_WINDOWS = platform.system().lower().startswith("win")
+IB_FALLBACK_ENABLED = IB_CLIENT_AVAILABLE and not IS_WINDOWS
 
 
 def _get_cache_path(file_name: str) -> Path:
@@ -157,7 +160,7 @@ def _refresh_local_cache(local_df: pd.DataFrame, ticker: str, interval: str, fil
 def _fetch_yf_initial(ticker: str, interval: str, period: str) -> pd.DataFrame:
     fetch_period = "7d" if interval == "1m" else period
     print(f"initializing download for {ticker} with interval {interval} and period {fetch_period}")
-    return yf.download(ticker, period=fetch_period, interval=interval, prepost=True, progress=True)
+    return yf.download(ticker, period=fetch_period, interval=interval, prepost=True, progress=False)
 
 
 def _map_interval_to_ib_barsize(interval: str) -> str | None:
@@ -234,6 +237,10 @@ def run_loop(app):
 
 def get_data_from_ib(ticker: str, interval: str = "1d", period: str = "2y") -> pd.DataFrame:
     """Fetch historical OHLCV from Interactive Brokers as a backup source."""
+    if IS_WINDOWS:
+        print("IB fallback disabled on Windows; using cache/Yahoo Finance path.")
+        return pd.DataFrame()
+
     if not IB_CLIENT_AVAILABLE:
         print("IB API unavailable: install ibapi to enable fallback.")
         return pd.DataFrame()
@@ -263,20 +270,28 @@ def get_data_from_ib(ticker: str, interval: str = "1d", period: str = "2y") -> p
     contract.currency = "USD"
 
     end_time = datetime.now(timezone.utc).strftime("%Y%m%d %H:%M:%S")
+    request_kwargs = {
+        "reqId": 1,
+        "contract": contract,
+        "endDateTime": end_time,
+        "durationStr": duration,
+        "barSizeSetting": bar_size,
+        "whatToShow": "TRADES",
+        "useRTH": 0,
+        "formatDate": 1,
+        "keepUpToDate": 0,
+        "chartOptions": [],
+        "timezoneId": "America/New_York",
+    }
     try:
-        app.reqHistoricalData(
-            reqId=1,
-            contract=contract,
-            endDateTime=end_time,
-            durationStr=duration,
-            barSizeSetting=bar_size,
-            whatToShow="TRADES",
-            useRTH=0,
-            formatDate=1,
-            keepUpToDate=0,
-            chartOptions=[],
-            timezoneId="America/New_York",
-        )
+        try:
+            app.reqHistoricalData(**request_kwargs)
+        except TypeError as exc:
+            if "timezoneId" not in str(exc):
+                raise
+            # Some IB API versions don't support timezoneId.
+            request_kwargs.pop("timezoneId", None)
+            app.reqHistoricalData(**request_kwargs)
     except Exception as exc:
         print(f"IB historical request failed: {exc}")
         try:
@@ -329,7 +344,7 @@ def get_data_persistent(ticker, interval="1d", period="2y", force_refresh=False)
                 return refreshed_df
             return local_df
 
-        if IB_CLIENT_AVAILABLE:
+        if IB_FALLBACK_ENABLED:
             ib_df = get_data_from_ib(ticker, interval=interval, period=period)
             if not ib_df.empty:
                 ib_df = _normalize_yf_df(ib_df)

@@ -17,5 +17,7 @@ build/
 *.egg-info/
 *.parquet
 *.csv
+*.txt
 *.json
+*.log
 ./data/

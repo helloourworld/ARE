@@ -1,5 +1,6 @@
 import sys
 import warnings
+import logging
 import numpy as np
 from scipy.stats import linregress, norm
 from pathlib import Path
@@ -38,6 +39,8 @@ except ImportError:
         
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_ROOT / "data"
@@ -367,25 +370,26 @@ def generate_suggestion(regime, judgment, entropy, alpha, h_val, vpin, cvd_slope
 
     return "🔎 MONITOR", "Metrics are inconclusive. Wait for fractal alignment."
 
-def scan_market(ticker, show_judgment=True):
-    print(f"--- Scanning {ticker} Mandelbrot Status ---")
+def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
+    logger.info("Scanning Mandelbrot status | ticker=%s", ticker)
 
-    # Load 1m (Trend) and 1d (Structural Risk)
-    data_1m = get_data_persistent(ticker, "1m")
-    data_1d = get_data_persistent(ticker, "1d")
+    # Load 1m (Trend) and 1d (Structural Risk) data if not provided.
+    if data_1m is None:
+        data_1m = get_data_persistent(ticker, "1m")
+    if data_1d is None:
+        data_1d = get_data_persistent(ticker, "1d")
 
-    if data_1m.empty or data_1d.empty:
-        print("ERROR: Insufficient data returned from Yahoo Finance.")
+    if data_1m is None or data_1d is None or data_1m.empty or data_1d.empty:
+        logger.error("Insufficient data returned from data source")
         return "ERROR - No Data"
 
     required_1m = max(HURST_WINDOW, VOL_LOOKBACK, 60) + 1
     if len(data_1m) < required_1m:
-        print(
-            f"ERROR: Not enough intraday data ({len(data_1m)} bars, need {required_1m}).")
+        logger.error("Not enough intraday data | bars=%s | required=%s", len(data_1m), required_1m)
         return "ERROR - Insufficient 1m data"
 
     if len(data_1d) < 2:
-        print("ERROR: Not enough daily history.")
+        logger.error("Not enough daily history")
         return "ERROR - Insufficient 1d data"
 
     hybrid_signal_result = {
@@ -407,11 +411,12 @@ def scan_market(ticker, show_judgment=True):
             "Hybrid Lower Band": float(hybrid.get("lower_band", np.nan)),
         })
     except Exception as exc:
-        print(f"Hybrid signal computation failed: {exc}")
+        logger.warning("Hybrid signal computation failed | error=%s", exc)
 
     prices = data_1m['Close'].values
     volumes = data_1m['Volume'].values
     returns_1m = np.diff(np.log(prices))
+    market_ts = data_1m.index[-1] if len(data_1m.index) > 0 else "N/A"
 
     # 1. Calculate Core Metrics
     h_val = calculate_hurst_vw(prices, volumes, window=HURST_WINDOW)
@@ -435,7 +440,7 @@ def scan_market(ticker, show_judgment=True):
     cash_cmf = liquidity_signals['cmf']
     fragility_score = abs(cash_cmf) / max(recent_vol, 1e-12)
     if h_val < 0.53 and cash_cmf < -0.15 and fragility_score > FRAGILITY_THRESHOLD:
-        print("ALERT: CRITICAL FRAGILITY - High Risk of Phase Transition (Gap Down)")
+        logger.warning("Critical fragility detected | high risk of phase transition")
 
     # 3. Directional Check (Slope of last hour)
     slope = linregress(np.arange(60), prices[-60:]).slope
@@ -460,11 +465,7 @@ def scan_market(ticker, show_judgment=True):
         regime = "3 - NEUTRAL / RANDOM WALK"
 
     # 5. OUTPUT
-    print(f"Price:         {prices[-1]:.2f}")
-    print(f"Hurst (Trend): {h_val:.3f}")
-    print(f"Tail Index:    {alpha_eff:.3f}")
-    print(f"Intraday Vol:  {recent_vol:.5f}")
-    print(f"RESULT REGIME: {regime}")
+    logger.info("StockTs=%s | Price=%.2f | Hurst=%.3f | TailIndex=%.3f | IntradayVol=%.5f | Regime=%s", market_ts, prices[-1], h_val, alpha_eff, recent_vol, regime)
 
     # Compute liquidity signals for better tape/flow context.
     result = {
@@ -491,16 +492,12 @@ def scan_market(ticker, show_judgment=True):
         )
         cvd_arrow = "⬆️" if cvd_slope > 0 else "⬇️" if cvd_slope < 0 else "→"
         cvd_label = "UP" if cvd_slope > 0 else "DOWN" if cvd_slope < 0 else "FLAT"
-        print(f"Entropy: {entropy:.2f} (Low is better) | VPIN: {vpin:.2f}")
-        print(f"Liquidity CMF: {liquidity_signals['cmf']:.3f} | Breadth Slope: {liquidity_signals['breadth_slope']:.5f}")
-        print(f"CVD Trend: {cvd_slope: .2f} {cvd_arrow} {cvd_label}")
-        print(f"VERDICT: {judgment}")
+        logger.info("StockTs=%s | Entropy=%.2f | VPIN=%.2f | LiquidityCMF=%.3f | BreadthSlope=%.5f | CVDTrend=%.2f %s %s | Verdict=%s", market_ts, entropy, vpin, liquidity_signals['cmf'], liquidity_signals['breadth_slope'], cvd_slope, cvd_arrow, cvd_label, judgment)
 
         # 6. ADD SUGGESTION
         action, reason = generate_suggestion(
             regime, judgment, entropy, alpha_eff, h_val, vpin, cvd_slope)
-        print(f"\nSUGGESTION: {action}")
-        print(f"REASON:     {reason}")
+        logger.info("StockTs=%s | Suggestion=%s | Reason=%s", market_ts, action, reason)
 
         result.update({
             "Verdict": judgment,
@@ -513,7 +510,7 @@ def scan_market(ticker, show_judgment=True):
     if h_val < 0.53 and cash_cmf < -0.15 and fragility_score > FRAGILITY_THRESHOLD:
         result["Fragility Alert"] = "CRITICAL FRAGILITY"
 
-    print("-" * 45)
+    logger.debug("Scan complete | ticker=%s", ticker)
     return result
 
 
