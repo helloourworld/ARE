@@ -15,9 +15,9 @@ TARGETS = [
     {'symbol': 'XEQT.TO', 'exch': 'TSX',   'curr': 'CAD', 'weight': 0.35, 'limit': 45.1},
     {'symbol': 'XDIV.TO', 'exch': 'TSX',   'curr': 'CAD', 'weight': 0.20, 'limit': 45.1},
     {'symbol': 'CLML.TO', 'exch': 'TSX',   'curr': 'CAD', 'weight': 0.20, 'limit': 53.5},
-    {'symbol': 'MSFT', 'exch': 'SMART', 'curr': 'USD', 'weight': 0.083, 'limit': 385.0}, # MSFT usually has more liquidity
-    {'symbol': 'GOOGL','exch': 'SMART', 'curr': 'USD', 'weight': 0.083, 'limit': 355.0}, # GOOGL usually has more liquidity
-    {'symbol': 'AMZN', 'exch': 'SMART', 'curr': 'USD', 'weight': 0.084, 'limit': 245.0}, # AMZN usually has more liquidity
+    {'symbol': 'SPY', 'exch': 'SMART', 'curr': 'USD', 'weight': 0.25, 'limit': 385.0}, # MSFT usually has more liquidity
+    # {'symbol': 'GOOGL','exch': 'SMART', 'curr': 'USD', 'weight': 0.083, 'limit': 355.0}, # GOOGL usually has more liquidity
+    # {'symbol': 'AMZN', 'exch': 'SMART', 'curr': 'USD', 'weight': 0.084, 'limit': 245.0}, # AMZN usually has more liquidity
 ]
 
 
@@ -277,7 +277,7 @@ class FHSADefensiveTrader:
                     getattr(contract, 'primaryExchange', ''),
                     contract.currency,
                 )
-                manual_limit = item.get('limit') if item.get('curr') == 'CAD' else None
+                manual_limit = item.get('limit') if item.get('limit') is not None else None
                 if manual_limit is not None:
                     price = float(manual_limit)
                     lmt_price = round(float(manual_limit), 2)
