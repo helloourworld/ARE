@@ -168,6 +168,32 @@ class FHSADefensiveTrader:
 
         return Stock(symbol, exch, curr)
 
+    def _get_cash_balance(self, currency):
+        """Return account cash balance for a currency using IB account summary."""
+        summary = self.ib.accountSummary(account=self.account_id)
+        preferred_tags = ('TotalCashValue', 'CashBalance')
+
+        for tag in preferred_tags:
+            for row in summary:
+                if row.tag == tag and row.currency == currency and row.account == self.account_id:
+                    try:
+                        return float(row.value)
+                    except (TypeError, ValueError):
+                        continue
+
+        return 0.0
+
+    def _get_position_size(self, contract):
+        """Return current position size for contract in selected account."""
+        self.ib.qualifyContracts(contract)
+        target_con_id = contract.conId
+
+        for pos in self.ib.positions(account=self.account_id):
+            if pos.contract.conId == target_con_id:
+                return int(math.floor(pos.position))
+
+        return 0
+
     def convert_cad_to_usd(self, amount_cad, usd_cad_rate):
         """Converts a lump sum of CAD to USD to save on per-trade fees."""
         if usd_cad_rate <= 0:
@@ -200,13 +226,26 @@ class FHSADefensiveTrader:
                 raise RuntimeError(f"Invalid USDCAD midpoint: {usd_cad_rate}")
             logger.info("USDCAD midpoint fetched: %.6f", usd_cad_rate)
 
-            # 2. Check if we should do a lump-sum FX conversion first
-            usd_needed_cad = TOTAL_BUDGET_CAD * USD_ALLOCATION_PCT
-            do_fx = input(f"Do you want to convert ${usd_needed_cad:.2f} CAD to USD now? (y/n): ")
-            if do_fx.lower() == 'y':
-                self.convert_cad_to_usd(usd_needed_cad, usd_cad_rate)
+            # 2. Convert only the missing USD cash for this allocation target.
+            usd_target = (TOTAL_BUDGET_CAD * USD_ALLOCATION_PCT) / usd_cad_rate
+            usd_cash_now = self._get_cash_balance('USD')
+            usd_shortfall = max(0.0, usd_target - usd_cash_now)
+
+            if usd_shortfall >= 1.0:
+                cad_needed = usd_shortfall * usd_cad_rate
+                do_fx = input(
+                    f"Need about ${cad_needed:.2f} CAD to top up {usd_shortfall:.2f} USD. Convert now? (y/n): "
+                )
+                if do_fx.lower() == 'y':
+                    self.convert_cad_to_usd(cad_needed, usd_cad_rate)
+                else:
+                    logger.info("FX conversion skipped by user")
             else:
-                logger.info("FX conversion skipped by user")
+                logger.info(
+                    "USD cash already sufficient (target=%.2f USD, current=%.2f USD); skipping FX conversion",
+                    usd_target,
+                    usd_cash_now,
+                )
 
             # 3. Process Stocks
             orders = []
@@ -227,14 +266,29 @@ class FHSADefensiveTrader:
 
                 # Use real-time rate to decide how many shares to buy
                 price_in_cad = price * usd_cad_rate if item['curr'] == 'USD' else price
-                qty = math.floor((TOTAL_BUDGET_CAD * item['weight']) / price_in_cad)
+                target_qty = math.floor((TOTAL_BUDGET_CAD * item['weight']) / price_in_cad)
+                held_qty = self._get_position_size(contract)
+                qty = max(0, target_qty - held_qty)
 
                 if qty > 0:
                     lmt_price = round(price * (1 + SLIPPAGE_BUFFER), 2)
                     orders.append((contract, qty, lmt_price))
-                    logger.info("PLAN: Buy %s %s at %.2f %s", qty, item['symbol'], lmt_price, item['curr'])
+                    logger.info(
+                        "PLAN: Buy %s %s at %.2f %s (target=%s, held=%s)",
+                        qty,
+                        item['symbol'],
+                        lmt_price,
+                        item['curr'],
+                        target_qty,
+                        held_qty,
+                    )
                 else:
-                    logger.warning("Skipped %s because computed quantity is %s", item['symbol'], qty)
+                    logger.info(
+                        "No buy needed for %s (target=%s, held=%s)",
+                        item['symbol'],
+                        target_qty,
+                        held_qty,
+                    )
 
             # 4. Final confirmation
             if input("\nExecute all stock orders? (y/n): ").lower() == 'y':
