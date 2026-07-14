@@ -12,9 +12,9 @@ USD_ALLOCATION_PCT = 0.25 # 25% of portfolio is USD (MSFT, GOOG, AMZN)
 SLIPPAGE_BUFFER = 0.001 
 # Defensive Weights
 TARGETS = [
-    {'symbol': 'XEQT.TO', 'exch': 'TSX',   'curr': 'CAD', 'weight': 0.35},
-    {'symbol': 'XDIV.TO', 'exch': 'TSX',   'curr': 'CAD', 'weight': 0.20},
-    {'symbol': 'CLML.TO', 'exch': 'TSX',   'curr': 'CAD', 'weight': 0.20},
+    {'symbol': 'XEQT.TO', 'exch': 'TSX',   'curr': 'CAD', 'weight': 0.35, 'limit': 45.1},
+    {'symbol': 'XDIV.TO', 'exch': 'TSX',   'curr': 'CAD', 'weight': 0.20, 'limit': 45.1},
+    {'symbol': 'CLML.TO', 'exch': 'TSX',   'curr': 'CAD', 'weight': 0.20, 'limit': 53.5},
     {'symbol': 'MSFT', 'exch': 'SMART', 'curr': 'USD', 'weight': 0.083},
     {'symbol': 'GOOGL','exch': 'SMART', 'curr': 'USD', 'weight': 0.083}, # GOOGL usually has more liquidity
     {'symbol': 'AMZN', 'exch': 'SMART', 'curr': 'USD', 'weight': 0.084},
@@ -117,6 +117,13 @@ class FHSADefensiveTrader:
                 raise ValueError(f"TARGETS[{idx}] has unsupported currency: {curr}")
             if weight <= 0:
                 raise ValueError(f"TARGETS[{idx}] has non-positive weight: {weight}")
+            if curr == 'CAD' and 'limit' in item:
+                try:
+                    limit = float(item['limit'])
+                except (TypeError, ValueError):
+                    raise ValueError(f"TARGETS[{idx}] has invalid limit price: {item['limit']}")
+                if limit <= 0:
+                    raise ValueError(f"TARGETS[{idx}] has non-positive limit price: {limit}")
 
             seen_symbols.add(symbol)
             total_weight += weight
@@ -259,10 +266,17 @@ class FHSADefensiveTrader:
                     getattr(contract, 'primaryExchange', ''),
                     contract.currency,
                 )
-                use_snapshot = item.get('exch') == 'TSX'
-                if use_snapshot:
-                    logger.info("Using snapshot market data for %s", item['symbol'])
-                price = self.get_market_price(contract, use_snapshot=use_snapshot)
+                manual_limit = item.get('limit') if item.get('curr') == 'CAD' else None
+                if manual_limit is not None:
+                    price = float(manual_limit)
+                    lmt_price = round(float(manual_limit), 2)
+                    logger.info("Using manual limit price for %s: %.2f CAD", item['symbol'], lmt_price)
+                else:
+                    use_snapshot = item.get('exch') == 'TSX'
+                    if use_snapshot:
+                        logger.info("Using snapshot market data for %s", item['symbol'])
+                    price = self.get_market_price(contract, use_snapshot=use_snapshot)
+                    lmt_price = round(price * (1 + SLIPPAGE_BUFFER), 2)
 
                 # Use real-time rate to decide how many shares to buy
                 price_in_cad = price * usd_cad_rate if item['curr'] == 'USD' else price
@@ -271,7 +285,6 @@ class FHSADefensiveTrader:
                 qty = max(0, target_qty - held_qty)
 
                 if qty > 0:
-                    lmt_price = round(price * (1 + SLIPPAGE_BUFFER), 2)
                     orders.append((contract, qty, lmt_price))
                     logger.info(
                         "PLAN: Buy %s %s at %.2f %s (target=%s, held=%s)",
