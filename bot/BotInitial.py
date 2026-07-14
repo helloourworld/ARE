@@ -212,6 +212,35 @@ class FHSADefensiveTrader:
 
         return 0
 
+    def _get_open_buy_quantity(self, contract):
+        """Return active open BUY quantity for contract in selected account."""
+        self.ib.qualifyContracts(contract)
+        target_con_id = contract.conId
+        open_qty = 0
+
+        for trade in self.ib.openTrades():
+            if trade.order.account != self.account_id:
+                continue
+            if trade.contract.conId != target_con_id:
+                continue
+            if trade.order.action != 'BUY':
+                continue
+
+            status = trade.orderStatus.status or ''
+            if status in {'Filled', 'Cancelled', 'ApiCancelled', 'Inactive'}:
+                continue
+
+            remaining = trade.orderStatus.remaining
+            if remaining is None:
+                remaining = trade.order.totalQuantity
+
+            try:
+                open_qty += int(math.ceil(float(remaining)))
+            except (TypeError, ValueError):
+                continue
+
+        return open_qty
+
     def convert_cad_to_usd(self, amount_cad, usd_cad_rate):
         """Converts a lump sum of CAD to USD to save on per-trade fees."""
         if usd_cad_rate <= 0:
@@ -236,6 +265,8 @@ class FHSADefensiveTrader:
         logger.info("Starting bot run | account=%s", self.account_id)
         try:
             self._validate_targets()
+            self.ib.reqAllOpenOrders()
+            self.ib.waitOnUpdate(timeout=0.5)
 
             # 1. Fetch FX rate for calculations
             fx_ticker = self.ib.reqTickers(Forex('USDCAD'))[0]
@@ -293,25 +324,28 @@ class FHSADefensiveTrader:
                 price_in_cad = price * usd_cad_rate if item['curr'] == 'USD' else price
                 target_qty = math.floor((TOTAL_BUDGET_CAD * item['weight']) / price_in_cad)
                 held_qty = self._get_position_size(contract)
-                qty = max(0, target_qty - held_qty)
+                open_buy_qty = self._get_open_buy_quantity(contract)
+                qty = max(0, target_qty - held_qty - open_buy_qty)
 
                 if qty > 0:
                     orders.append((contract, qty, lmt_price))
                     logger.info(
-                        "PLAN: Buy %s %s at %.2f %s (target=%s, held=%s)",
+                        "PLAN: Buy %s %s at %.2f %s (target=%s, held=%s, open_buy=%s)",
                         qty,
                         item['symbol'],
                         lmt_price,
                         item['curr'],
                         target_qty,
                         held_qty,
+                        open_buy_qty,
                     )
                 else:
                     logger.info(
-                        "No buy needed for %s (target=%s, held=%s)",
+                        "No buy needed for %s (target=%s, held=%s, open_buy=%s)",
                         item['symbol'],
                         target_qty,
                         held_qty,
+                        open_buy_qty,
                     )
 
             # 4. Final confirmation
