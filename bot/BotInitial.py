@@ -133,11 +133,16 @@ class FHSADefensiveTrader:
                 usd_weight,
             )
 
-    def get_market_price(self, contract):
+    def get_market_price(self, contract, use_snapshot=False):
         self.ib.qualifyContracts(contract)
-        self.ib.reqMktData(contract, '', False, False)
-        time.sleep(2)
-        ticker = self.ib.reqTickers(contract)[0]
+
+        if use_snapshot:
+            ticker = self.ib.reqTickers(contract)[0]
+        else:
+            self.ib.reqMktData(contract, '', False, False)
+            time.sleep(2)
+            ticker = self.ib.reqTickers(contract)[0]
+
         for candidate in (ticker.ask, ticker.last, ticker.close):
             if candidate is not None and candidate > 0:
                 return candidate
@@ -215,7 +220,10 @@ class FHSADefensiveTrader:
                     getattr(contract, 'primaryExchange', ''),
                     contract.currency,
                 )
-                price = self.get_market_price(contract)
+                use_snapshot = item.get('exch') == 'TSX'
+                if use_snapshot:
+                    logger.info("Using snapshot market data for %s", item['symbol'])
+                price = self.get_market_price(contract, use_snapshot=use_snapshot)
 
                 # Use real-time rate to decide how many shares to buy
                 price_in_cad = price * usd_cad_rate if item['curr'] == 'USD' else price
