@@ -144,7 +144,7 @@ class FHSADefensiveTrader:
         self.ib.qualifyContracts(contract)
 
         if use_snapshot:
-            ticker = self.ib.reqMktData(contract, '', True, False)
+            ticker = self.ib.reqMktData(contract, '', True, True)
             start = time.time()
             while (
                 time.time() - start < 10
