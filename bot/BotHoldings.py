@@ -4,7 +4,7 @@ from datetime import datetime
 
 ib = IB()
 try:
-    ib.connect('127.0.0.1', 4001, clientId=2)
+    ib.connect('127.0.0.1', 4002, clientId=2)
 except Exception as e:
     print(f"Connection failed: {e}")
     exit()
