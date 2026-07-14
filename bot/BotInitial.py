@@ -10,12 +10,12 @@ ACCOUNT_ID = os.getenv('IB_PAPER_ID')
 TOTAL_BUDGET_CAD = 4700.0
 USD_ALLOCATION_PCT = 0.25 # 25% of portfolio is USD (MSFT, GOOG, AMZN)
 SLIPPAGE_BUFFER = 0.001 
-
+Error 200, reqId 188: The destination or exchange selected is Invalid. Please review your order's "Destination" field. If using a <br>Directed order, review the exchange selected when creating the order ticket or order row. This may occur when <br>creating stock orders for the overnight session or when creating option orders for the overnight session., contract: Stock(symbol='XEQT.TO', exchange='TSX', currency='CAD')
 # Defensive Weights
 TARGETS = [
-    {'symbol': 'XEQT', 'exch': 'TSX',   'curr': 'CAD', 'weight': 0.35},
-    {'symbol': 'XDIV', 'exch': 'TSX',   'curr': 'CAD', 'weight': 0.20},
-    {'symbol': 'CLML', 'exch': 'TSX',   'curr': 'CAD', 'weight': 0.20},
+    {'symbol': 'XEQT.TO', 'exch': 'TSX',   'curr': 'CAD', 'weight': 0.35},
+    {'symbol': 'XDIV.TO', 'exch': 'TSX',   'curr': 'CAD', 'weight': 0.20},
+    {'symbol': 'CLML.TO', 'exch': 'TSX',   'curr': 'CAD', 'weight': 0.20},
     {'symbol': 'MSFT', 'exch': 'SMART', 'curr': 'USD', 'weight': 0.083},
     {'symbol': 'GOOGL','exch': 'SMART', 'curr': 'USD', 'weight': 0.083}, # GOOGL usually has more liquidity
     {'symbol': 'AMZN', 'exch': 'SMART', 'curr': 'USD', 'weight': 0.084},
