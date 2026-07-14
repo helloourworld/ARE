@@ -503,7 +503,7 @@ class MandelbrotBot:
                 if entry_signal_streak < ENTRY_CONFIRMATION_BARS:
                     continue
 
-                cash_to_use = min(Cash, self.initial_equity * POSITION_SIZE_PCT)
+                cash_to_use = self.get_total_equity() * POSITION_SIZE_PCT
                 share_qty = cash_to_use / current_price
                 order = MarketOrder('BUY', round(share_qty, 6))
                 trade = self.ib.placeOrder(self.contract, order)
@@ -900,8 +900,8 @@ def run_backtest_sweep(
 # --- EXECUTION ---
 if __name__ == "__main__":
     PORT = 4002
-    TICKER = 'MRVL'
-    Cash = 1000  # Your current balance
+    TICKER = 'QQQM'
+    INITIAL_CASH = 1000  # Your current balance
     MAX_ACCOUNT_DRAWDOWN = 0.15  # 15% Total Stop Loss
     POSITION_SIZE_PCT = 0.05  # Use up to 5% of equity per signal-driven entry
     TIME_EXIT_AT = "17:00"  # 5:00 PM Atlantic Time
@@ -916,7 +916,7 @@ if __name__ == "__main__":
         trailing_stop_pct = float(sys.argv[8]) if len(sys.argv) > 8 else DEFAULT_TRAILING_STOP_PCT
         equity_df, trades_df = backtest_mandelbrot_strategy(
             TICKER,
-            initial_cash=Cash,
+            initial_cash=INITIAL_CASH,
             position_size_pct=POSITION_SIZE_PCT,
             output_dir=output_dir,
             step_minutes=step_minutes,
@@ -932,7 +932,7 @@ if __name__ == "__main__":
             logger.info("Last trades:\n%s", trades_df.tail(10).to_string(index=False))
         else:
             logger.info("No trades were executed in this run")
-        metrics = _compute_backtest_metrics(equity_df, trades_df, Cash)
+        metrics = _compute_backtest_metrics(equity_df, trades_df, INITIAL_CASH)
         logger.info(
             "Backtest summary | final_equity=%.2f | total_return_pct=%.2f | max_drawdown_pct=%.2f | closed_trades=%s | win_rate_pct=%.2f | avg_win_pct=%.2f | avg_loss_pct=%.2f | profit_factor=%s",
             metrics["final_equity"],
@@ -952,7 +952,7 @@ if __name__ == "__main__":
         results_df, top_df = run_backtest_sweep(
             ticker=TICKER,
             output_dir=output_dir,
-            initial_cash=Cash,
+            initial_cash=INITIAL_CASH,
             position_size_pct=POSITION_SIZE_PCT,
             quick=quick,
         )

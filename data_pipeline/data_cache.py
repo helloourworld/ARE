@@ -16,6 +16,7 @@ Usage example:
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Thread
+import logging
 import platform
 import time
 
@@ -42,6 +43,8 @@ IB_YF_SUFFIX_MAP = {
     "TO": {"primaryExchange": "TSE", "currency": "CAD"},
     "NE": {"primaryExchange": "AEQN", "currency": "CAD"},
 }
+
+logger = logging.getLogger(__name__)
 
 
 def _get_cache_path(file_name: str) -> Path:
@@ -198,7 +201,12 @@ def _refresh_local_cache(local_df: pd.DataFrame, ticker: str, interval: str, fil
 
 def _fetch_yf_initial(ticker: str, interval: str, period: str) -> pd.DataFrame:
     fetch_period = "7d" if interval == "1m" else period
-    print(f"initializing download for {ticker} with interval {interval} and period {fetch_period}")
+    logger.debug(
+        "Initializing Yahoo download | ticker=%s interval=%s period=%s",
+        ticker,
+        interval,
+        fetch_period,
+    )
     return yf.download(ticker, period=fetch_period, interval=interval, prepost=True, progress=False)
 
 

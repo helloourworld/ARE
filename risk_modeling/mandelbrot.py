@@ -2,8 +2,10 @@ import sys
 import warnings
 import logging
 import numpy as np
+import pandas as pd
 from scipy.stats import linregress, norm
 from pathlib import Path
+from datetime import time
 
 
 try:
@@ -148,15 +150,6 @@ def calculate_tail_index_robust(returns: np.ndarray, lookback: int = 500):
 
     return float(np.percentile(results, 15)) if results else 2.5
 
-# ============================================================================
-# 3. PERSISTENT DATA CACHE
-# ============================================================================
-
-# ============================================================================
-# NEW JUDGMENT INDICATORS
-# ============================================================================
-
-
 def calculate_shannon_entropy(returns, bins=10):
     """
     Shannon Entropy: Measures Market Complexity.
@@ -245,8 +238,6 @@ def calculate_cvd_refined(data_df, window=100):
 # ============================================================================
 # UPDATED SCANNER WITH JUDGMENT LOGIC
 # ============================================================================
-
-
 def compute_judgment(prices, volumes, data_1m, h_val, alpha, cmf=0.0, breadth_slope=0.0):
     """
     Refined Market Regime Judgment Engine
@@ -370,14 +361,25 @@ def generate_suggestion(regime, judgment, entropy, alpha, h_val, vpin, cvd_slope
 
     return "🔎 MONITOR", "Metrics are inconclusive. Wait for fractal alignment."
 
-def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
-    logger.info("Scanning Mandelbrot status | ticker=%s", ticker)
 
-    # Load 1m (Trend) and 1d (Structural Risk) data if not provided.
+def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
+    """
+    Scan one ticker and return regime metrics + actionable fields.
+
+    Notes on intraday baseline handling:
+    - `data_1m` may span multiple days (for example 7d windows).
+    - Session open is taken from the first bar of the current ET trading day,
+        not from the first bar in the full 1m window.
+    - Day % uses previous close in premarket, and switches to current day open
+        after regular session starts (09:30 ET).
+    """
+    logger.info("Scanning Mandelbrot status | ticker=%s", ticker)
+    logging.getLogger("streamlit.runtime.caching.cache_data_api").setLevel(logging.ERROR)
+    # Load 1m (trend/tape) and 1d (structural) views if not provided.
     if data_1m is None:
-        data_1m = get_data_persistent(ticker, "1m")
+            data_1m = get_data_persistent(ticker, "1m")
     if data_1d is None:
-        data_1d = get_data_persistent(ticker, "1d")
+            data_1d = get_data_persistent(ticker, "1d")
 
     if data_1m is None or data_1d is None or data_1m.empty or data_1d.empty:
         logger.error("Insufficient data returned from data source")
@@ -445,15 +447,62 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
     # 3. Directional Check (Slope of last hour)
     slope = linregress(np.arange(60), prices[-60:]).slope
 
-    # 4. REGIME CLASSIFICATION
-    prev_close = data_1d['Close'].values[-1]
-    gap_pct = abs((prices[-1] - prev_close) / prev_close)
+    # 4. REGIME CLASSIFICATION + SESSION BASELINES
+    daily_index = pd.DatetimeIndex(pd.to_datetime(data_1d.index, errors="coerce"))
+    current_session_date = market_ts_et.date()
+    latest_daily_date = daily_index[-1].date() if len(daily_index) else None
+
+    if latest_daily_date == current_session_date and len(data_1d) >= 2:
+        prev_close = float(data_1d['Close'].iloc[-2])
+    else:
+        prev_close = float(data_1d['Close'].iloc[-1])
+    current_price = float(prices[-1])
+
+    # Normalize the latest timestamp to ET so session state is consistent.
+    market_ts_pd = pd.Timestamp(market_ts)
+    if market_ts_pd.tzinfo is not None:
+        market_ts_et = market_ts_pd.tz_convert("America/New_York")
+    else:
+        market_ts_et = market_ts_pd
+
+    # data_1m can include multiple days; isolate bars from the current ET date.
+    idx_1m = pd.DatetimeIndex(pd.to_datetime(data_1m.index, errors="coerce"))
+    if idx_1m.tz is not None:
+        idx_1m_et = idx_1m.tz_convert("America/New_York")
+    else:
+        idx_1m_et = idx_1m
+
+    same_day_mask = idx_1m_et.date == market_ts_et.date()
+    same_day_pos = np.flatnonzero(same_day_mask)
+
+    if same_day_pos.size > 0:
+        day_slice = data_1m.iloc[same_day_pos]
+    else:
+        logger.warning("Unable to isolate current session bars; falling back to first bar in window")
+        day_slice = data_1m
+
+    # Session open = first bar open of the current day (fallback to close if needed).
+    if 'Open' in day_slice.columns and not day_slice['Open'].empty:
+        session_open = float(day_slice['Open'].iloc[0])
+    else:
+        session_open = float(day_slice['Close'].iloc[0])
+
+    # Baseline switch:
+    # - Premarket uses previous close.
+    # - Regular session uses today's session open.
+    pre_market = market_ts_et.time() < time(9, 30)
+
+    gap_pct = (session_open - prev_close) / prev_close
+    day_baseline = prev_close if pre_market else session_open
+    day_pct = ((current_price - day_baseline) / day_baseline) * 100.0
     tail_state = "ACTIVE" if recent_vol > VOL_THRESHOLD else "DORMANT"
 
     if alpha_eff < TAIL_RISKY:
         regime = f"5 - TAIL RISK ({tail_state} Danger of Sudden Move)"
     elif gap_pct > 0.05 and h_val < HURST_TREND_MIN:
         regime = "1 - BULLISH PERSISTENCE (Post-Gap Consolidation)"
+    elif gap_pct < -0.05 and h_val < HURST_TREND_MIN:
+        regime = "2 - BEARISH PERSISTENCE (Post-Gap Breakdown)"
     elif h_val > HURST_TREND_MIN:
         if alpha_eff >= TAIL_SAFE:
             regime = "1 - BULLISH PERSISTENCE (Trend is Real)"
@@ -470,6 +519,7 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
     # Compute liquidity signals for better tape/flow context.
     result = {
         "Price": float(prices[-1]),
+        "Day %": float(day_pct),
         "Hurst": float(h_val),
         "Tail Index": float(alpha_eff),
         "Intraday Vol": float(recent_vol),
@@ -516,13 +566,11 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
 
 if __name__ == "__main__":
     # Test on your Core Universe
-    import time
     tickers = ["MU", 'SPY']
     while True:
         for t in tickers:
             scan_market(t)
             # scan_with_judgment(t)
-        time.sleep(60)  # Wait 1 minute before next scan
 """
 Summary Table for Tail-Index Risk Regimes
 

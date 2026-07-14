@@ -1107,6 +1107,8 @@ with tab9:
         st.info("Click 'Refresh Pre-Market/Gap Audit' to load gap analysis.")
 
     # --- Risk Alert Portal ---
+    
+    
     st.divider()
     st.subheader("Risk Alert Portal")
     st.markdown(
@@ -1168,27 +1170,154 @@ with tab9:
             cvd_icon = get_cvd_icon(result['CVD Trend'])
             st.write(f"**CVD Trend:** {result['CVD Trend']} {cvd_icon}")
             # Intraday VPIN & CVD plots
+            
             try:
-                intraday_df = get_data_persistent(alert_ticker, "1m")
+                intraday_df = get_data_persistent(alert_ticker, interval="1m", period="7d", force_refresh=True)
                 if intraday_df is not None and not intraday_df.empty:
-                    vpin_series = compute_rolling_vpin(intraday_df, vpin_window=50, window_minutes=250)
-                    cvd_series = compute_rolling_cvd(intraday_df)
-                    # Smooth series
-                    vpin_s = vpin_series.rolling(window=3, min_periods=1).mean()
-                    cvd_s = cvd_series.rolling(window=3, min_periods=1).mean()
+                    vpin_series = compute_rolling_vpin(
+                        intraday_df,
+                        vpin_window=vpin_bucket_count,
+                        window_minutes=vpin_window_minutes,
+                        resample_rule="5min",
+                    )
+                    cvd_series = compute_rolling_cvd(intraday_df, resample_rule="5min")
 
-                    st.subheader("Intraday VPIN & CVD")
-                    fig = make_subplots(specs=[[{"secondary_y": True}]])
-                    fig.add_trace(go.Scatter(x=vpin_s.index, y=vpin_s.values, name='VPIN (smoothed)', line=dict(color='orange')),
-                                  secondary_y=False)
-                    fig.add_trace(go.Scatter(x=cvd_s.index, y=cvd_s.values, name='CVD (smoothed)', line=dict(color='blue')),
-                                  secondary_y=True)
-                    fig.update_yaxes(title_text="VPIN", secondary_y=False)
-                    fig.update_yaxes(title_text="CVD", secondary_y=True)
-                    fig.update_layout(height=360, margin=dict(l=40, r=40, t=30, b=20))
-                    st.plotly_chart(fig, width=700)
+                    # Align on a unified time index before smoothing to avoid vertical-line artifacts.
+                    vpin_series = pd.to_numeric(vpin_series, errors="coerce")
+                    cvd_series = pd.to_numeric(cvd_series, errors="coerce")
+
+                    vpin_series.index = pd.to_datetime(vpin_series.index, errors="coerce")
+                    cvd_series.index = pd.to_datetime(cvd_series.index, errors="coerce")
+
+                    vpin_series = (
+                        vpin_series[~vpin_series.index.isna()]
+                        .sort_index()
+                        .groupby(level=0)
+                        .last()
+                    )
+                    cvd_series = (
+                        cvd_series[~cvd_series.index.isna()]
+                        .sort_index()
+                        .groupby(level=0)
+                        .last()
+                    )
+
+                    plot_df = pd.concat(
+                        [vpin_series.rename("VPIN"), cvd_series.rename("CVD")],
+                        axis=1,
+                    ).sort_index()
+
+                    if plot_df.empty:
+                        st.info("No VPIN/CVD data available to plot.")
+                    else:
+                        vpin_s = plot_df["VPIN"].rolling(window=smoothing_window, min_periods=1).mean()
+                        cvd_s = plot_df["CVD"].rolling(window=smoothing_window, min_periods=1).mean()
+
+                        plot_df["VPIN_SMOOTH"] = vpin_s
+                        plot_df["CVD_SMOOTH"] = cvd_s
+                        plot_df = plot_df.dropna(how="all", subset=["VPIN_SMOOTH", "CVD_SMOOTH"])
+
+                        if plot_df.empty:
+                            st.info("No VPIN/CVD points available after alignment.")
+                        else:
+                            st.subheader("Intraday VPIN & CVD")
+                            fig = make_subplots(specs=[[{"secondary_y": True}]])
+                            fig.add_trace(
+                                go.Scatter(
+                                    x=plot_df.index,
+                                    y=plot_df["VPIN_SMOOTH"],
+                                    name='VPIN (smoothed)',
+                                    line=dict(color='orange')
+                                ),
+                                secondary_y=False,
+                            )
+                            fig.add_trace(
+                                go.Scatter(
+                                    x=plot_df.index,
+                                    y=plot_df["CVD_SMOOTH"],
+                                    name='CVD (smoothed)',
+                                    line=dict(color='blue')
+                                ),
+                                secondary_y=True,
+                            )
+                            fig.update_yaxes(title_text="VPIN", secondary_y=False)
+                            fig.update_yaxes(title_text="CVD", secondary_y=True)
+                            fig.update_layout(height=360, margin=dict(l=40, r=40, t=30, b=20), hovermode="x unified")
+                            st.plotly_chart(fig, width=700)
             except Exception as e:
                 st.write(f"VPIN/CVD plot failed: {e}")
+
+            # Hourly Return vs Hourly VPIN
+            try:
+                hourly_df = get_data_persistent(alert_ticker, interval="1h", period="60d", force_refresh=True)
+                if hourly_df is not None and not hourly_df.empty and {"Close", "Volume"}.issubset(hourly_df.columns):
+                    hourly_returns = hourly_df["Close"].pct_change() * 100.0
+                    hourly_vpin = compute_rolling_vpin(
+                        hourly_df,
+                        vpin_window=max(10, int(vpin_bucket_count // 2)),
+                        window_minutes=max(24, int(vpin_window_minutes // 60)),
+                        resample_rule=None,
+                    )
+
+                    hourly_returns = pd.to_numeric(hourly_returns, errors="coerce")
+                    hourly_vpin = pd.to_numeric(hourly_vpin, errors="coerce")
+
+                    hourly_returns.index = pd.to_datetime(hourly_returns.index, errors="coerce")
+                    hourly_vpin.index = pd.to_datetime(hourly_vpin.index, errors="coerce")
+
+                    hourly_returns = (
+                        hourly_returns[~hourly_returns.index.isna()]
+                        .sort_index()
+                        .groupby(level=0)
+                        .last()
+                    )
+                    hourly_vpin = (
+                        hourly_vpin[~hourly_vpin.index.isna()]
+                        .sort_index()
+                        .groupby(level=0)
+                        .last()
+                    )
+
+                    hourly_plot_df = pd.concat(
+                        [
+                            hourly_returns.rename("Hourly Return %"),
+                            hourly_vpin.rename("Hourly VPIN"),
+                        ],
+                        axis=1,
+                    ).sort_index()
+
+                    hourly_plot_df["Hourly Return %"] = hourly_plot_df["Hourly Return %"].rolling(window=3, min_periods=1).mean()
+                    hourly_plot_df["Hourly VPIN"] = hourly_plot_df["Hourly VPIN"].rolling(window=3, min_periods=1).mean()
+                    hourly_plot_df = hourly_plot_df.dropna(how="all", subset=["Hourly Return %", "Hourly VPIN"])
+
+                    if not hourly_plot_df.empty:
+                        st.subheader("Hourly Return vs Hourly VPIN")
+                        fig_daily = make_subplots(specs=[[{"secondary_y": True}]])
+                        fig_daily.add_trace(
+                            go.Scatter(
+                                x=hourly_plot_df.index,
+                                y=hourly_plot_df["Hourly Return %"],
+                                name="Hourly Return % (smoothed)",
+                                line=dict(color="#22A06B"),
+                            ),
+                            secondary_y=False,
+                        )
+                        fig_daily.add_trace(
+                            go.Scatter(
+                                x=hourly_plot_df.index,
+                                y=hourly_plot_df["Hourly VPIN"],
+                                name="Hourly VPIN (smoothed)",
+                                line=dict(color="#F0883E"),
+                            ),
+                            secondary_y=True,
+                        )
+                        fig_daily.update_yaxes(title_text="Hourly Return %", secondary_y=False)
+                        fig_daily.update_yaxes(title_text="Hourly VPIN", secondary_y=True)
+                        fig_daily.update_layout(height=360, margin=dict(l=40, r=40, t=30, b=20), hovermode="x unified")
+                        st.plotly_chart(fig_daily, width=700)
+            except Exception as e:
+                st.write(f"Hourly Return/VPIN plot failed: {e}")
+
             st.markdown("**Judgment & Suggestion**")
             st.write(
                 f"**Regime:** {get_regime_icon(result['Regime'])} {result['Regime']}")
@@ -1221,6 +1350,9 @@ with tab9:
                 all_signals.append({
                     "Ticker": ticker,
                     "Price": f"{result.get('Price', 0.0):.2f}",
+                    "Day %": f"{result.get('Day %', 0.0):.2f}%",
+                    "Suggestion": result.get('Suggestion', ''),
+                    "Reason": result.get('Reason', ''),
                     "Hurst": f"{result.get('Hurst', 0.0):.3f}",
                     "Tail Index": f"{result.get('Tail Index', 0.0):.3f}",
                     "VPIN": f"{result.get('VPIN', 0.0):.3f}",
@@ -1230,21 +1362,61 @@ with tab9:
                     "CVD Trend": f"{cvd_icon} {result.get('CVD Trend', 'N/A')}",
                     "Signal/Regime": f"{result.get('Regime')} {get_regime_icon(result.get('Regime'))}",
                     "Verdict": result.get('Verdict', ''),
-                    "Suggestion": result.get('Suggestion', ''),
-                    "Reason": result.get('Reason', ''),
                     "Fragility": result.get('Fragility Alert', '')
                 })
 
                 # Optionally save plots per ticker
                 if save_plots:
                     try:
-                        intraday = get_data_persistent(ticker, "1m")
+                        intraday = get_data_persistent(ticker, interval="1m", period="7d", force_refresh=True)
                         if intraday is not None and not intraday.empty:
-                            vpin_s = compute_rolling_vpin(intraday, vpin_window=vpin_bucket_count, window_minutes=vpin_window_minutes).rolling(window=smoothing_window, min_periods=1).mean()
-                            cvd_s = compute_rolling_cvd(intraday).rolling(window=smoothing_window, min_periods=1).mean()
+                            vpin_series = compute_rolling_vpin(
+                                intraday,
+                                vpin_window=vpin_bucket_count,
+                                window_minutes=vpin_window_minutes,
+                                resample_rule="5min",
+                            )
+                            cvd_series = compute_rolling_cvd(intraday, resample_rule="5min")
+
+                            vpin_series = pd.to_numeric(vpin_series, errors="coerce")
+                            cvd_series = pd.to_numeric(cvd_series, errors="coerce")
+
+                            vpin_series.index = pd.to_datetime(vpin_series.index, errors="coerce")
+                            cvd_series.index = pd.to_datetime(cvd_series.index, errors="coerce")
+
+                            vpin_series = (
+                                vpin_series[~vpin_series.index.isna()]
+                                .sort_index()
+                                .groupby(level=0)
+                                .last()
+                            )
+                            cvd_series = (
+                                cvd_series[~cvd_series.index.isna()]
+                                .sort_index()
+                                .groupby(level=0)
+                                .last()
+                            )
+
+                            plot_df = pd.concat(
+                                [vpin_series.rename("VPIN"), cvd_series.rename("CVD")],
+                                axis=1,
+                            ).sort_index()
+
+                            if plot_df.empty:
+                                continue
+
+                            vpin_s = plot_df["VPIN"].rolling(window=smoothing_window, min_periods=1).mean()
+                            cvd_s = plot_df["CVD"].rolling(window=smoothing_window, min_periods=1).mean()
+                            plot_df["VPIN_SMOOTH"] = vpin_s
+                            plot_df["CVD_SMOOTH"] = cvd_s
+                            plot_df = plot_df.dropna(how="all", subset=["VPIN_SMOOTH", "CVD_SMOOTH"])
+
+                            if plot_df.empty:
+                                continue
+
                             fig = make_subplots(specs=[[{"secondary_y": True}]])
-                            fig.add_trace(go.Scatter(x=vpin_s.index, y=vpin_s.values, name='VPIN (smoothed)', line=dict(color='orange')), secondary_y=False)
-                            fig.add_trace(go.Scatter(x=cvd_s.index, y=cvd_s.values, name='CVD (smoothed)', line=dict(color='blue')), secondary_y=True)
+                            fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["VPIN_SMOOTH"], name='VPIN (smoothed)', line=dict(color='orange')), secondary_y=False)
+                            fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["CVD_SMOOTH"], name='CVD (smoothed)', line=dict(color='blue')), secondary_y=True)
                             fig.update_yaxes(title_text="VPIN", secondary_y=False)
                             fig.update_yaxes(title_text="CVD", secondary_y=True)
                             out_dir = DATA_DIR / 'hybrid_plots'
