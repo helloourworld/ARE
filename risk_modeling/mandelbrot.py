@@ -448,7 +448,14 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
     slope = linregress(np.arange(60), prices[-60:]).slope
 
     # 4. REGIME CLASSIFICATION + SESSION BASELINES
-    daily_index = pd.DatetimeIndex(pd.to_datetime(data_1d.index, errors="coerce"))
+    # Normalize the latest timestamp to ET so session state is consistent.
+    market_ts_pd = pd.Timestamp(market_ts)
+    if market_ts_pd.tzinfo is not None:
+        market_ts_et = market_ts_pd.tz_convert("America/New_York")
+    else:
+        market_ts_et = market_ts_pd
+
+    daily_index = pd.to_datetime(data_1d.index, errors="coerce")
     current_session_date = market_ts_et.date()
     latest_daily_date = daily_index[-1].date() if len(daily_index) else None
 
@@ -457,13 +464,6 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
     else:
         prev_close = float(data_1d['Close'].iloc[-1])
     current_price = float(prices[-1])
-
-    # Normalize the latest timestamp to ET so session state is consistent.
-    market_ts_pd = pd.Timestamp(market_ts)
-    if market_ts_pd.tzinfo is not None:
-        market_ts_et = market_ts_pd.tz_convert("America/New_York")
-    else:
-        market_ts_et = market_ts_pd
 
     # data_1m can include multiple days; isolate bars from the current ET date.
     idx_1m = pd.DatetimeIndex(pd.to_datetime(data_1m.index, errors="coerce"))
