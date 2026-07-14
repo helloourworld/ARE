@@ -10,7 +10,6 @@ ACCOUNT_ID = os.getenv('IB_PAPER_ID')
 TOTAL_BUDGET_CAD = 4700.0
 USD_ALLOCATION_PCT = 0.25 # 25% of portfolio is USD (MSFT, GOOG, AMZN)
 SLIPPAGE_BUFFER = 0.001 
-Error 200, reqId 188: The destination or exchange selected is Invalid. Please review your order's "Destination" field. If using a <br>Directed order, review the exchange selected when creating the order ticket or order row. This may occur when <br>creating stock orders for the overnight session or when creating option orders for the overnight session., contract: Stock(symbol='XEQT.TO', exchange='TSX', currency='CAD')
 # Defensive Weights
 TARGETS = [
     {'symbol': 'XEQT.TO', 'exch': 'TSX',   'curr': 'CAD', 'weight': 0.35},
@@ -101,6 +100,22 @@ class FHSADefensiveTrader:
         ticker = self.ib.reqTickers(contract)[0]
         return ticker.ask if ticker.ask > 0 else ticker.close
 
+    def _build_stock_contract(self, item):
+        """Build an IB stock contract with exchange/symbol normalization."""
+        symbol = item['symbol']
+        exch = item['exch']
+        curr = item['curr']
+
+        # IB expects Canadian TSX symbols without the .TO suffix.
+        if curr == 'CAD' and symbol.endswith('.TO'):
+            symbol = symbol[:-3]
+
+        # Route Canadian equities via SMART and pin the primary listing exchange.
+        if exch == 'TSX':
+            return Stock(symbol, 'SMART', curr, primaryExchange='TSE')
+
+        return Stock(symbol, exch, curr)
+
     def convert_cad_to_usd(self, amount_cad):
         """Converts a lump sum of CAD to USD to save on per-trade fees."""
         logger.info("ACTION REQUIRED: Converting %.2f CAD to USD", amount_cad)
@@ -131,7 +146,15 @@ class FHSADefensiveTrader:
         # 3. Process Stocks
         orders = []
         for item in TARGETS:
-            contract = Stock(item['symbol'], item['exch'], item['curr'])
+            contract = self._build_stock_contract(item)
+            logger.info(
+                "CONTRACT: requested=%s | symbol=%s | exchange=%s | primary=%s | currency=%s",
+                item['symbol'],
+                contract.symbol,
+                contract.exchange,
+                getattr(contract, 'primaryExchange', ''),
+                contract.currency,
+            )
             price = self.get_market_price(contract)
             
             # Use real-time rate to decide how many shares to buy
