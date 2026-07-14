@@ -93,12 +93,59 @@ class FHSADefensiveTrader:
         )
         return final_status
 
+    def _validate_targets(self):
+        required = {'symbol', 'exch', 'curr', 'weight'}
+        allowed_currencies = {'CAD', 'USD'}
+        seen_symbols = set()
+        total_weight = 0.0
+        usd_weight = 0.0
+
+        for idx, item in enumerate(TARGETS):
+            missing = required - set(item.keys())
+            if missing:
+                raise ValueError(f"TARGETS[{idx}] is missing required fields: {sorted(missing)}")
+
+            symbol = str(item['symbol']).strip()
+            curr = str(item['curr']).strip().upper()
+            weight = float(item['weight'])
+
+            if not symbol:
+                raise ValueError(f"TARGETS[{idx}] has an empty symbol")
+            if symbol in seen_symbols:
+                raise ValueError(f"TARGETS contains duplicate symbol: {symbol}")
+            if curr not in allowed_currencies:
+                raise ValueError(f"TARGETS[{idx}] has unsupported currency: {curr}")
+            if weight <= 0:
+                raise ValueError(f"TARGETS[{idx}] has non-positive weight: {weight}")
+
+            seen_symbols.add(symbol)
+            total_weight += weight
+            if curr == 'USD':
+                usd_weight += weight
+
+        if not math.isclose(total_weight, 1.0, abs_tol=1e-6):
+            raise ValueError(f"TARGETS weights must sum to 1.0, got {total_weight:.6f}")
+
+        if not math.isclose(usd_weight, USD_ALLOCATION_PCT, abs_tol=0.02):
+            logger.warning(
+                "USD_ALLOCATION_PCT (%.3f) differs from USD target weight sum (%.3f)",
+                USD_ALLOCATION_PCT,
+                usd_weight,
+            )
+
     def get_market_price(self, contract):
         self.ib.qualifyContracts(contract)
         self.ib.reqMktData(contract, '', False, False)
         time.sleep(2)
         ticker = self.ib.reqTickers(contract)[0]
-        return ticker.ask if ticker.ask > 0 else ticker.close
+        for candidate in (ticker.ask, ticker.last, ticker.close):
+            if candidate is not None and candidate > 0:
+                return candidate
+
+        raise RuntimeError(
+            f"No valid market price for {contract.symbol} "
+            f"(ask={ticker.ask}, last={ticker.last}, close={ticker.close})"
+        )
 
     def _build_stock_contract(self, item):
         """Build an IB stock contract with exchange/symbol normalization."""
@@ -116,70 +163,84 @@ class FHSADefensiveTrader:
 
         return Stock(symbol, exch, curr)
 
-    def convert_cad_to_usd(self, amount_cad):
+    def convert_cad_to_usd(self, amount_cad, usd_cad_rate):
         """Converts a lump sum of CAD to USD to save on per-trade fees."""
-        logger.info("ACTION REQUIRED: Converting %.2f CAD to USD", amount_cad)
+        if usd_cad_rate <= 0:
+            raise RuntimeError(f"Invalid USDCAD rate for conversion: {usd_cad_rate}")
+
+        usd_qty = max(1, int(round(amount_cad / usd_cad_rate)))
+        logger.info(
+            "ACTION REQUIRED: Converting %.2f CAD to about %s USD at USDCAD %.6f",
+            amount_cad,
+            usd_qty,
+            usd_cad_rate,
+        )
         pair = Forex('USDCAD')
         self.ib.qualifyContracts(pair)
         # In IBKR, buying USDCAD means buying USD with CAD
-        order = MarketOrder('BUY', amount_cad, account=self.account_id)
+        order = MarketOrder('BUY', usd_qty, account=self.account_id)
         trade = self.ib.placeOrder(pair, order)
         logger.info("FX trade submitted for account=%s", self.account_id)
         self._wait_and_log_trade(trade, 'FX_CONVERSION')
 
     def run(self):
         logger.info("Starting bot run | account=%s", self.account_id)
+        try:
+            self._validate_targets()
 
-        # 1. Fetch FX Rate for calculations
-        fx_ticker = self.ib.reqTickers(Forex('USDCAD'))[0]
-        usd_cad_rate = fx_ticker.midpoint()
-        logger.info("USDCAD midpoint fetched: %.6f", usd_cad_rate)
+            # 1. Fetch FX rate for calculations
+            fx_ticker = self.ib.reqTickers(Forex('USDCAD'))[0]
+            usd_cad_rate = fx_ticker.midpoint()
+            if usd_cad_rate is None or usd_cad_rate <= 0:
+                raise RuntimeError(f"Invalid USDCAD midpoint: {usd_cad_rate}")
+            logger.info("USDCAD midpoint fetched: %.6f", usd_cad_rate)
 
-        # 2. Check if we should do a lump-sum FX conversion first
-        usd_needed_cad = TOTAL_BUDGET_CAD * USD_ALLOCATION_PCT
-        do_fx = input(f"Do you want to convert ${usd_needed_cad:.2f} CAD to USD now? (y/n): ")
-        if do_fx.lower() == 'y':
-            self.convert_cad_to_usd(usd_needed_cad)
-        else:
-            logger.info("FX conversion skipped by user")
-
-        # 3. Process Stocks
-        orders = []
-        for item in TARGETS:
-            contract = self._build_stock_contract(item)
-            logger.info(
-                "CONTRACT: requested=%s | symbol=%s | exchange=%s | primary=%s | currency=%s",
-                item['symbol'],
-                contract.symbol,
-                contract.exchange,
-                getattr(contract, 'primaryExchange', ''),
-                contract.currency,
-            )
-            price = self.get_market_price(contract)
-            
-            # Use real-time rate to decide how many shares to buy
-            price_in_cad = price * usd_cad_rate if item['curr'] == 'USD' else price
-            qty = math.floor((TOTAL_BUDGET_CAD * item['weight']) / price_in_cad)
-            
-            if qty > 0:
-                lmt_price = round(price * (1 + SLIPPAGE_BUFFER), 2)
-                orders.append((contract, qty, lmt_price))
-                logger.info("PLAN: Buy %s %s at %.2f %s", qty, item['symbol'], lmt_price, item['curr'])
+            # 2. Check if we should do a lump-sum FX conversion first
+            usd_needed_cad = TOTAL_BUDGET_CAD * USD_ALLOCATION_PCT
+            do_fx = input(f"Do you want to convert ${usd_needed_cad:.2f} CAD to USD now? (y/n): ")
+            if do_fx.lower() == 'y':
+                self.convert_cad_to_usd(usd_needed_cad, usd_cad_rate)
             else:
-                logger.warning("Skipped %s because computed quantity is %s", item['symbol'], qty)
+                logger.info("FX conversion skipped by user")
 
-        # 4. Final Confirmation
-        if input("\nExecute all stock orders? (y/n): ").lower() == 'y':
-            for contract, qty, lmt in orders:
-                order = LimitOrder('BUY', qty, lmt, account=self.account_id)
-                trade = self.ib.placeOrder(contract, order)
-                logger.info("Order submitted | symbol=%s | qty=%s | limit=%.2f", contract.symbol, qty, lmt)
-                self._wait_and_log_trade(trade, 'EQUITY_ORDER')
-        else:
-            logger.info("Order execution cancelled by user at final confirmation")
-        
-        self.ib.disconnect()
-        logger.info("Bot run finished and disconnected")
+            # 3. Process Stocks
+            orders = []
+            for item in TARGETS:
+                contract = self._build_stock_contract(item)
+                logger.info(
+                    "CONTRACT: requested=%s | symbol=%s | exchange=%s | primary=%s | currency=%s",
+                    item['symbol'],
+                    contract.symbol,
+                    contract.exchange,
+                    getattr(contract, 'primaryExchange', ''),
+                    contract.currency,
+                )
+                price = self.get_market_price(contract)
+
+                # Use real-time rate to decide how many shares to buy
+                price_in_cad = price * usd_cad_rate if item['curr'] == 'USD' else price
+                qty = math.floor((TOTAL_BUDGET_CAD * item['weight']) / price_in_cad)
+
+                if qty > 0:
+                    lmt_price = round(price * (1 + SLIPPAGE_BUFFER), 2)
+                    orders.append((contract, qty, lmt_price))
+                    logger.info("PLAN: Buy %s %s at %.2f %s", qty, item['symbol'], lmt_price, item['curr'])
+                else:
+                    logger.warning("Skipped %s because computed quantity is %s", item['symbol'], qty)
+
+            # 4. Final confirmation
+            if input("\nExecute all stock orders? (y/n): ").lower() == 'y':
+                for contract, qty, lmt in orders:
+                    order = LimitOrder('BUY', qty, lmt, account=self.account_id)
+                    trade = self.ib.placeOrder(contract, order)
+                    logger.info("Order submitted | symbol=%s | qty=%s | limit=%.2f", contract.symbol, qty, lmt)
+                    self._wait_and_log_trade(trade, 'EQUITY_ORDER')
+            else:
+                logger.info("Order execution cancelled by user at final confirmation")
+        finally:
+            if self.ib.isConnected():
+                self.ib.disconnect()
+            logger.info("Bot run finished and disconnected")
 
 if __name__ == "__main__":
     try:
