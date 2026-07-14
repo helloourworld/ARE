@@ -272,7 +272,7 @@ class FHSADefensiveTrader:
                     lmt_price = round(float(manual_limit), 2)
                     logger.info("Using manual limit price for %s: %.2f CAD", item['symbol'], lmt_price)
                 else:
-                    use_snapshot = item.get('exch') == 'TSX'
+                    use_snapshot = item.get('exch') == 'TSX' or item.get('curr') == 'USD'
                     if use_snapshot:
                         logger.info("Using snapshot market data for %s", item['symbol'])
                     price = self.get_market_price(contract, use_snapshot=use_snapshot)
