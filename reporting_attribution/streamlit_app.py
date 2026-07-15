@@ -35,7 +35,7 @@ from pypfopt import (
 
 # Local application modules
 from frontier_plots import plot_institutional_frontier
-from data_pipeline import get_daily_returns, get_price_history, get_price_history_with_benchmark, get_premarket_data, get_live_intraday, get_data_persistent
+from data_pipeline import get_daily_returns, get_price_history, get_price_history_with_benchmark, get_premarket_data, get_live_intraday, get_data_persistent, get_official_session_open
 from risk_modeling import AlphaRiskEngine, calculate_mansfield_rs, monitor_mean_reversion, calculate_rs_bollinger_bands, get_rs_signals, detect_rs_hook
 from risk_modeling.mandelbrot import scan_market
 from risk_modeling.bolling_bands import compute_rolling_vpin, compute_rolling_cvd
@@ -123,7 +123,7 @@ def normalize_timestamp_for_index(value, index):
     return ts
 
 
-def get_reference_price(series: pd.Series):
+def get_reference_price(ticker: str, series: pd.Series):
     if series is None or series.empty:
         return None, "Unknown"
 
@@ -143,11 +143,11 @@ def get_reference_price(series: pd.Series):
 
     today_open_mask = [d == current_date and t >= datetime.time(9, 30)
                        for d, t in zip(est_index.date, est_index.time)]
-    today_open = series.iloc[[i for i, m in enumerate(today_open_mask) if m][0]] if any(today_open_mask) else None
+    today_open = get_official_session_open(ticker, current_date) if any(today_open_mask) else None
 
     if premarket or today_open is None:
         return prev_close, "Previous Close"
-    return today_open, "Open Price"
+    return today_open, "Official Open"
 
 
 def render_metric_with_threshold(name: str, value: float, threshold_text: str, color: str, precision: int = 3):
@@ -282,6 +282,38 @@ if returns.empty:
         "No data available for the selected tickers and date range. Please adjust your selection.")
     st.stop()
 
+# Keep a NaN-free returns matrix for risk modeling and regressions.
+incomplete_cols = [col for col in returns.columns if returns[col].isna().any()]
+if incomplete_cols:
+    returns = returns.drop(columns=incomplete_cols)
+    dropped_assets = [col for col in incomplete_cols if col != selected_benchmark]
+    if dropped_assets:
+        st.warning(
+            f"Dropped assets with incomplete return history: {', '.join(sorted(dropped_assets))}"
+        )
+
+if selected_benchmark not in returns.columns:
+    st.error(
+        f"Benchmark {selected_benchmark} has incomplete return history for this window. Please choose another benchmark or start date."
+    )
+    st.stop()
+
+selected_tickers = [
+    ticker for ticker in selected_tickers if ticker in returns.columns and ticker != selected_benchmark
+]
+if not selected_tickers:
+    st.error(
+        "No analyzable assets remain after cleaning missing-return data. Please adjust your selection."
+    )
+    st.stop()
+
+returns = returns[selected_tickers + [selected_benchmark]].dropna(how='any')
+if returns.empty:
+    st.error(
+        "No overlapping complete return history remains after cleaning missing values. Please adjust your selection or start date."
+    )
+    st.stop()
+
 # --- DISPLAY METADATA ---
 st.title(cfg['metadata']['report_title'])
 st.caption(
@@ -293,7 +325,7 @@ st.write(f"Risk-Free Rate (Annualized Proxy): {rf:.1%}")
 
 # Display returns data preview
 with st.expander("📊 Returns Data Preview"):
-    st.dataframe(returns.tail(3), width='stretch')
+    st.dataframe(returns.tail(3).style.format("{:.2%}"), width='stretch')
     st.caption(
         f"Data shape: {returns.shape[0]} periods × {returns.shape[1]} assets | Starting: {returns.index[0].date()}")
 
@@ -1020,7 +1052,7 @@ with tab9:
             # Calculate Benchmark change first for relative comparison
             bench_series = live_data[selected_benchmark].dropna()
             bench_current = bench_series.iloc[-1]
-            bench_ref_price, bench_ref_label = get_reference_price(bench_series)
+            bench_ref_price, bench_ref_label = get_reference_price(selected_benchmark, bench_series)
             benchmark_change = (bench_current / bench_ref_price - 1) * 100 if bench_ref_price is not None else float('nan')
 
             for t in monitor_list:
@@ -1030,7 +1062,7 @@ with tab9:
                 if ticker_series.empty:
                     continue
                 current_p = ticker_series.iloc[-1]
-                ref_price, _ = get_reference_price(ticker_series)
+                ref_price, _ = get_reference_price(t, ticker_series)
                 prev_p = ref_price if ref_price is not None else ticker_series.iloc[0]
                 change_abs = current_p - prev_p
                 change_pct = (change_abs / prev_p) * 100 if prev_p else float('nan')
@@ -1130,6 +1162,8 @@ with tab9:
             st.error(f"Scan failed: {result}")
         else:
             st.write(f"**Price:** {result['Price']:.2f}")
+            st.write(f"**Daily Return (Session Baseline):** {result['Day %']:.2f}%")
+            st.write(f"**Daily Return (vs Prev Close):** {result.get('Day % vs Prev Close', float('nan')):.2f}%")
             render_metric_with_threshold(
                 "Hurst (Trend)",
                 result['Hurst'],
@@ -1203,6 +1237,7 @@ with tab9:
                     "Ticker": ticker,
                     "Price": f"{result.get('Price', 0.0):.2f}",
                     "Day %": f"{result.get('Day %', 0.0):.2f}%",
+                    "Day % vs Prev Close": f"{result.get('Day % vs Prev Close', 0.0):.2f}%",
                     "Suggestion": result.get('Suggestion', ''),
                     "Reason": result.get('Reason', ''),
                     "Hurst": f"{result.get('Hurst', 0.0):.3f}",

@@ -125,7 +125,14 @@ class AlphaRiskEngine:
         results = {}
         self.returns = self.ingest_data()  # Ensure returns are available
         for ticker in self.tickers:
-            daily_returns = self.returns[ticker]
+            daily_returns = self.returns[ticker].dropna()
+            if daily_returns.empty:
+                results[ticker] = {
+                    "Daily_ES": np.nan,
+                    "Theoretical_Annual_ES": np.nan,
+                    "Empirical_Annual_ES": np.nan,
+                }
+                continue
 
             # 1. Theoretical Annualization (Square Root of Time)
             var_95 = np.percentile(daily_returns, (1 - confidence_level) * 100)
@@ -135,12 +142,14 @@ class AlphaRiskEngine:
             # 2. Empirical Annualization (Using 21-day rolling windows - 1 month)
             # This captures path-dependency better than daily scaling
             monthly_returns = daily_returns.rolling(window=21).sum().dropna()
-            m_var_95 = np.percentile(
-                monthly_returns, (1 - confidence_level) * 100)
-            monthly_cvar = monthly_returns[monthly_returns <= m_var_95].mean()
+            empirical_annual_cvar = np.nan
+            if not monthly_returns.empty:
+                m_var_95 = np.percentile(
+                    monthly_returns, (1 - confidence_level) * 100)
+                monthly_cvar = monthly_returns[monthly_returns <= m_var_95].mean()
 
-            # Scale monthly to annual (linear scaling for return-space averages)
-            empirical_annual_cvar = monthly_cvar * np.sqrt(12)
+                # Scale monthly to annual (linear scaling for return-space averages)
+                empirical_annual_cvar = monthly_cvar * np.sqrt(12)
 
             results[ticker] = {
                 "Daily_ES": daily_cvar,

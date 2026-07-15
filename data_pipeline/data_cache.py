@@ -45,6 +45,32 @@ IB_YF_SUFFIX_MAP = {
 }
 
 logger = logging.getLogger(__name__)
+STORAGE_TIMEZONE = "America/New_York"
+DATE_ONLY_INTERVALS = {"1d", "1wk", "1mo"}
+
+
+def _normalize_index_for_interval(index, interval: str):
+    """Normalize index shape by interval.
+
+    - Daily/weekly/monthly data is stored as session dates (tz-naive).
+    - Intraday data is stored timezone-aware in New York time.
+    """
+    normalized_interval = str(interval).lower()
+    dt_index = pd.DatetimeIndex(index)
+
+    if normalized_interval in DATE_ONLY_INTERVALS:
+        if dt_index.tz is not None:
+            # Convert to UTC first so legacy 20:00-04 daily rows map to the next trading date.
+            dt_index = dt_index.tz_convert("UTC").normalize().tz_localize(None)
+        else:
+            dt_index = dt_index.normalize()
+        return pd.DatetimeIndex(dt_index)
+
+    if dt_index.tz is None:
+        dt_index = dt_index.tz_localize(STORAGE_TIMEZONE)
+    elif str(dt_index.tz) != STORAGE_TIMEZONE:
+        dt_index = dt_index.tz_convert(STORAGE_TIMEZONE)
+    return pd.DatetimeIndex(dt_index)
 
 
 def _get_cache_path(file_name: str) -> Path:
@@ -59,7 +85,7 @@ def _get_cache_path(file_name: str) -> Path:
     return target_path
 
 
-def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_yf_df(df: pd.DataFrame, interval: str = "1d") -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     
@@ -68,17 +94,23 @@ def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     
-    # Ensure index is timezone-aware UTC
-    if isinstance(df.index, pd.DatetimeIndex):
-        if df.index.tz is None:
-            df.index = df.index.tz_localize("UTC")
-        elif df.index.tz != "UTC":
-            df.index = df.index.tz_convert("UTC")
+    # Coerce index to datetime, then normalize it for the requested interval.
+    if not isinstance(df.index, pd.DatetimeIndex):
+        coerced_index = pd.to_datetime(df.index, errors="coerce")
+        valid_mask = ~coerced_index.isna()
+        df = df.loc[valid_mask].copy()
+        coerced_index = coerced_index[valid_mask]
+        if len(coerced_index) == 0:
+            return pd.DataFrame()
+        df.index = pd.DatetimeIndex(coerced_index)
+
+    df.index = _normalize_index_for_interval(df.index, interval)
+    df = df[~df.index.duplicated(keep="last")].sort_index()
     
     return df
 
 
-def _normalize_ib_df(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_ib_df(df: pd.DataFrame, interval: str = "1d") -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     
@@ -91,11 +123,8 @@ def _normalize_ib_df(df: pd.DataFrame) -> pd.DataFrame:
     if not isinstance(df.index, pd.DatetimeIndex):
         return pd.DataFrame()
     
-    # Ensure index is timezone-aware UTC
-    if df.index.tz is None:
-        df.index = df.index.tz_localize("UTC")
-    elif df.index.tz != "UTC":
-        df.index = df.index.tz_convert("UTC")
+    df.index = _normalize_index_for_interval(df.index, interval)
+    df = df[~df.index.duplicated(keep="last")].sort_index()
 
     df = df.rename(columns={
         "open": "Open",
@@ -110,16 +139,16 @@ def _normalize_ib_df(df: pd.DataFrame) -> pd.DataFrame:
 def normalize_timestamp_for_index(value, index):
     ts = pd.to_datetime(value)
     if getattr(index, "tz", None) is not None and index.tz is not None and ts.tzinfo is None:
-        ts = ts.tz_localize("UTC")
+        ts = ts.tz_localize(STORAGE_TIMEZONE)
     return ts
 
 
-def _load_cached_csv(path: Path) -> pd.DataFrame:
+def _load_cached_csv(path: Path, interval: str) -> pd.DataFrame:
     df = pd.read_csv(path, index_col=0, parse_dates=True)
-    # Ensure timezone is always localized to UTC after loading from CSV
-    df = _normalize_yf_df(df)
-    if df.index.tz is None:
-        df.index = df.index.tz_localize("UTC")
+    # Normalize index formatting/timezone on every read so legacy rows are repaired.
+    df = _normalize_yf_df(df, interval=interval)
+    if df.empty:
+        return pd.DataFrame()
     return df
 
 
@@ -174,26 +203,31 @@ def _refresh_from_yf(ticker: str, start_date, interval: str) -> pd.DataFrame:
 def _refresh_local_cache(local_df: pd.DataFrame, ticker: str, interval: str, file_path: Path) -> pd.DataFrame:
     last_ts = local_df.index[-1]
     
-    # Ensure last_ts is timezone-aware
-    if last_ts.tzinfo is None:
-        last_ts = pd.Timestamp(last_ts, tz="UTC")
+    daily_like = str(interval).lower() in DATE_ONLY_INTERVALS
+
+    # Ensure last_ts is timezone-aware for staleness checks.
+    if getattr(last_ts, "tzinfo", None) is None:
+        if daily_like:
+            last_ts = pd.Timestamp(last_ts).tz_localize(STORAGE_TIMEZONE)
+        else:
+            last_ts = pd.Timestamp(last_ts, tz=STORAGE_TIMEZONE)
     
     # Ensure comparison with timezone-aware now
-    now_utc = pd.Timestamp.now(tz="UTC")
+    now_local = pd.Timestamp.now(tz=STORAGE_TIMEZONE)
     wait_time = timedelta(minutes=2) if interval == "1m" else timedelta(hours=12)
     
-    if now_utc - last_ts < wait_time:
+    if now_local - last_ts < wait_time:
         return local_df
 
     # Use the Timestamp object directly - _refresh_from_yf will handle conversion
-    start_date = max(last_ts, now_utc - pd.Timedelta(days=7)) if interval == "1m" else last_ts
+    start_date = max(last_ts, now_local - pd.Timedelta(days=7)) if interval == "1m" else last_ts
 
     new_data = _refresh_from_yf(ticker, start_date, interval)
     if new_data.empty:
         return local_df
 
     new_data = new_data[1:]
-    new_data = _normalize_yf_df(new_data)
+    new_data = _normalize_yf_df(new_data, interval=interval)
     combined = pd.concat([local_df, new_data])
     combined = combined[~combined.index.duplicated(keep="last")].sort_index()
     return _cache_dataframe(combined, file_path)
@@ -412,7 +446,7 @@ def get_data_from_ib(ticker: str, interval: str = "1d", period: str = "2y") -> p
         return pd.DataFrame()
 
     df = pd.DataFrame(app.data)
-    df = _normalize_ib_df(df)
+    df = _normalize_ib_df(df, interval=interval)
     if df.empty:
         return pd.DataFrame()
 
@@ -430,11 +464,10 @@ def get_data_persistent(ticker, interval="1d", period="2y", force_refresh=False)
     """
     safe_ticker = str(ticker).replace("/", "_").replace("=", "_")
     file_path = _get_cache_path(f"cache_{safe_ticker}_{interval}.csv")
-    now = pd.Timestamp.now(tz="UTC")
 
     try:
         if file_path.exists() and not force_refresh:
-            local_df = _load_cached_csv(file_path)
+            local_df = _load_cached_csv(file_path, interval=interval)
             if local_df.empty:
                 return local_df
 
@@ -446,13 +479,13 @@ def get_data_persistent(ticker, interval="1d", period="2y", force_refresh=False)
         if IB_FALLBACK_ENABLED:
             ib_df = get_data_from_ib(ticker, interval=interval, period=period)
             if not ib_df.empty:
-                ib_df = _normalize_yf_df(ib_df)
+                ib_df = _normalize_yf_df(ib_df, interval=interval)
                 return _cache_dataframe(ib_df, file_path)
 
         yf_df = _fetch_yf_initial(ticker, interval, period)
         if yf_df is None or yf_df.empty:
             return pd.DataFrame()
-        yf_df = _normalize_yf_df(yf_df)
+        yf_df = _normalize_yf_df(yf_df, interval=interval)
         return _cache_dataframe(yf_df, file_path)
     except Exception as exc:
         print("Download/cache error:", repr(exc))
@@ -472,12 +505,13 @@ __all__ = [
     "get_ohlcv_history",
     "get_premarket_data",
     "get_live_intraday",
+    "get_official_session_open",
     "force_refresh_ticker",
 ]
 
 def get_daily_returns(tickers, benchmark, start_date):
     """
-    Fetch daily price data and return percentage changes.
+    Fetch completed-session daily close-to-close percentage changes.
     Uses persistent cache with automatic updates.
     
     Args:
@@ -494,9 +528,39 @@ def get_daily_returns(tickers, benchmark, start_date):
     if price_data.empty:
         return pd.DataFrame()
 
+    if isinstance(price_data.index, pd.DatetimeIndex):
+        price_data.index = _normalize_index_for_interval(price_data.index, "1d")
+
     start_ts = normalize_timestamp_for_index(start_date, price_data.index)
-    price_data = price_data[price_data.index >= start_ts].dropna()
-    return price_data.pct_change(fill_method=None).dropna()
+    if price_data.index.min() > start_ts:
+        price_data = _load_close_series(
+            all_tickers, interval="1d", period="5y", force_refresh=True
+        )
+        if price_data.empty:
+            return pd.DataFrame()
+        if isinstance(price_data.index, pd.DatetimeIndex):
+            price_data.index = _normalize_index_for_interval(price_data.index, "1d")
+
+    returns = price_data.pct_change(fill_method=None)
+
+    # Drop symbols with no valid returns instead of dropping all rows globally.
+    returns = returns.loc[:, returns.notna().any(axis=0)]
+    if returns.empty:
+        return pd.DataFrame()
+
+    # Yahoo's current daily bar changes until its trading session has closed.
+    today = pd.Timestamp.now(tz=STORAGE_TIMEZONE).normalize()
+    if getattr(returns.index, "tz", None) is None:
+        today = today.tz_localize(None)
+    returns = returns[returns.index.normalize() < today]
+    returns = returns[returns.index >= start_ts]
+
+    # Keep rows where the benchmark is available; remaining symbols align to it.
+    if benchmark in returns.columns:
+        returns = returns[returns[benchmark].notna()]
+
+    returns = returns.dropna(how="all")
+    return returns
 
 
 def get_price_history(tickers, period="2y", interval="1d"):
@@ -614,6 +678,23 @@ def get_live_intraday(tickers, period="2d", force_refresh=True):
         return result if not result.empty else None
     except Exception as e:
         print(f"Live intraday error: {e}")
+        return None
+
+
+def get_official_session_open(ticker, session_date):
+    """Return a ticker's official daily opening price for a trading date."""
+    try:
+        daily_data = get_data_persistent(
+            ticker, interval="1d", period="5d", force_refresh=False
+        )
+        if daily_data.empty or "Open" not in daily_data:
+            return None
+
+        target_date = pd.Timestamp(session_date).date()
+        matching_rows = daily_data.loc[pd.DatetimeIndex(daily_data.index).date == target_date, "Open"].dropna()
+        return float(matching_rows.iloc[-1]) if not matching_rows.empty else None
+    except Exception as e:
+        print(f"Official open data error for {ticker}: {e}")
         return None
 
 

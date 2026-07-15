@@ -16,6 +16,7 @@ from .data_cache import (
     get_data_persistent,
     get_ohlcv_history,
     force_refresh_ticker,
+    get_official_session_open,
 )
 
 __all__ = [
@@ -25,6 +26,7 @@ __all__ = [
     "get_price_history_with_benchmark",
     "get_premarket_data",
     "get_live_intraday",
+    "get_official_session_open",
     # Lower-level persistent cache functions
     "get_data_persistent",
     "get_ohlcv_history",

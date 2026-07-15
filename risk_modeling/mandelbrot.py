@@ -362,6 +362,27 @@ def generate_suggestion(regime, judgment, entropy, alpha, h_val, vpin, cvd_slope
     return "🔎 MONITOR", "Metrics are inconclusive. Wait for fractal alignment."
 
 
+def _get_session_open(data_1m, data_1d, session_date):
+    """Prefer the official daily open, with a regular-session intraday fallback."""
+    daily_index = pd.DatetimeIndex(pd.to_datetime(data_1d.index, errors="coerce"))
+    daily_rows = data_1d.loc[daily_index.date == session_date]
+    if not daily_rows.empty and "Open" in daily_rows.columns:
+        official_open = daily_rows["Open"].dropna()
+        if not official_open.empty:
+            return float(official_open.iloc[-1])
+
+    intraday_index = pd.DatetimeIndex(pd.to_datetime(data_1m.index, errors="coerce"))
+    if intraday_index.tz is not None:
+        intraday_index = intraday_index.tz_convert("America/New_York")
+    regular_session = (intraday_index.date == session_date) & (intraday_index.time >= time(9, 30))
+    regular_rows = data_1m.iloc[np.flatnonzero(regular_session)]
+    if regular_rows.empty:
+        return None
+    if "Open" in regular_rows.columns:
+        return float(regular_rows["Open"].iloc[0])
+    return float(regular_rows["Close"].iloc[0])
+
+
 def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
     """
     Scan one ticker and return regime metrics + actionable fields.
@@ -459,6 +480,7 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
     current_session_date = market_ts_et.date()
     latest_daily_date = daily_index[-1].date() if len(daily_index) else None
 
+    # Determine the previous close for premarket vs. regular session calculations.
     if latest_daily_date == current_session_date and len(data_1d) >= 2:
         prev_close = float(data_1d['Close'].iloc[-2])
     else:
@@ -481,11 +503,12 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
         logger.warning("Unable to isolate current session bars; falling back to first bar in window")
         day_slice = data_1m
 
-    # Session open = first bar open of the current day (fallback to close if needed).
-    if 'Open' in day_slice.columns and not day_slice['Open'].empty:
-        session_open = float(day_slice['Open'].iloc[0])
-    else:
-        session_open = float(day_slice['Close'].iloc[0])
+    session_open = _get_session_open(data_1m, data_1d, current_session_date)
+    if session_open is None:
+        if 'Open' in day_slice.columns and not day_slice['Open'].empty:
+            session_open = float(day_slice['Open'].iloc[0])
+        else:
+            session_open = float(day_slice['Close'].iloc[0])
 
     # Baseline switch:
     # - Premarket uses previous close.
@@ -493,8 +516,11 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
     pre_market = market_ts_et.time() < time(9, 30)
 
     gap_pct = (session_open - prev_close) / prev_close
+    # print("premarket:", pre_market, "prev_close:", prev_close, "session_open:", session_open, "current_price:", current_price, "gap_pct:", gap_pct
+    #       )
     day_baseline = prev_close if pre_market else session_open
     day_pct = ((current_price - day_baseline) / day_baseline) * 100.0
+    day_pct_prev_close = ((current_price - prev_close) / prev_close) * 100.0
     tail_state = "ACTIVE" if recent_vol > VOL_THRESHOLD else "DORMANT"
 
     if alpha_eff < TAIL_RISKY:
@@ -520,6 +546,7 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
     result = {
         "Price": float(prices[-1]),
         "Day %": float(day_pct),
+        "Day % vs Prev Close": float(day_pct_prev_close),
         "Hurst": float(h_val),
         "Tail Index": float(alpha_eff),
         "Intraday Vol": float(recent_vol),
@@ -566,11 +593,10 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
 
 if __name__ == "__main__":
     # Test on your Core Universe
-    tickers = ["MU", 'SPY']
+    tickers = ["QQQ"]
     while True:
         for t in tickers:
-            scan_market(t)
-            # scan_with_judgment(t)
+            scan_market(t)     
 """
 Summary Table for Tail-Index Risk Regimes
 
