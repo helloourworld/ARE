@@ -26,12 +26,6 @@ Notes / assumptions:
 """
 
 
-st.set_page_config(
-    page_title="Market Breadth Dashboard",
-    layout="wide"
-)
-
-
 # -----------------------------
 # Helper: get S&P 500 tickers
 # -----------------------------
@@ -77,6 +71,7 @@ def get_sp500_tickers():
 # -----------------------------
 # Helper: download price data
 # -----------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
 def download_prices(tickers, period="2y"):
     data = yf.download(
         tickers,
@@ -103,6 +98,7 @@ def download_prices(tickers, period="2y"):
     return close
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def download_etfs(period="2y"):
     etfs = ["SPY", "RSP", "QQQ", "IWM", "^VIX"]
     data = yf.download(
@@ -125,6 +121,46 @@ def download_etfs(period="2y"):
 
     return close
 
+# -------- Append current price data --------
+def append_current_prices(close_df, tickers):
+    """Fetch current prices for all tickers and append as today's row if not already present."""
+    try:
+        today = pd.Timestamp.now().normalize()
+        last_date = close_df.index[-1] if len(close_df) > 0 else None
+
+        # Only fetch if today's data isn't already in the dataframe
+        if last_date is None or last_date.normalize() < today:
+            # Fetch current price (1d data from yesterday to today to catch market close)
+            current_data = yf.download(
+                tickers,
+                start=(today - pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
+                end=(today + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                threads=True,
+            )
+
+            if isinstance(current_data.columns, pd.MultiIndex):
+                current_close = current_data["Close"].copy()
+            else:
+                current_close = current_data[["Close"]].copy()
+
+            # Align columns with historical data
+            current_close = current_close.reindex(columns=close_df.columns, fill_value=np.nan)
+
+            # Append only the most recent row if it's a new date
+            if len(current_close) > 0:
+                latest_current_row = current_close.iloc[-1:]
+                latest_current_row.index = latest_current_row.index.normalize()
+
+                if last_date is None or latest_current_row.index[0] > last_date.normalize():
+                    close_df = pd.concat([close_df, latest_current_row])
+
+        return close_df
+    except Exception as e:
+        # If current price fetch fails, return historical data as-is
+        return close_df
 
 # -----------------------------
 # Breadth calculations
@@ -215,47 +251,116 @@ def calculate_sector_breadth(close, sector_map):
     return sector_df.sort_values("% Above 200DMA", ascending=False)
 
 
-def breadth_signal(latest):
-    pct_50 = latest["% Above 50DMA"]
+def breadth_signal(latest, spy_series=None):
+    """Compute a breadth health score from multiple internal indicators.
+
+    Scoring rules (each criterion contributes ±1):
+    1. % Above 50DMA   > 0.60 → +1   |  < 0.40 → -1
+    2. % Above 200DMA  > 0.55 → +1   |  < 0.35 → -1  (tighter — 200DMA is structural)
+    3. A/D Ratio       > 1.5  → +1   |  < 0.67 → -1
+    4. 52W High/Low    net >  0  → +1  |  net < 0 → -1  (normalised by total)
+    5. SPY trend       price > 50DMA > 200DMA → +1
+                       price < 50DMA           → -1
+                       Golden Cross (50 crossed above 200 recently) → +1 bonus
+                       Death  Cross (50 crossed below 200 recently) → -1 bonus
+
+    Returns (label, color, score, detail_lines).
+    """
+    pct_50  = latest["% Above 50DMA"]
     pct_200 = latest["% Above 200DMA"]
     ad_ratio = latest["A/D Ratio"]
     new_highs = latest["52W New Highs"]
-    new_lows = latest["52W New Lows"]
+    new_lows  = latest["52W New Lows"]
 
     score = 0
+    details = []
 
+    # 1. Participation — 50DMA
     if pct_50 > 0.60:
         score += 1
+        details.append(f"✅ {pct_50:.1%} stocks above 50DMA (>60%)")
     elif pct_50 < 0.40:
         score -= 1
+        details.append(f"❌ {pct_50:.1%} stocks above 50DMA (<40%)")
+    else:
+        details.append(f"➖ {pct_50:.1%} stocks above 50DMA (neutral)")
 
-    if pct_200 > 0.60:
+    # 2. Participation — 200DMA (structural)
+    if pct_200 > 0.55:
         score += 1
-    elif pct_200 < 0.40:
+        details.append(f"✅ {pct_200:.1%} stocks above 200DMA (>55%)")
+    elif pct_200 < 0.35:
         score -= 1
+        details.append(f"❌ {pct_200:.1%} stocks above 200DMA (<35%)")
+    else:
+        details.append(f"➖ {pct_200:.1%} stocks above 200DMA (neutral)")
 
+    # 3. A/D Ratio
     if ad_ratio > 1.5:
         score += 1
-    elif ad_ratio < 0.75:
+        details.append(f"✅ A/D Ratio {ad_ratio:.2f} (>1.5 — buyers dominate)")
+    elif ad_ratio < 0.67:
         score -= 1
-
-    if new_highs > new_lows:
-        score += 1
-    elif new_lows > new_highs:
-        score -= 1
-
-    if score >= 2:
-        return "Healthy", "green"
-    elif score <= -2:
-        return "Weak / Unstable", "red"
+        details.append(f"❌ A/D Ratio {ad_ratio:.2f} (<0.67 — sellers dominate)")
     else:
-        return "Neutral / Mixed", "orange"
+        details.append(f"➖ A/D Ratio {ad_ratio:.2f} (neutral)")
+
+    # 4. 52W High-Low Net
+    hl_net = int(new_highs) - int(new_lows)
+    hl_total = max(int(new_highs) + int(new_lows), 1)
+    hl_ratio = hl_net / hl_total
+    if hl_ratio > 0.15:
+        score += 1
+        details.append(f"✅ 52W Highs dominate: +{hl_net} net ({new_highs:.0f} H / {new_lows:.0f} L)")
+    elif hl_ratio < -0.15:
+        score -= 1
+        details.append(f"❌ 52W Lows dominate: {hl_net} net ({new_highs:.0f} H / {new_lows:.0f} L)")
+    else:
+        details.append(f"➖ 52W Highs/Lows balanced: {hl_net:+d} net")
+
+    # 5. SPY price vs moving averages + cross detection
+    if spy_series is not None and len(spy_series) >= 201:
+        spy_50  = spy_series.rolling(50).mean()
+        spy_200 = spy_series.rolling(200).mean()
+        latest_price = spy_series.iloc[-1]
+        s50  = spy_50.iloc[-1]
+        s200 = spy_200.iloc[-1]
+
+        if latest_price > s50 and s50 > s200:
+            score += 1
+            details.append(f"✅ SPY {latest_price:.2f} > 50DMA {s50:.2f} > 200DMA {s200:.2f}")
+        elif latest_price < s50:
+            score -= 1
+            details.append(f"❌ SPY {latest_price:.2f} below 50DMA {s50:.2f}")
+        else:
+            details.append(f"➖ SPY {latest_price:.2f} — mixed vs MAs")
+
+        # Golden / Death Cross: did the 50DMA cross the 200DMA in the last 10 sessions?
+        cross_window = min(10, len(spy_50.dropna()))
+        recent_50  = spy_50.dropna().iloc[-cross_window:]
+        recent_200 = spy_200.dropna().iloc[-cross_window:]
+        diff = (recent_50 - recent_200)
+        if len(diff) >= 2:
+            if diff.iloc[-1] > 0 and diff.iloc[0] <= 0:
+                score += 1
+                details.append("🌟 Golden Cross detected (50DMA crossed above 200DMA)")
+            elif diff.iloc[-1] < 0 and diff.iloc[0] >= 0:
+                score -= 1
+                details.append("💀 Death Cross detected (50DMA crossed below 200DMA)")
+
+    if score >= 3:
+        return "Healthy", "green", score, details
+    elif score <= -2:
+        return "Weak / Unstable", "red", score, details
+    else:
+        return "Neutral / Mixed", "orange", score, details
 
 
 # -----------------------------
 # App layout
 # -----------------------------
 if __name__ == "__main__":
+    st.set_page_config(page_title="Market Breadth Dashboard", layout="wide")
     st.title("S&P 500 Market Breadth Dashboard")
 
     st.caption(
@@ -287,13 +392,18 @@ if __name__ == "__main__":
     close = download_prices(tickers, period=period)
     etf_close = download_etfs(period=period)
 
+    # Append current prices (today's latest data)
+    close = append_current_prices(close, tickers)
+    etf_close = append_current_prices(etf_close, ["SPY", "RSP", "QQQ", "IWM", "^VIX"])
+
     breadth = calculate_breadth(close)
     sector_breadth = calculate_sector_breadth(close, sector_map)
 
     latest = breadth.dropna().iloc[-1]
     latest_date = breadth.dropna().index[-1].date()
 
-    signal, signal_color = breadth_signal(latest)
+    spy_series = etf_close["SPY"].dropna() if "SPY" in etf_close.columns else None
+    signal, signal_color, score, details = breadth_signal(latest, spy_series)
 
 
     # -----------------------------
@@ -353,16 +463,19 @@ if __name__ == "__main__":
 
     if signal == "Healthy":
         st.success(
-            "Market breadth looks healthy. A large share of S&P 500 stocks are participating in the move."
+            f"Market breadth looks healthy (score {score:+d}). A large share of S&P 500 stocks are participating in the move."
         )
     elif signal == "Weak / Unstable":
         st.error(
-            "Market breadth looks weak. The index may be supported by a narrow group of large-cap stocks."
+            f"Market breadth looks weak (score {score:+d}). The index may be supported by a narrow group of large-cap stocks."
         )
     else:
         st.warning(
-            "Market breadth is mixed. Some internal indicators are supportive, while others show caution."
+            f"Market breadth is mixed (score {score:+d}). Some internal indicators are supportive, while others show caution."
         )
+    with st.expander("Signal breakdown"):
+        for line in details:
+            st.markdown(f"- {line}")
 
 
     # -----------------------------

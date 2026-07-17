@@ -1,5 +1,6 @@
 # Standard library
 import datetime
+import logging
 import os
 import sys
 from pathlib import Path
@@ -38,6 +39,10 @@ from frontier_plots import plot_institutional_frontier
 from data_pipeline import get_daily_returns, get_price_history, get_price_history_with_benchmark, get_premarket_data, get_live_intraday, get_data_persistent, get_official_session_open
 from risk_modeling import AlphaRiskEngine, calculate_mansfield_rs, monitor_mean_reversion, calculate_rs_bollinger_bands, get_rs_signals, detect_rs_hook
 from risk_modeling.mandelbrot import scan_market
+from risk_modeling.market_breadth import (
+    get_sp500_tickers, download_prices, download_etfs,
+    calculate_breadth, calculate_sector_breadth, breadth_signal, append_current_prices,
+)
 from risk_modeling.bolling_bands import compute_rolling_vpin, compute_rolling_cvd
 from data_pipeline.data_cache import DATA_DIR
 import plotly.graph_objects as go
@@ -71,6 +76,26 @@ cache_path = os.path.join(
 if not os.path.exists(cache_path):
     os.makedirs(cache_path)
 yf.set_tz_cache_location(cache_path)
+# --- Capture mandelbrot WARNING logs into session state ---
+class _SessionStateLogHandler(logging.Handler):
+    """Forwards WARNING+ records from risk_modeling.mandelbrot to st.session_state."""
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            if "mandelbrot_warnings" not in st.session_state:
+                st.session_state["mandelbrot_warnings"] = []
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            st.session_state["mandelbrot_warnings"].append(
+                f"{ts} | {self.format(record)}"
+            )
+        except Exception:
+            pass
+
+_mandelbrot_logger = logging.getLogger("risk_modeling.mandelbrot")
+if not any(isinstance(h, _SessionStateLogHandler) for h in _mandelbrot_logger.handlers):
+    _handler = _SessionStateLogHandler(level=logging.WARNING)
+    _handler.setFormatter(logging.Formatter("%(message)s"))
+    _mandelbrot_logger.addHandler(_handler)
+
 # Local modules
 
 # Prefer setting PYTHONPATH or using a package structure with __init__.py files.
@@ -283,14 +308,13 @@ if returns.empty:
     st.stop()
 
 # Keep a NaN-free returns matrix for risk modeling and regressions.
+# Instead of dropping assets with incomplete history, forward-fill NaN values
 incomplete_cols = [col for col in returns.columns if returns[col].isna().any()]
 if incomplete_cols:
-    returns = returns.drop(columns=incomplete_cols)
-    dropped_assets = [col for col in incomplete_cols if col != selected_benchmark]
-    if dropped_assets:
-        st.warning(
-            f"Dropped assets with incomplete return history: {', '.join(sorted(dropped_assets))}"
-        )
+    returns[incomplete_cols] = returns[incomplete_cols].ffill().bfill().fillna(0)
+    st.info(
+        f"⚠️ Forward-filled missing returns for: {', '.join(sorted(incomplete_cols))} (using ffill → bfill → 0)"
+    )
 
 if selected_benchmark not in returns.columns:
     st.error(
@@ -303,7 +327,7 @@ selected_tickers = [
 ]
 if not selected_tickers:
     st.error(
-        "No analyzable assets remain after cleaning missing-return data. Please adjust your selection."
+        "No analyzable assets remain. Please adjust your selection."
     )
     st.stop()
 
@@ -351,9 +375,9 @@ def get_robust_metrics(returns):
 shrunk_cov, shrunk_corr = get_robust_metrics(returns)
 
 # --- APP TABS ---
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(
     ["Performance Attribution", "Risk Report", "Scenario Stress Test", "Factor Attribution", "Efficient Frontier", "CURRENCY EXPOSURE & FX SENSITIVITY", "Rebalancing & Execution",
-     "Relative Strength Signals", "Market Trend"])
+     "Relative Strength Signals", "Market Trend", "📊 Market Breadth"])
 
 # --- TAB 1: ALPHA ATTRIBUTION ---
 with tab1:
@@ -1339,12 +1363,222 @@ with tab9:
     else:
         st.info("Regime: Normal Intraday Variance. No emergency rebalancing required.")
 
+# =============================================================================
+# TAB 10: MARKET BREADTH PORTAL
+# =============================================================================
+with tab10:
+    st.header("📊 S&P 500 Market Breadth Portal")
+    st.caption(
+        "Checks whether the S&P 500 rally is broad-based or concentrated in a few large-cap names."
+    )
+
+    mb_period = st.selectbox("Historical period", ["1y", "2y", "5y"], index=1, key="mb_period")
+    if st.button("🔄 Refresh Breadth Data", key="mb_refresh"):
+        st.cache_data.clear()
+        st.rerun()
+
+    with st.spinner("Loading S&P 500 price data…"):
+        mb_tickers, mb_sector_map = get_sp500_tickers()
+        mb_close   = download_prices(mb_tickers, period=mb_period)
+        mb_etf     = download_etfs(period=mb_period)
+
+        # Append current prices (today's latest data)
+        mb_close = append_current_prices(mb_close, mb_tickers)
+        mb_etf   = append_current_prices(mb_etf, ["SPY", "RSP", "QQQ", "IWM", "^VIX"])
+
+    mb_breadth      = calculate_breadth(mb_close)
+    mb_sector_df    = calculate_sector_breadth(mb_close, mb_sector_map)
+    mb_latest       = mb_breadth.dropna().iloc[-1]
+    mb_latest_date  = mb_breadth.dropna().index[-1].date()
+    mb_spy_series   = mb_etf["SPY"].dropna() if "SPY" in mb_etf.columns else None
+    mb_signal, mb_color, mb_score, mb_details = breadth_signal(mb_latest, mb_spy_series)
+
+    # ── Summary metrics ──────────────────────────────────────────────────────
+    st.subheader(f"Latest Breadth Reading: {mb_latest_date}")
+    _color_map = {"green": "normal", "orange": "off", "red": "inverse"}
+    c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
+    c1.metric("Signal",          mb_signal)
+    c2.metric("Score",           f"{mb_score:+d} / 5")
+    c3.metric("A/D Ratio",       f"{mb_latest['A/D Ratio']:.2f}")
+    c4.metric("% > 50DMA",       f"{mb_latest['% Above 50DMA']:.1%}")
+    c5.metric("% > 200DMA",      f"{mb_latest['% Above 200DMA']:.1%}")
+    c6.metric("Advancers",       int(mb_latest["Advancers"]))
+    c7.metric("52W New Highs",   int(mb_latest["52W New Highs"]))
+    c8.metric("52W New Lows",    int(mb_latest["52W New Lows"]))
+
+    # ── Interpretation ───────────────────────────────────────────────────────
+    _msg = {
+        "Healthy":        f"✅ Market breadth is **healthy** (score {mb_score:+d}). Broad participation supports the rally.",
+        "Weak / Unstable":f"🚨 Market breadth is **weak** (score {mb_score:+d}). Rally may be narrow / fragile.",
+        "Neutral / Mixed":f"⚠️ Market breadth is **mixed** (score {mb_score:+d}). Watch for confirmation.",
+    }
+    if mb_color == "green":
+        st.success(_msg[mb_signal])
+    elif mb_color == "red":
+        st.error(_msg[mb_signal])
+    else:
+        st.warning(_msg[mb_signal])
+
+    with st.expander("Signal breakdown"):
+        for _d in mb_details:
+            st.markdown(f"- {_d}")
+
+    st.divider()
+
+    # ── Charts row 1: A/D Line + % Above MAs ─────────────────────────────────
+    st.subheader("Breadth Charts")
+    _r1c1, _r1c2 = st.columns(2)
+
+    with _r1c1:
+        _fig = go.Figure()
+        _fig.add_trace(go.Scatter(
+            x=mb_breadth.index, y=mb_breadth["A/D Line"],
+            mode="lines", name="A/D Line", line=dict(color="#1f77b4")
+        ))
+        _fig.update_layout(title="Advance-Decline Line", yaxis_title="Cumulative Net Advancers",
+                           height=350, margin=dict(t=40, b=20))
+        st.plotly_chart(_fig, width="stretch")
+
+    with _r1c2:
+        _fig = go.Figure()
+        _fig.add_trace(go.Scatter(x=mb_breadth.index, y=mb_breadth["% Above 50DMA"],
+                                  mode="lines", name="% Above 50DMA", line=dict(color="#2ca02c")))
+        _fig.add_trace(go.Scatter(x=mb_breadth.index, y=mb_breadth["% Above 200DMA"],
+                                  mode="lines", name="% Above 200DMA", line=dict(color="#d62728")))
+        _fig.add_hline(y=0.60, line_dash="dash", line_color="gray", annotation_text="60%")
+        _fig.add_hline(y=0.40, line_dash="dash", line_color="gray", annotation_text="40%")
+        _fig.update_layout(title="% of Stocks Above Moving Averages", yaxis_title="Fraction",
+                           yaxis_tickformat=".0%", height=350, margin=dict(t=40, b=20))
+        st.plotly_chart(_fig, width="stretch")
+
+    # ── Charts row 2: 52W Highs/Lows + RSP/SPY ───────────────────────────────
+    _r2c1, _r2c2 = st.columns(2)
+
+    with _r2c1:
+        _fig = go.Figure()
+        _fig.add_trace(go.Bar(x=mb_breadth.index, y=mb_breadth["52W New Highs"],
+                              name="New Highs", marker_color="#2ca02c"))
+        _fig.add_trace(go.Bar(x=mb_breadth.index, y=-mb_breadth["52W New Lows"],
+                              name="New Lows", marker_color="#d62728"))
+        _fig.update_layout(barmode="overlay", title="52-Week New Highs vs New Lows",
+                           yaxis_title="Count", height=350, margin=dict(t=40, b=20))
+        st.plotly_chart(_fig, width="stretch")
+
+    with _r2c2:
+        if "RSP" in mb_etf.columns and "SPY" in mb_etf.columns:
+            _ratio = (mb_etf["RSP"] / mb_etf["SPY"]).dropna()
+            _ratio_50 = _ratio.rolling(50).mean()
+            _fig = go.Figure()
+            _fig.add_trace(go.Scatter(x=_ratio.index, y=_ratio,
+                                      mode="lines", name="RSP/SPY", line=dict(color="#1f77b4")))
+            _fig.add_trace(go.Scatter(x=_ratio_50.index, y=_ratio_50,
+                                      mode="lines", name="50DMA", line=dict(color="orange", dash="dash")))
+            _fig.update_layout(title="RSP/SPY: Equal-Weight vs Cap-Weight",
+                               yaxis_title="Ratio", height=350, margin=dict(t=40, b=20))
+            st.plotly_chart(_fig, width="stretch")
+            _latest_r = _ratio.iloc[-1]; _50ma_r = _ratio_50.dropna().iloc[-1]
+            if _latest_r > _50ma_r:
+                st.success("RSP/SPY above 50DMA → broader participation is improving.")
+            else:
+                st.warning("RSP/SPY below 50DMA → mega-cap concentration may be increasing.")
+
+    st.divider()
+
+    # ── SPY Price Confirmation ────────────────────────────────────────────────
+    st.subheader("SPY Price Confirmation")
+    if mb_spy_series is not None and len(mb_spy_series) >= 50:
+        _spy = mb_spy_series
+        _spy_50  = _spy.rolling(50).mean()
+        _spy_200 = _spy.rolling(200).mean()
+        _cur_price = _spy.iloc[-1]
+        _cur_50    = _spy_50.dropna().iloc[-1]
+        _cur_200   = _spy_200.dropna().iloc[-1]
+        _cur_date  = _spy.index[-1]
+
+        # Price summary row
+        _sc1, _sc2, _sc3 = st.columns(3)
+        _sc1.metric("SPY Current Price", f"${_cur_price:.2f}")
+        _sc2.metric("50DMA",  f"${_cur_50:.2f}",  delta=f"{(_cur_price/_cur_50-1)*100:+.2f}% vs price")
+        _sc3.metric("200DMA", f"${_cur_200:.2f}", delta=f"{(_cur_price/_cur_200-1)*100:+.2f}% vs price")
+
+        _fig = go.Figure()
+        _fig.add_trace(go.Scatter(x=_spy.index, y=_spy.values,
+                                  mode="lines", name="SPY", line=dict(color="#1f77b4", width=1.5)))
+        _fig.add_trace(go.Scatter(x=_spy_50.index, y=_spy_50.values,
+                                  mode="lines", name="50DMA", line=dict(color="orange", dash="dash")))
+        _fig.add_trace(go.Scatter(x=_spy_200.index, y=_spy_200.values,
+                                  mode="lines", name="200DMA", line=dict(color="red", dash="dot")))
+
+        # Current price: horizontal reference line + marker
+        _fig.add_hline(y=_cur_price, line_dash="dot", line_color="#1f77b4", opacity=0.5,
+                       annotation_text=f"  Current ${_cur_price:.2f}",
+                       annotation_position="top left",
+                       annotation_font=dict(color="#1f77b4", size=12))
+        _fig.add_trace(go.Scatter(
+            x=[_cur_date], y=[_cur_price],
+            mode="markers+text",
+            marker=dict(color="#1f77b4", size=10, symbol="circle"),
+            text=[f"  ${_cur_price:.2f}"],
+            textposition="top right",
+            textfont=dict(size=11, color="#1f77b4"),
+            name="Current Price",
+            showlegend=True,
+        ))
+
+        _fig.update_layout(
+            title="SPY with 50DMA and 200DMA",
+            yaxis_title="Price (USD)",
+            height=430,
+            margin=dict(t=40, b=20),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(_fig, width="stretch")
+
+        # Trend interpretation
+        if _cur_price > _cur_50 > _cur_200:
+            st.success(f"SPY trend strong: price ${_cur_price:.2f} > 50DMA ${_cur_50:.2f} > 200DMA ${_cur_200:.2f}")
+        elif _cur_price < _cur_200:
+            st.error(f"SPY below 200DMA (${_cur_200:.2f}) — long-term trend risk elevated.")
+        elif _cur_price < _cur_50:
+            st.warning(f"SPY below 50DMA (${_cur_50:.2f}) — short-term momentum weakening.")
+        else:
+            st.info(f"SPY ${_cur_price:.2f} above 200DMA but below 50DMA — trend transitioning.")
+    else:
+        st.warning("SPY data unavailable.")
+
+    st.divider()
+
+    # ── Sector Breadth ────────────────────────────────────────────────────────
+    st.subheader("Sector Breadth")
+    _sd = mb_sector_df.copy()
+    _sd["% Above 50DMA"]  = _sd["% Above 50DMA"].map("{:.1%}".format)
+    _sd["% Above 200DMA"] = _sd["% Above 200DMA"].map("{:.1%}".format)
+    st.dataframe(_sd, width="stretch", hide_index=True)
+
+    if st.checkbox("Show raw breadth table (last 100 rows)", key="mb_raw"):
+        st.dataframe(mb_breadth.tail(100), width="stretch")
+
 # --- FOOTER: DECISION LOG ---
 st.divider()
 st.subheader("Decision Log Entry")
+
+# Show any warnings captured from risk_modeling.mandelbrot this session
+_captured_warnings = st.session_state.get("mandelbrot_warnings", [])
+if _captured_warnings:
+    st.markdown("**⚠️ Risk Engine Warnings (this session):**")
+    for _w in _captured_warnings:
+        st.warning(_w)
+    if st.button("Clear Warnings"):
+        st.session_state["mandelbrot_warnings"] = []
+        st.rerun()
+
 note = st.text_area("Record today's rationale (GIPS Governance):",
                     placeholder="e.g., Retained GIL despite volatility due to Hanes synergy targets.")
 if st.button("Save Entry"):
-    with open("governance_ips/decision_log.txt", "a") as f:
+    # Also flush any captured warnings into the file
+    _warnings_to_save = st.session_state.get("mandelbrot_warnings", [])
+    with open("governance_ips/decision_log.txt", "a", encoding="utf-8") as f:
         f.write(f"\n{pd.Timestamp.now()}: {note}")
+        for _w in _warnings_to_save:
+            f.write(f"\n  [AUTO-WARNING] {_w}")
     st.success("Entry saved to /governance_ips/")

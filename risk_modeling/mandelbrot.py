@@ -434,7 +434,7 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
             "Hybrid Lower Band": float(hybrid.get("lower_band", np.nan)),
         })
     except Exception as exc:
-        logger.warning("Hybrid signal computation failed | error=%s", exc)
+        logger.warning(f"⚠️ {ticker} Hybrid signal computation failed | error=%s", exc)
 
     prices = data_1m['Close'].values
     volumes = data_1m['Volume'].values
@@ -463,7 +463,7 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
     cash_cmf = liquidity_signals['cmf']
     fragility_score = abs(cash_cmf) / max(recent_vol, 1e-12)
     if h_val < 0.53 and cash_cmf < -0.15 and fragility_score > FRAGILITY_THRESHOLD:
-        logger.warning("Critical fragility detected | high risk of phase transition")
+        logger.warning(f"⚠️ {ticker} Critical fragility detected | high risk of phase transition")
 
     # 3. Directional Check (Slope of last hour)
     slope = linregress(np.arange(60), prices[-60:]).slope
@@ -500,7 +500,7 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
     if same_day_pos.size > 0:
         day_slice = data_1m.iloc[same_day_pos]
     else:
-        logger.warning("Unable to isolate current session bars; falling back to first bar in window")
+        logger.warning(f"⚠️ {ticker} Unable to isolate current session bars; falling back to first bar in window")
         day_slice = data_1m
 
     session_open = _get_session_open(data_1m, data_1d, current_session_date)
@@ -593,7 +593,7 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
 
 if __name__ == "__main__":
     # Test on your Core Universe
-    tickers = ["QQQ"]
+    tickers = ["SPY"]
     while True:
         for t in tickers:
             scan_market(t)     
