@@ -1260,6 +1260,7 @@ with tab9:
                 all_signals.append({
                     "Ticker": ticker,
                     "Price": f"{result.get('Price', 0.0):.2f}",
+                    "Open": f"{result.get('Open', 0.0):.2f}",
                     "Day %": f"{result.get('Day %', 0.0):.2f}%",
                     "Day % vs Prev Close": f"{result.get('Day % vs Prev Close', 0.0):.2f}%",
                     "Suggestion": result.get('Suggestion', ''),

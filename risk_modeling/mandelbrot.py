@@ -408,7 +408,7 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
 
     required_1m = max(HURST_WINDOW, VOL_LOOKBACK, 60) + 1
     if len(data_1m) < required_1m:
-        logger.error("Not enough intraday data | bars=%s | required=%s", len(data_1m), required_1m)
+        logger.error(f"{ticker} Not enough intraday data | bars={len(data_1m)} | required={required_1m}")
         return "ERROR - Insufficient 1m data"
 
     if len(data_1d) < 2:
@@ -545,6 +545,7 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
     # Compute liquidity signals for better tape/flow context.
     result = {
         "Price": float(prices[-1]),
+        "Open": float(session_open) if session_open is not None else float(prices[0]),
         "Day %": float(day_pct),
         "Day % vs Prev Close": float(day_pct_prev_close),
         "Hurst": float(h_val),
