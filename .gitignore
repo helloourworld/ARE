@@ -20,4 +20,5 @@ build/
 *.txt
 *.json
 *.log
-./data/
+./data/*
+!./data/.gitkeep

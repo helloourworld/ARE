@@ -1282,58 +1282,37 @@ with tab9:
                     try:
                         intraday = get_data_persistent(ticker, interval="1m", period="7d", force_refresh=True)
                         if intraday is not None and not intraday.empty:
-                            vpin_series = compute_rolling_vpin(
-                                intraday,
-                                vpin_window=vpin_bucket_count,
-                                window_minutes=vpin_window_minutes,
-                                resample_rule="5min",
-                            )
-                            cvd_series = compute_rolling_cvd(intraday, resample_rule="5min")
-
-                            vpin_series = pd.to_numeric(vpin_series, errors="coerce")
-                            cvd_series = pd.to_numeric(cvd_series, errors="coerce")
-
-                            vpin_series.index = pd.to_datetime(vpin_series.index, errors="coerce")
-                            cvd_series.index = pd.to_datetime(cvd_series.index, errors="coerce")
-
-                            vpin_series = (
-                                vpin_series[~vpin_series.index.isna()]
-                                .sort_index()
-                                .groupby(level=0)
-                                .last()
-                            )
-                            cvd_series = (
-                                cvd_series[~cvd_series.index.isna()]
-                                .sort_index()
-                                .groupby(level=0)
-                                .last()
-                            )
-
-                            plot_df = pd.concat(
-                                [vpin_series.rename("VPIN"), cvd_series.rename("CVD")],
-                                axis=1,
-                            ).sort_index()
-
-                            if plot_df.empty:
+                            # Get last 2 consecutive days of data
+                            intraday = intraday.sort_index().tail(2880)  # 1440 minutes per day * 2
+                            
+                            if intraday.empty:
                                 continue
-
-                            vpin_s = plot_df["VPIN"].rolling(window=smoothing_window, min_periods=1).mean()
-                            cvd_s = plot_df["CVD"].rolling(window=smoothing_window, min_periods=1).mean()
-                            plot_df["VPIN_SMOOTH"] = vpin_s
-                            plot_df["CVD_SMOOTH"] = cvd_s
-                            plot_df = plot_df.dropna(how="all", subset=["VPIN_SMOOTH", "CVD_SMOOTH"])
-
-                            if plot_df.empty:
+                            
+                            # Extract volume data
+                            volume_data = intraday[['Volume']].copy()
+                            volume_data.index = pd.to_datetime(volume_data.index, errors="coerce")
+                            volume_data = volume_data[~volume_data.index.isna()].sort_index()
+                            
+                            if volume_data.empty:
                                 continue
-
-                            fig = make_subplots(specs=[[{"secondary_y": True}]])
-                            fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["VPIN_SMOOTH"], name='VPIN (smoothed)', line=dict(color='orange')), secondary_y=False)
-                            fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["CVD_SMOOTH"], name='CVD (smoothed)', line=dict(color='blue')), secondary_y=True)
-                            fig.update_yaxes(title_text="VPIN", secondary_y=False)
-                            fig.update_yaxes(title_text="CVD", secondary_y=True)
+                            
+                            # Create plot
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(
+                                x=volume_data.index,
+                                y=volume_data['Volume'],
+                                name='Volume',
+                                line=dict(color='blue')
+                            ))
+                            fig.update_layout(
+                                title=f"{ticker} - Volume (1m) - Last 2 Days",
+                                xaxis_title="Time",
+                                yaxis_title="Volume",
+                                hovermode='x unified'
+                            )
                             out_dir = DATA_DIR / 'hybrid_plots'
                             out_dir.mkdir(parents=True, exist_ok=True)
-                            out_file = out_dir / f"{ticker}_vpin_cvd.html"
+                            out_file = out_dir / f"{ticker}_volume.html"
                             fig.write_html(str(out_file))
                     except Exception as e:
                         print(f"Failed saving plot for {ticker}: {e}")
