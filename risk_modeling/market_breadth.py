@@ -5,6 +5,7 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 from datetime import datetime
 from io import StringIO
+import requests
 
 
 """
@@ -25,6 +26,11 @@ Notes / assumptions:
     higher-level caching layers (see data_pipeline in repository).
 """
 
+# Create a session with custom headers
+session = requests.Session()
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+})
 
 # -----------------------------
 # Helper: get S&P 500 tickers
@@ -79,7 +85,8 @@ def download_prices(tickers, period="2y"):
         interval="1d",
         auto_adjust=True,
         progress=False,
-        threads=True
+        threads=True,
+        session=session  # Use the custom session with headers to avoid 403 errors
     )
 
     # yfinance returns a MultiIndex when multiple tickers are requested
@@ -107,7 +114,8 @@ def download_etfs(period="2y"):
         interval="1d",
         auto_adjust=True,
         progress=False,
-        threads=True
+        threads=True,
+        session=session  # Use the custom session with headers to avoid 403 errors
     )
 
     # Reuse same normalization logic as download_prices for ETF list
@@ -139,6 +147,7 @@ def append_current_prices(close_df, tickers):
                 auto_adjust=True,
                 progress=False,
                 threads=True,
+                session=session  # Use the custom session with headers to avoid 403 errors
             )
 
             if isinstance(current_data.columns, pd.MultiIndex):

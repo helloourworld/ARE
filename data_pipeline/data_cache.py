@@ -201,7 +201,7 @@ def _refresh_from_yf(ticker: str, start_date, interval: str) -> pd.DataFrame:
 
 
 def _refresh_local_cache(local_df: pd.DataFrame, ticker: str, interval: str, file_path: Path) -> pd.DataFrame:
-    last_ts = local_df.index[-1]
+    last_ts = local_df.index[-2] # Use second-to-last index to avoid partial last row TODO
     
     daily_like = str(interval).lower() in DATE_ONLY_INTERVALS
 
