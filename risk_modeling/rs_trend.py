@@ -1,12 +1,10 @@
 import pandas as pd
 import numpy as np
-import sys
 from pathlib import Path
 
-# Add repo root to path for imports
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+from enable_repo_root import ensure_repo_root
+
+REPO_ROOT = ensure_repo_root(Path(__file__).resolve().parents[1])
 
 try:
     from data_pipeline import get_price_history_with_benchmark

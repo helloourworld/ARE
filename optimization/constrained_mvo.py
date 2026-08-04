@@ -1,21 +1,57 @@
-import yaml
 import pandas as pd
-import sys
 from pathlib import Path
 from pypfopt import EfficientFrontier, risk_models, expected_returns, objective_functions
+import sys
 
-# Add repo root to path
-REPO_ROOT = Path(__file__).resolve().parents[1]
+
+def _find_repo_root(start_path: Path) -> Path:
+    for candidate in [start_path, *start_path.parents]:
+        if (candidate / "enable_repo_root.py").exists():
+            return candidate
+    return start_path
+
+
+REPO_ROOT = _find_repo_root(Path(__file__).resolve())
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from enable_repo_root import ensure_repo_root, load_config
 from data_pipeline import get_price_history
+
+REPO_ROOT = ensure_repo_root(REPO_ROOT)
+
+
+def build_optimization_report(weights, targets, bounds):
+    """Create a structured optimization report and a compact summary for downstream use."""
+    tickers = list(targets.keys())
+    if len(tickers) != len(weights):
+        raise ValueError("Weight and target counts must match")
+
+    report = pd.DataFrame({
+        "Ticker": tickers,
+        "Strategic Target": [targets[ticker] for ticker in tickers],
+        "Optimized Weight": [weights.get(ticker, 0.0) for ticker in tickers],
+    })
+    report["Delta"] = report["Optimized Weight"] - report["Strategic Target"]
+
+    bounds_lookup = {ticker: bounds[idx] for idx, ticker in enumerate(tickers)}
+    within_bounds = all(
+        lower <= report.loc[report["Ticker"] == ticker, "Optimized Weight"].iloc[0] <= upper
+        for ticker, (lower, upper) in bounds_lookup.items()
+    )
+
+    summary = {
+        "num_assets": len(tickers),
+        "within_bounds": within_bounds,
+        "max_abs_delta": float(abs(report["Delta"]).max()),
+    }
+
+    return report, summary
+
 
 def run_constrained_optimization():
     # 1. Load Configuration
-    config_path = REPO_ROOT / "config.yaml"
-    with open(config_path, "r") as f:
-        cfg = yaml.safe_load(f)
+    cfg = load_config("config.yaml", REPO_ROOT)
     
     tickers = list(cfg['constraints'].keys())
     bounds = [(v['min'], v['max']) for v in cfg['constraints'].values()]
@@ -46,17 +82,14 @@ def run_constrained_optimization():
     cleaned_weights = ef.clean_weights()
     
     # 7. Comparison Report
-    report = pd.DataFrame({
-        "Strategic Target": targets,
-        "Optimized Weight": cleaned_weights
-    })
-    report['Delta'] = report['Optimized Weight'] - report['Strategic Target']
+    report, summary = build_optimization_report(cleaned_weights, targets, bounds)
     
     print("--- Constrained Optimization Results ---")
     print(report.to_string(formatters={'Strategic Target': '{:,.2%}'.format, 
                                        'Optimized Weight': '{:,.2%}'.format,
                                        'Delta': '{:+.2%}'.format}))
-    return cleaned_weights
+    print(f"Summary: {summary}")
+    return cleaned_weights, report, summary
 
 if __name__ == "__main__":
     run_constrained_optimization()

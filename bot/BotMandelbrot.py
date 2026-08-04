@@ -14,17 +14,28 @@ import os
 import uuid
 from logging.handlers import RotatingFileHandler
 from contextlib import redirect_stdout
-import sys
 import time
 from pathlib import Path
 import pytz
 import numpy as np
 import pandas as pd
+import sys
 
-# Ensure the project root is on sys.path so imports work when running bot/BotMandelbrot.py directly.
-REPO_ROOT = Path(__file__).resolve().parents[1]
+
+def _find_repo_root(start_path: Path) -> Path:
+    for candidate in [start_path, *start_path.parents]:
+        if (candidate / "enable_repo_root.py").exists():
+            return candidate
+    return start_path
+
+
+REPO_ROOT = _find_repo_root(Path(__file__).resolve())
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+from enable_repo_root import ensure_repo_root
+
+REPO_ROOT = ensure_repo_root(REPO_ROOT)
 
 from ib_insync import IB, MarketOrder, Stock
 from data_pipeline.data_cache import get_data_persistent

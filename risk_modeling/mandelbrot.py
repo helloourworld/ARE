@@ -235,6 +235,31 @@ def calculate_cvd_refined(data_df, window=100):
 
     return normalized_slope, r_value
 
+
+def calibrate_cvd_threshold(data_df, lookback=240, base_threshold=0.03):
+    """Calibrate CVD slope threshold from recent flow intensity.
+
+    The threshold adapts by symbol/session so divergence checks remain meaningful
+    across different volume scales and tape regimes.
+    """
+    df = data_df.tail(lookback).copy()
+    if len(df) < 120 or "Close" not in df.columns or "Volume" not in df.columns:
+        return float(base_threshold)
+
+    returns = df["Close"].pct_change().fillna(0.0)
+    sigma = returns.rolling(20, min_periods=20).std().replace(0.0, np.nan)
+    z = (returns / sigma).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    buy_prob = norm.cdf(z)
+    delta = (2.0 * buy_prob - 1.0) * df["Volume"].astype(float)
+
+    avg_vol = max(float(df["Volume"].astype(float).mean()), 1e-9)
+    delta_norm = (delta / avg_vol).abs()
+
+    q75 = float(delta_norm.quantile(0.75)) if len(delta_norm.dropna()) else 0.0
+    adaptive = max(base_threshold, q75 * 0.25)
+    return float(np.clip(adaptive, 0.02, 0.25))
+
 # ============================================================================
 # UPDATED SCANNER WITH JUDGMENT LOGIC
 # ============================================================================
@@ -254,7 +279,7 @@ def compute_judgment(prices, volumes, data_1m, h_val, alpha, cmf=0.0, breadth_sl
     is_price_down = price_change < -0.001
     
     # 3. Define Thresholds
-    CVD_THRESHOLD = 0.05       # Minimum slope to care about
+    CVD_THRESHOLD = calibrate_cvd_threshold(data_1m, base_threshold=0.03)
     CONFIDENCE_THRESHOLD = 0.5 # Minimum R-Value to trust CVD
     VPIN_TOXIC = 0.75          # Level where liquidity becomes fragile
     weak_liquidity = (cmf < 0) and (breadth_slope < 0)
@@ -301,7 +326,7 @@ def compute_judgment(prices, volumes, data_1m, h_val, alpha, cmf=0.0, breadth_sl
     elif h_val < 0.45 and entropy < 2.2:
         judgment = "MEAN REVERSION (Trend is dead, price likely to return to average)"
 
-    return judgment, entropy, vpin, cvd_slope
+    return judgment, entropy, vpin, cvd_slope, CVD_THRESHOLD
 
 
 def scan_with_judgment(ticker):
@@ -321,7 +346,7 @@ def generate_suggestion(regime, judgment, entropy, alpha, h_val, vpin, cvd_slope
     if "TOXIC" in judgment or vpin > 0.80:
         if "DISTRIBUTION" in judgment:
             return "🚨 EXIT / AGGRESSIVE SELL", "Structural Jump Risk: Smart money is exiting into a hollow rally. Rug-pull imminent."
-        if "ACCUMULATE" in judgment or "ABSORPTION" in judgment:
+        if "ACCUMULATE" in judgment or "ACCUMULATION" in judgment or "ABSORPTION" in judgment:
             return "🛡️ HEDGE / PROTECT", "Toxic flow detected during accumulation. High volatility ahead; use protective puts."
         return "🚫 AVOID / STAY CASH", "Order flow is predatory (VPIN > 0.8). Market makers are withdrawing liquidity."
 
@@ -446,8 +471,9 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
 
     # We calculate the 'Worst Case' Alpha between live intraday and structural daily
     alpha_live = calculate_tail_index_robust(returns_1m, lookback=500)
-    alpha_daily = calculate_tail_index_robust(
-        data_1d['Close'].pct_change().dropna().values, lookback=500)
+    daily_prices = data_1d['Close'].astype(float).values
+    daily_log_returns = np.diff(np.log(daily_prices))
+    alpha_daily = calculate_tail_index_robust(daily_log_returns, lookback=500)
     alpha_eff = min(alpha_live, alpha_daily)
 
     # 2. Intraday Volatility (Standard Deviation of log returns over 30 mins)
@@ -530,14 +556,26 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
     elif gap_pct < -0.05 and h_val < HURST_TREND_MIN:
         regime = "2 - BEARISH PERSISTENCE (Post-Gap Breakdown)"
     elif h_val > HURST_TREND_MIN:
+        is_bullish = day_pct > 0 or gap_pct > 0
         if alpha_eff >= TAIL_SAFE:
-            regime = "1 - BULLISH PERSISTENCE (Trend is Real)"
+            regime = "1 - BULLISH PERSISTENCE (Trend is Real | Tail-Stable)" if is_bullish else "2 - BEARISH PERSISTENCE (Trend is Real | Tail-Stable)"
+            tail_quality = "Tail-Stable"
         else:
-            regime = "2 - BEARISH PERSISTENCE (Trend is Real)"
+            regime = "1 - BULLISH PERSISTENCE (Trend is Real | Tail-Caution)" if is_bullish else "2 - BEARISH PERSISTENCE (Trend is Real | Tail-Caution)"
+            tail_quality = "Tail-Caution"
     elif h_val < HURST_CHOP_MAX:
         regime = "4 - UNSTABLE (Mean Reverting / Chop)"
+        tail_quality = "N/A"
     else:
         regime = "3 - NEUTRAL / RANDOM WALK"
+        tail_quality = "N/A"
+
+    if alpha_eff < TAIL_RISKY:
+        tail_quality = "Tail-Risk"
+    elif gap_pct > 0.05 and h_val < HURST_TREND_MIN:
+        tail_quality = "N/A"
+    elif gap_pct < -0.05 and h_val < HURST_TREND_MIN:
+        tail_quality = "N/A"
 
     # 5. OUTPUT
     logger.info("StockTs=%s | Price=%.2f | Hurst=%.3f | TailIndex=%.3f | IntradayVol=%.5f | Regime=%s", market_ts, prices[-1], h_val, alpha_eff, recent_vol, regime)
@@ -555,6 +593,8 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
         "Regime": regime,
         "Fragility Score": float(fragility_score),
         "Fragility Alert": "",
+        "Tail Quality": tail_quality,
+        "CVD Threshold": float(np.nan),
         "Verdict": "N/A",
         "Suggestion": "N/A",
         "Reason": "N/A",
@@ -563,14 +603,14 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
     result.update(hybrid_signal_result)
 
     if show_judgment:
-        judgment, entropy, vpin, cvd_slope = compute_judgment(
+        judgment, entropy, vpin, cvd_slope, cvd_threshold = compute_judgment(
             prices, volumes, data_1m, h_val, alpha_eff,
             cmf=liquidity_signals['cmf'],
             breadth_slope=liquidity_signals['breadth_slope']
         )
         cvd_arrow = "⬆️" if cvd_slope > 0 else "⬇️" if cvd_slope < 0 else "→"
         cvd_label = "UP" if cvd_slope > 0 else "DOWN" if cvd_slope < 0 else "FLAT"
-        logger.info("StockTs=%s | Entropy=%.2f | VPIN=%.2f | LiquidityCMF=%.3f | BreadthSlope=%.5f | CVDTrend=%.2f %s %s | Verdict=%s", market_ts, entropy, vpin, liquidity_signals['cmf'], liquidity_signals['breadth_slope'], cvd_slope, cvd_arrow, cvd_label, judgment)
+        logger.info("StockTs=%s | Entropy=%.2f | VPIN=%.2f | LiquidityCMF=%.3f | BreadthSlope=%.5f | CVDThr=%.3f | CVDTrend=%.2f %s %s | Verdict=%s", market_ts, entropy, vpin, liquidity_signals['cmf'], liquidity_signals['breadth_slope'], cvd_threshold, cvd_slope, cvd_arrow, cvd_label, judgment)
 
         # 6. ADD SUGGESTION
         action, reason = generate_suggestion(
@@ -582,6 +622,7 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
             "Suggestion": action,
             "Reason": reason,
             "CVD Trend": f"{cvd_slope:.2f} {cvd_label}",
+            "CVD Threshold": float(cvd_threshold),
             "VPIN": float(vpin)
         })
 

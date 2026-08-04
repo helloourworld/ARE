@@ -1,16 +1,13 @@
 import pandas as pd
 import numpy as np
-import sys
 from pathlib import Path
 from scipy.stats import norm
 from datetime import datetime, timedelta
 
-# Add repo root to path
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
+from enable_repo_root import ensure_repo_root
 from data_pipeline import get_price_history, get_ohlcv_history
+
+REPO_ROOT = ensure_repo_root(Path(__file__).resolve().parents[1])
 
 class AREDataLoader:
     def __init__(self):

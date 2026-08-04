@@ -2,17 +2,24 @@
 import datetime
 import logging
 import os
-import sys
 from pathlib import Path
+import sys
 
-# Ensure the repository root is on PYTHONPATH for local imports.
-REPO_ROOT = Path(__file__).resolve().parents[1]
+
+def _find_repo_root(start_path: Path) -> Path:
+    for candidate in [start_path, *start_path.parents]:
+        if (candidate / "enable_repo_root.py").exists():
+            return candidate
+    return start_path
+
+
+# Repository startup helper
+REPO_ROOT = _find_repo_root(Path(__file__).resolve())
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# Repository startup helper
 from enable_repo_root import ensure_repo_root
-ensure_repo_root(REPO_ROOT)
+REPO_ROOT = ensure_repo_root(REPO_ROOT)
 
 # Third-party libraries
 import appdirs as ad
@@ -45,6 +52,7 @@ from risk_modeling.market_breadth import (
 )
 from risk_modeling.bolling_bands import compute_rolling_vpin, compute_rolling_cvd
 from data_pipeline.data_cache import DATA_DIR
+from alpha_research.price_forecasting import run_all, RiskRulesConfig
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -375,9 +383,9 @@ def get_robust_metrics(returns):
 shrunk_cov, shrunk_corr = get_robust_metrics(returns)
 
 # --- APP TABS ---
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(
     ["Performance Attribution", "Risk Report", "Scenario Stress Test", "Factor Attribution", "Efficient Frontier", "CURRENCY EXPOSURE & FX SENSITIVITY", "Rebalancing & Execution",
-     "Relative Strength Signals", "Market Trend", "📊 Market Breadth"])
+     "Relative Strength Signals", "Market Trend", "📊 Market Breadth", "🔮 Forecast Portal"])
 
 # --- TAB 1: ALPHA ATTRIBUTION ---
 with tab1:
@@ -1171,6 +1179,18 @@ with tab9:
         """**Regime Icon Legend:** 🟢 Bullish | 🔴 Bearish | 🟡 Neutral | ⚠️ Unstable | 🚨 Tail Risk | 🔎 Other  
         **CVD Trend Icons:** ⬆️ Up | ⬇️ Down | → Flat"""
     )
+    with st.expander("Evaluation Legend", expanded=False):
+                st.markdown(
+                        """
+                        - **Tail Quality**
+                            - **Tail-Stable:** Tail index is in the safer zone for trend-following.
+                            - **Tail-Caution:** Trend exists, but fat-tail risk is elevated; reduce size.
+                            - **Tail-Risk:** Jump/gap risk is dominant; protect capital first.
+                        - **Calibrated CVD Threshold**
+                            - Dynamic divergence sensitivity for the current tape.
+                            - Higher values mean only stronger CVD slopes are treated as meaningful divergence.
+                        """
+                )
     st.write(f"**Monitor List:** {', '.join(sorted(monitor_list))}")
 
     alert_ticker = st.selectbox(
@@ -1209,6 +1229,9 @@ with tab9:
                 format_vpin_color(result['VPIN']),
                 precision=3
             )
+            if isinstance(result.get('CVD Threshold'), (float, int)):
+                st.write(f"**Calibrated CVD Threshold:** {result.get('CVD Threshold', 0.0):.3f}")
+            st.write(f"**Tail Quality:** {result.get('Tail Quality', 'N/A')}")
             render_metric_with_threshold(
                 "Hybrid Signal VPIN",
                 result.get('Hybrid VPIN', 0.0),
@@ -1269,6 +1292,8 @@ with tab9:
                     "Tail Index": f"{result.get('Tail Index', 0.0):.3f}",
                     "VPIN": f"{result.get('VPIN', 0.0):.3f}",
                     "Hybrid VPIN": f"{result.get('Hybrid VPIN', 0.0):.3f}",
+                    "CVD Threshold": f"{result.get('CVD Threshold', 0.0):.3f}",
+                    "Tail Quality": result.get('Tail Quality', 'N/A'),
                     "Hybrid Signal": result.get('Hybrid Signal', 'N/A'),
                     "Hybrid CVD Trend": result.get('Hybrid CVD Trend', 'N/A'),
                     "CVD Trend": f"{cvd_icon} {result.get('CVD Trend', 'N/A')}",
@@ -1537,6 +1562,147 @@ with tab10:
 
     if st.checkbox("Show raw breadth table (last 100 rows)", key="mb_raw"):
         st.dataframe(mb_breadth.tail(100), width="stretch")
+
+
+# =============================================================================
+# TAB 11: FORECAST PORTAL (ML + MONTE CARLO + ACTIONS)
+# =============================================================================
+with tab11:
+    st.header("🔮 Intraday Forecast & Action Portal")
+    st.caption("Machine-learning forecasts + Monte Carlo probabilistic range + rule-based trade action.")
+
+    forecast_universe = sorted(set(selected_tickers + [selected_benchmark] + st.session_state.get('external_tickers', [])))
+    if not forecast_universe:
+        st.warning("No symbols available. Select tickers in the sidebar first.")
+    else:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            fc_ticker = st.selectbox("Ticker", options=forecast_universe, index=0, key="fc_ticker")
+        with c2:
+            fc_intraday_period = st.selectbox("Intraday Training Period", options=["30d", "60d"], index=1, key="fc_period")
+        with c3:
+            fc_intraday_interval = st.selectbox("Intraday Interval", options=["1m", "2m", "5m", "15m"], index=2, key="fc_interval")
+
+        r1, r2, r3 = st.columns(3)
+        with r1:
+            fc_portfolio_value = st.number_input("Portfolio Value", min_value=1_000.0, value=100_000.0, step=5_000.0)
+        with r2:
+            fc_daily_budget = st.slider("Daily Tail-Risk Budget %", min_value=0.10, max_value=5.00, value=1.50, step=0.05) / 100.0
+        with r3:
+            fc_min_edge = st.slider("Min Edge %", min_value=0.05, max_value=2.00, value=0.25, step=0.05) / 100.0
+
+        if st.button("Run Forecast & Action", key="run_forecast_action"):
+            try:
+                rules_cfg = RiskRulesConfig(
+                    min_edge_pct=fc_min_edge,
+                    daily_tail_risk_budget_pct=fc_daily_budget,
+                )
+                forecast_results = run_all(
+                    ticker=fc_ticker,
+                    intraday_period=fc_intraday_period,
+                    intraday_interval=fc_intraday_interval,
+                    portfolio_value=fc_portfolio_value,
+                    rules_config=rules_cfg,
+                )
+
+                intraday = forecast_results["intraday_ml"]
+                daily = forecast_results["next_close_ml"]
+                mc = forecast_results["gbm_monte_carlo"]
+                decision = forecast_results.get("trade_decision")
+
+                st.subheader(f"Forecast Snapshot: {fc_ticker}")
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Current Price (1m)", f"{intraday.current_price:.2f}")
+                m2.metric("Predicted Session Close", f"{intraday.predicted_close:.2f}", f"{intraday.predicted_return_to_close * 100:.2f}%")
+                m3.metric("Predicted Next Close", f"{daily.predicted_next_close:.2f}", f"MAE {daily.holdout_mae:.3f}")
+                m4.metric("P(Terminal > Start)", f"{mc.probability_above_start * 100:.2f}%")
+
+                with st.expander("Model Validation Metrics", expanded=True):
+                    v1, v2, v3, v4 = st.columns(4)
+                    v1.metric("Daily Holdout MAE", f"{daily.holdout_mae:.4f}")
+                    v2.metric("Daily Holdout RMSE", f"{daily.holdout_rmse:.4f}")
+                    v3.metric("Daily Holdout MAPE", f"{daily.holdout_mape:.2%}")
+                    v4.metric("Daily Directional Acc", f"{daily.holdout_directional_acc:.2%}")
+
+                    w1, w2, w3, w4 = st.columns(4)
+                    w1.metric("Daily WF MAE", f"{daily.walk_forward_mae:.4f}")
+                    w2.metric("Daily WF RMSE", f"{daily.walk_forward_rmse:.4f}")
+                    w3.metric("Daily WF MAPE", f"{daily.walk_forward_mape:.2%}")
+                    w4.metric("Daily WF Dir Acc", f"{daily.walk_forward_directional_acc:.2%}")
+                    st.caption(f"Daily walk-forward windows: {daily.walk_forward_windows}")
+
+                    intraday_metrics = getattr(intraday, "validation_metrics", {}) or {}
+                    i1, i2, i3, i4 = st.columns(4)
+                    i1.metric("Intraday Holdout MAE", f"{float(intraday_metrics.get('mae', float('nan'))):.6f}")
+                    i2.metric("Intraday Holdout RMSE", f"{float(intraday_metrics.get('rmse', float('nan'))):.6f}")
+                    i3.metric("Intraday Holdout MAPE", f"{float(intraday_metrics.get('mape', float('nan'))):.2%}")
+                    i4.metric("Intraday Directional Acc", f"{float(intraday_metrics.get('directional_acc', float('nan'))):.2%}")
+
+                    iw1, iw2, iw3, iw4 = st.columns(4)
+                    iw1.metric("Intraday WF MAE", f"{float(intraday_metrics.get('wf_mae', float('nan'))):.6f}")
+                    iw2.metric("Intraday WF RMSE", f"{float(intraday_metrics.get('wf_rmse', float('nan'))):.6f}")
+                    iw3.metric("Intraday WF MAPE", f"{float(intraday_metrics.get('wf_mape', float('nan'))):.2%}")
+                    iw4.metric("Intraday WF Dir Acc", f"{float(intraday_metrics.get('wf_directional_acc', float('nan'))):.2%}")
+                    st.caption(f"Intraday walk-forward windows: {int(float(intraday_metrics.get('wf_windows', 0.0)))}")
+
+                q_df = pd.DataFrame([
+                    {"Quantile": "5%", "Price": mc.quantiles["p05"]},
+                    {"Quantile": "25%", "Price": mc.quantiles["p25"]},
+                    {"Quantile": "50%", "Price": mc.quantiles["p50"]},
+                    {"Quantile": "75%", "Price": mc.quantiles["p75"]},
+                    {"Quantile": "95%", "Price": mc.quantiles["p95"]},
+                ])
+
+                c_left, c_right = st.columns([1, 2])
+                with c_left:
+                    st.markdown("**Monte Carlo Quantile Range**")
+                    st.dataframe(q_df.style.format({"Price": "{:.2f}"}), hide_index=True, width='stretch')
+                with c_right:
+                    fig_q = go.Figure()
+                    fig_q.add_trace(go.Scatter(
+                        x=q_df["Quantile"],
+                        y=q_df["Price"],
+                        mode="lines+markers",
+                        name="Quantile Curve",
+                        line=dict(color="#1f77b4", width=2),
+                    ))
+                    fig_q.add_hline(
+                        y=intraday.current_price,
+                        line_dash="dash",
+                        line_color="gray",
+                        annotation_text=f"Current {intraday.current_price:.2f}",
+                        annotation_position="top left",
+                    )
+                    fig_q.update_layout(title="GBM Probabilistic Close Range", yaxis_title="Price", height=320)
+                    st.plotly_chart(fig_q, width='stretch')
+
+                if decision is not None:
+                    st.subheader("Action Engine")
+                    if decision.action == "TRADE":
+                        st.success(f"Action: {decision.action}")
+                    elif decision.action == "REDUCE":
+                        st.warning(f"Action: {decision.action}")
+                    else:
+                        st.error(f"Action: {decision.action}")
+
+                    a1, a2, a3, a4 = st.columns(4)
+                    a1.metric("Edge", f"{decision.edge_pct * 100:.2f}%")
+                    a2.metric("Reward / Risk", f"{decision.reward_to_risk:.2f}")
+                    a3.metric("Suggested Weight", f"{decision.recommended_weight * 100:.2f}%")
+                    a4.metric("Tail-Risk Notional", f"{decision.tail_risk_notional:.2f}")
+
+                    budget_total = forecast_results.get("risk_budget_total")
+                    budget_remaining = forecast_results.get("risk_budget_remaining")
+                    if isinstance(budget_total, (float, int)) and isinstance(budget_remaining, (float, int)):
+                        st.caption(f"Daily risk budget remaining: {budget_remaining:.2f} / {budget_total:.2f}")
+
+                    if getattr(decision, "reasons", None):
+                        st.markdown("**Decision Reasons**")
+                        for reason in decision.reasons:
+                            st.write(f"- {reason}")
+
+            except Exception as e:
+                st.error(f"Forecast portal error: {e}")
 
 # --- FOOTER: DECISION LOG ---
 st.divider()
