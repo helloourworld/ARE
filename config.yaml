@@ -7,7 +7,7 @@ metadata:
 # The "Master List" for the Select Universe dropdown
 universe:
   core: [XEQT.TO]
-  active_growth: [CLML.TO]
+  active_growth: [PSI]
   passive_em: [ZEM.TO]
   intl_hedged: [XEF.TO]
   us_tech: [MSFT, GOOG, AMZN, AAPL]
@@ -23,7 +23,7 @@ universe:
 defaults:
   selected_portfolio:
     - XEQT.TO
-    - CLML.TO
+    - PSI
     - XDIV.TO
     - MSFT
     - GOOG
@@ -35,7 +35,7 @@ defaults:
 # Strategic Asset Allocation (SAA) with Box Constraints
 constraints:
   XEQT.TO: {min: 0.15, max: 0.30, target: 0.25}
-  CLML.TO: {min: 0.20, max: 0.30, target: 0.25}
+  PSI:     {min: 0.20, max: 0.30, target: 0.25}
   MSFT:    {min: 0.05, max: 0.20, target: 0.15}
   GOOG:    {min: 0.05, max: 0.20, target: 0.15}
   AMZN:    {min: 0.05, max: 0.20, target: 0.10}
@@ -59,6 +59,5 @@ external_tickers:
   - INTC
   - AAPL
   - MRVL
-  - PSI
   - QQQM
   - VRT

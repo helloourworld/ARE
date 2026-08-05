@@ -5,6 +5,9 @@ import os
 from pathlib import Path
 import sys
 
+# Avoid loky physical-core detection warning on some Windows setups.
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(os.cpu_count() or 1))
+
 
 def _find_repo_root(start_path: Path) -> Path:
     for candidate in [start_path, *start_path.parents]:
@@ -84,25 +87,37 @@ cache_path = os.path.join(
 if not os.path.exists(cache_path):
     os.makedirs(cache_path)
 yf.set_tz_cache_location(cache_path)
+
 # --- Capture mandelbrot WARNING logs into session state ---
+_MANDELBROT_HANDLER_TAG = "are_mandelbrot_session_handler"
+
+
 class _SessionStateLogHandler(logging.Handler):
     """Forwards WARNING+ records from risk_modeling.mandelbrot to st.session_state."""
     def emit(self, record: logging.LogRecord) -> None:
         try:
             if "mandelbrot_warnings" not in st.session_state:
                 st.session_state["mandelbrot_warnings"] = []
+            msg = self.format(record)
+            warnings_list = st.session_state["mandelbrot_warnings"]
+            # Prevent consecutive duplicate warnings caused by reruns/duplicate emits.
+            if warnings_list and warnings_list[-1].endswith(f"| {msg}"):
+                return
             ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            st.session_state["mandelbrot_warnings"].append(
-                f"{ts} | {self.format(record)}"
-            )
+            warnings_list.append(f"{ts} | {msg}")
         except Exception:
             pass
 
 _mandelbrot_logger = logging.getLogger("risk_modeling.mandelbrot")
-if not any(isinstance(h, _SessionStateLogHandler) for h in _mandelbrot_logger.handlers):
-    _handler = _SessionStateLogHandler(level=logging.WARNING)
-    _handler.setFormatter(logging.Formatter("%(message)s"))
-    _mandelbrot_logger.addHandler(_handler)
+# Keep exactly one session-state warning handler across Streamlit reruns.
+_mandelbrot_logger.handlers = [
+    h for h in _mandelbrot_logger.handlers
+    if getattr(h, "_are_tag", None) != _MANDELBROT_HANDLER_TAG
+]
+_handler = _SessionStateLogHandler(level=logging.WARNING)
+_handler.setFormatter(logging.Formatter("%(message)s"))
+_handler._are_tag = _MANDELBROT_HANDLER_TAG
+_mandelbrot_logger.addHandler(_handler)
 
 # Local modules
 
@@ -225,6 +240,24 @@ def format_vol_color(value: float) -> str:
     return "green"
 
 
+def render_headline_benchmark_alert() -> None:
+    """Show a global top banner when live benchmark move exceeds threshold."""
+    change_pct = st.session_state.get("live_benchmark_change_pct")
+    benchmark = st.session_state.get("live_benchmark_symbol")
+    baseline = st.session_state.get("live_benchmark_baseline")
+
+    if not isinstance(change_pct, (float, int)):
+        return
+
+    if change_pct > 1.5:
+        label = benchmark or "Benchmark"
+        basis = f" vs {baseline}" if isinstance(baseline, str) and baseline else ""
+        st.warning(
+            f"🚨 **Market Momentum Alert:** {label} is up **{float(change_pct):.2f}%**{basis}. "
+            "Upside can become fragile in fast melt-up conditions; tighten stops and avoid chasing late entries."
+        )
+
+
 # --- CONFIGURATION & STYLING ---
 st.set_page_config(page_title="Alpha Risk Engine (ARE)", layout="wide")
 
@@ -320,9 +353,9 @@ if returns.empty:
 incomplete_cols = [col for col in returns.columns if returns[col].isna().any()]
 if incomplete_cols:
     returns[incomplete_cols] = returns[incomplete_cols].ffill().bfill().fillna(0)
-    st.info(
-        f"⚠️ Forward-filled missing returns for: {', '.join(sorted(incomplete_cols))} (using ffill → bfill → 0)"
-    )
+    # st.info(
+    #     f"⚠️ Forward-filled missing returns for: {', '.join(sorted(incomplete_cols))} (using ffill → bfill → 0)"
+    # )
 
 if selected_benchmark not in returns.columns:
     st.error(
@@ -350,6 +383,7 @@ if returns.empty:
 st.title(cfg['metadata']['report_title'])
 st.caption(
     f"Analyst: {cfg['metadata']['analyst_name']} | Strategy: {cfg['metadata']['strategy_id']}")
+render_headline_benchmark_alert()
 
 # Access parameters for math
 rf = cfg['parameters']['risk_free_rate']
@@ -384,12 +418,12 @@ shrunk_cov, shrunk_corr = get_robust_metrics(returns)
 
 # --- APP TABS ---
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(
-    ["Performance Attribution", "Risk Report", "Scenario Stress Test", "Factor Attribution", "Efficient Frontier", "CURRENCY EXPOSURE & FX SENSITIVITY", "Rebalancing & Execution",
-     "Relative Strength Signals", "Market Trend", "📊 Market Breadth", "🔮 Forecast Portal"])
+    ["📈 Performance Attribution", "🛡️ Risk Report", "🧪 Scenario Stress Test", "🧠 Factor Attribution", "🧭 Efficient Frontier", "💱 Currency Exposure & FX Sensitivity", "⚖️ Rebalancing & Execution",
+     "📡 Relative Strength Signals", "🎛️ Market Trend", "📊 Market Breadth", "🔮 Forecast Portal"])
 
 # --- TAB 1: ALPHA ATTRIBUTION ---
 with tab1:
-    st.header("Factor-Based Alpha Analysis")
+    st.header("📈 Factor-Based Alpha Analysis")
     target_stock = st.selectbox("Analyze Asset Alpha", selected_tickers)
 
     # Simple Factor Proxy (Market Excess)
@@ -410,7 +444,7 @@ with tab1:
 
 # --- TAB 2: THE RISK REPORT ---
 with tab2:
-    st.header("Institutional Risk Report")
+    st.header("🛡️ Institutional Risk Report")
 
     col_a, col_b, col_c = st.columns([2, 1, 1])
 
@@ -463,7 +497,7 @@ with tab3:
     # Now, in any tab, you just call:
     current_weights = get_current_weights()
 
-    st.header("Strategic Scenario Analysis & Contagion Audit")
+    st.header("🧪 Strategic Scenario Analysis & Contagion Audit")
     st.markdown("""
     **Analytical Framework:** We utilize the **Conditional Linear Regression** method.
     By shocking a 'Primary Factor,' we estimate the impact on all other assets using their
@@ -567,7 +601,7 @@ with tab3:
 
 # --- TAB 4: REBALANCING & EXECUTION (Black-Litterman) ---
 with tab4:
-    st.header("Institutional Rebalancing: Black-Litterman Model")
+    st.header("⚖️ Institutional Rebalancing: Black-Litterman Model")
     st.markdown("""
     **Analytical Framework:** We blend Market Equilibrium (Priors) with your specific Analyst Views (the Alpha).
     This prevents the model from over-allocating based on noisy historical data.
@@ -671,7 +705,7 @@ with tab4:
 
 # --- STREAMLIT INTEGRATION ---
 with tab5:
-    st.header("Efficient Frontier Analytics")
+    st.header("🧭 Efficient Frontier Analytics")
     st.markdown("""
     **Consultant's View:** Assets below the white line are 'Dominated.'
     Your Optimized Portfolio (The Star) is positioned to maximize return for your chosen **Risk Aversion (λ=3)**.
@@ -687,7 +721,7 @@ with tab5:
 
 # --- TAB 6: CURRENCY EXPOSURE & FX SENSITIVITY ---
 with tab6:
-    st.header("Global Currency Exposure Audit")
+    st.header("💱 Global Currency Exposure Audit")
     st.markdown("""
     **Analytical Note:** This portfolio utilizes an **Unhedged Strategy**.
     We capture the 'Currency Alpha' during periods of CAD weakness.
@@ -764,7 +798,7 @@ with tab6:
 
 # --- TAB 7: SECTOR ROTATION (FINN vs XCHP) ---
 with tab7:
-    st.header("Relative Strength Audit: Application vs. Infrastructure")
+    st.header("📡 Relative Strength Audit: Application vs. Infrastructure")
     st.markdown("""
     **Analytical Thesis:** Are we at a 'Semiconductor Peak'?
     We compare the **Infrastructure (XCHP)** to the **Transaction Layer (FINN.NE)**.
@@ -818,7 +852,7 @@ with tab7:
 
  # --- TAB 8: ALPHA PERSISTENCE (RS SIGNALS) ---
 with tab8:
-    st.header("Institutional Relative Strength (RS) Audit")
+    st.header("📶 Institutional Relative Strength (RS) Audit")
     st.markdown("""
     **Objective:** Identify 'Institutional Footprints'.
     We look for assets with **RS Score > 0** (Outperforming) and **Positive Slope** (Accumulating).
@@ -1086,6 +1120,9 @@ with tab9:
             bench_current = bench_series.iloc[-1]
             bench_ref_price, bench_ref_label = get_reference_price(selected_benchmark, bench_series)
             benchmark_change = (bench_current / bench_ref_price - 1) * 100 if bench_ref_price is not None else float('nan')
+            st.session_state["live_benchmark_change_pct"] = float(benchmark_change) if not pd.isna(benchmark_change) else None
+            st.session_state["live_benchmark_symbol"] = selected_benchmark
+            st.session_state["live_benchmark_baseline"] = bench_ref_label
 
             for t in monitor_list:
                 if t == selected_benchmark:
@@ -1361,12 +1398,16 @@ with tab9:
 
     if benchmark_change > 1.5:
         st.warning(
-            "🚨 **Gamma Warning:** Market is rolling up >1.5%. Check for 'Melt-up' exhaustion in your INTC and MU satellites.")
+            "🚨 **Momentum Risk Alert:** Benchmark is up more than 1.5% from baseline. "
+            "Melt-up conditions can reverse sharply; avoid late entries and tighten risk controls."
+        )
     elif benchmark_change < -1.5:
         st.error(
-            "📉 **Liquidation Alert:** Systemic sell-off detected. Monitor KILO.TO for safe-haven decoupling.")
+            "📉 **Drawdown Alert:** Benchmark is down more than 1.5% from baseline. "
+            "Prioritize capital protection, reduce gross exposure, and focus on liquidity quality."
+        )
     else:
-        st.info("Regime: Normal Intraday Variance. No emergency rebalancing required.")
+        st.info("Regime: Intraday move is within normal variance; keep execution disciplined and size by risk.")
 
 # =============================================================================
 # TAB 10: MARKET BREADTH PORTAL

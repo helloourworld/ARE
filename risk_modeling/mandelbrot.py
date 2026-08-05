@@ -47,6 +47,32 @@ logger = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_ROOT / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR = REPO_ROOT / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+DEFAULT_SCAN_LOG_PATH = LOG_DIR / "mandelbrot_scan.log"
+FRAGILITY_CALIBRATION_PATH = DATA_DIR / "fragility_calibration.csv"
+
+
+def configure_scan_file_logging(log_path: Path = DEFAULT_SCAN_LOG_PATH) -> Path:
+    """Attach a file handler for mandelbrot scan logs if not already present."""
+    target = Path(log_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    for handler in logger.handlers:
+        if isinstance(handler, logging.FileHandler):
+            existing = Path(getattr(handler, "baseFilename", ""))
+            if existing == target:
+                return target
+
+    file_handler = logging.FileHandler(target, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    )
+    logger.addHandler(file_handler)
+    if logger.level == logging.NOTSET:
+        logger.setLevel(logging.INFO)
+    return target
 
 
 
@@ -69,7 +95,14 @@ TAIL_SAFE = 1.70              # Required for Regime 1/2 stability
 # Volatility: For Active vs. Dormant Risk
 VOL_LOOKBACK = 30             # 30-minute window for "Current Vol"
 VOL_THRESHOLD = 0.0015        # Threshold to define "Active" movement
-FRAGILITY_THRESHOLD = 2.5     # Fragility if negative money flow is large relative to low vol
+FRAGILITY_THRESHOLD = 35.0    # Tuned trigger: avoids low-signal criticals while preserving severe cases
+FRAGILITY_CMF_MIN = 0.12      # Stronger downside flow gate to reduce fragility false positives
+FRAGILITY_BREADTH_MIN = -0.002  # Require clearer negative breadth confirmation
+FRAGILITY_VOL_FLOOR_RATIO = 0.35  # Adaptive floor vs VOL_THRESHOLD to avoid divide-by-micro-vol noise
+FRAGILITY_UNIVERSE_Q = 0.80   # Cross-sectional score quantile for dynamic critical trigger
+FRAGILITY_THRESHOLD_MIN = 25.0
+FRAGILITY_THRESHOLD_MAX = 60.0
+FRAGILITY_CAL_MIN_SAMPLES = 8
 
 # ============================================================================
 # 2. FRACTAL MATHEMATICS
@@ -104,6 +137,7 @@ def calculate_hurst_vw(prices: np.ndarray, volumes: np.ndarray, window: int = 30
     N = len(data)
     lags = np.unique(np.geomspace(10, N//2, num=20).astype(int))
 
+    valid_lags = []
     RS = []
     for lag in lags:
         num_blocks = N // lag
@@ -116,11 +150,12 @@ def calculate_hurst_vw(prices: np.ndarray, volumes: np.ndarray, window: int = 30
                     np.min(np.cumsum(block - np.mean(block)))
                 rs_sub.append(r / s)
         if rs_sub:
+            valid_lags.append(lag)
             RS.append(np.mean(rs_sub))
 
-    if len(RS) < 5:
+    if len(RS) < 5 or len(valid_lags) != len(RS):
         return 0.5
-    return linregress(np.log(lags), np.log(RS)).slope
+    return linregress(np.log(valid_lags), np.log(RS)).slope
 
 
 def calculate_tail_index_robust(returns: np.ndarray, lookback: int = 500):
@@ -259,6 +294,174 @@ def calibrate_cvd_threshold(data_df, lookback=240, base_threshold=0.03):
     q75 = float(delta_norm.quantile(0.75)) if len(delta_norm.dropna()) else 0.0
     adaptive = max(base_threshold, q75 * 0.25)
     return float(np.clip(adaptive, 0.02, 0.25))
+
+
+def _get_universe_symbols_from_cache(max_symbols=80):
+    """Infer active symbol universe from local 1m cache files."""
+    symbols = []
+    for path in sorted(DATA_DIR.glob("cache_*_1m.csv")):
+        stem = path.stem
+        if not stem.startswith("cache_") or not stem.endswith("_1m"):
+            continue
+        symbol = stem[len("cache_"):-len("_1m")]
+        if symbol:
+            symbols.append(symbol)
+    return symbols[:max_symbols]
+
+
+def _load_fragility_calibration(session_date):
+    """Load a same-day universe calibration if present and valid."""
+    if not FRAGILITY_CALIBRATION_PATH.exists():
+        return None
+    try:
+        cal = pd.read_csv(FRAGILITY_CALIBRATION_PATH)
+        if cal.empty or "date" not in cal.columns or "threshold" not in cal.columns:
+            return None
+        same_day = cal.loc[cal["date"].astype(str) == str(session_date)]
+        if same_day.empty:
+            return None
+        sample_size = int(same_day.get("sample_size", pd.Series([0])).iloc[-1])
+        if sample_size < FRAGILITY_CAL_MIN_SAMPLES:
+            return None
+        threshold = float(same_day["threshold"].iloc[-1])
+        return float(np.clip(threshold, FRAGILITY_THRESHOLD_MIN, FRAGILITY_THRESHOLD_MAX))
+    except Exception:
+        return None
+
+
+def _save_fragility_calibration(session_date, threshold, sample_size):
+    """Persist daily calibration for reuse across scans."""
+    row = pd.DataFrame([
+        {
+            "date": str(session_date),
+            "threshold": float(threshold),
+            "sample_size": int(sample_size),
+        }
+    ])
+    try:
+        if FRAGILITY_CALIBRATION_PATH.exists():
+            old = pd.read_csv(FRAGILITY_CALIBRATION_PATH)
+            old = old.loc[old.get("date", pd.Series(dtype=str)).astype(str) != str(session_date)]
+            out = pd.concat([old, row], ignore_index=True)
+        else:
+            out = row
+        out.to_csv(FRAGILITY_CALIBRATION_PATH, index=False)
+    except Exception as exc:
+        logger.debug("Failed to persist fragility calibration | error=%s", exc)
+
+
+def calibrate_fragility_threshold_for_session(session_date, benchmark_df=None, base_threshold=FRAGILITY_THRESHOLD):
+    """Calibrate fragility threshold from same-day cross-sectional universe scores.
+
+    The goal is to keep CRITICAL alerts sparse and meaningful as market-wide
+    volatility/liquidity regimes drift.
+    """
+    cached = _load_fragility_calibration(session_date)
+    if cached is not None:
+        return float(cached)
+
+    symbols = _get_universe_symbols_from_cache(max_symbols=80)
+    if not symbols:
+        return float(base_threshold)
+
+    if benchmark_df is None or benchmark_df.empty:
+        benchmark_df = get_data_persistent("RSP", "1d")
+
+    scores = []
+    for symbol in symbols:
+        try:
+            data_1m = get_data_persistent(symbol, "1m")
+            data_1d = get_data_persistent(symbol, "1d")
+            if data_1m is None or data_1d is None or data_1m.empty or data_1d.empty:
+                continue
+            if len(data_1m) < (HURST_WINDOW + 1):
+                continue
+
+            prices = data_1m["Close"].values
+            volumes = data_1m["Volume"].values
+            returns_1m = np.diff(np.log(prices))
+            if len(returns_1m) < VOL_LOOKBACK:
+                continue
+
+            h_val = calculate_hurst_vw(prices, volumes, window=HURST_WINDOW)
+            recent_vol = float(np.std(returns_1m[-VOL_LOOKBACK:]))
+
+            if benchmark_df is None or benchmark_df.empty:
+                liq = {"cmf": 0.0, "breadth_slope": 0.0}
+            else:
+                liq = calculate_liquidity_signals(data_1d, benchmark_df)
+
+            fragility = calculate_fragility_score(
+                recent_vol=recent_vol,
+                returns_1m=returns_1m,
+                cmf=liq.get("cmf", 0.0),
+                breadth_slope=liq.get("breadth_slope", 0.0),
+                h_val=h_val,
+                threshold=base_threshold,
+            )
+
+            # Use full cross-section (including low/zero scores) so the threshold
+            # tracks universe-wide tape conditions instead of only stressed names.
+            scores.append(float(fragility["score"]))
+        except Exception:
+            continue
+
+    if len(scores) < FRAGILITY_CAL_MIN_SAMPLES:
+        threshold = float(base_threshold)
+    else:
+        q_score = float(np.quantile(scores, FRAGILITY_UNIVERSE_Q))
+        threshold = float(np.clip(q_score, FRAGILITY_THRESHOLD_MIN, FRAGILITY_THRESHOLD_MAX))
+
+    _save_fragility_calibration(session_date, threshold, len(scores))
+    return threshold
+
+
+def calculate_fragility_score(recent_vol, returns_1m, cmf, breadth_slope, h_val, threshold=FRAGILITY_THRESHOLD):
+    """Compute a robust fragility score with adaptive vol floor and flow/breadth confirmation.
+
+    Why this is more stable:
+    - Uses a percentile-based volatility floor to prevent low-volatility explosions.
+    - Requires downside money flow to be present before scoring.
+    - Penalizes negative breadth and weak memory regimes.
+    """
+    downside_cmf = max(-float(cmf), 0.0)
+
+    ret = np.asarray(returns_1m[-180:], dtype=float)
+    if ret.size > 0:
+        abs_ret = np.abs(ret)
+        vol_floor = float(np.percentile(abs_ret, 60))
+    else:
+        vol_floor = VOL_THRESHOLD
+
+    adaptive_floor = max(VOL_THRESHOLD * FRAGILITY_VOL_FLOOR_RATIO, vol_floor, 1e-6)
+    effective_vol = max(float(recent_vol), adaptive_floor)
+
+    flow_component = downside_cmf / effective_vol
+    breadth_multiplier = 1.0 + min(max(-float(breadth_slope), 0.0) * 40.0, 1.0)
+    memory_multiplier = 1.15 if float(h_val) < 0.53 else 1.0
+    score = float(flow_component * breadth_multiplier * memory_multiplier)
+
+    is_critical = (
+        downside_cmf > FRAGILITY_CMF_MIN
+        and float(breadth_slope) < FRAGILITY_BREADTH_MIN
+        and float(h_val) < 0.55
+        and score > float(threshold)
+    )
+    is_watch = (
+        not is_critical
+        and downside_cmf > (FRAGILITY_CMF_MIN * 0.75)
+        and float(h_val) < 0.56
+        and score > (float(threshold) * 0.75)
+    )
+
+    return {
+        "score": score,
+        "effective_vol": float(effective_vol),
+        "downside_cmf": float(downside_cmf),
+        "is_critical": bool(is_critical),
+        "is_watch": bool(is_watch),
+        "threshold": float(threshold),
+    }
 
 # ============================================================================
 # UPDATED SCANNER WITH JUDGMENT LOGIC
@@ -432,7 +635,7 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
         return "ERROR - No Data"
 
     required_1m = max(HURST_WINDOW, VOL_LOOKBACK, 60) + 1
-    if len(data_1m) < required_1m:
+    if len(data_1m) < required_1m and not ticker.endswith(".TO"):
         logger.error(f"{ticker} Not enough intraday data | bars={len(data_1m)} | required={required_1m}")
         return "ERROR - Insufficient 1m data"
 
@@ -466,6 +669,14 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
     returns_1m = np.diff(np.log(prices))
     market_ts = data_1m.index[-1] if len(data_1m.index) > 0 else "N/A"
 
+    # Normalize latest timestamp to ET for session-state consistency.
+    market_ts_pd = pd.Timestamp(market_ts)
+    if market_ts_pd.tzinfo is not None:
+        market_ts_et = market_ts_pd.tz_convert("America/New_York")
+    else:
+        market_ts_et = market_ts_pd
+    current_session_date = market_ts_et.date()
+
     # 1. Calculate Core Metrics
     h_val = calculate_hurst_vw(prices, volumes, window=HURST_WINDOW)
 
@@ -479,31 +690,53 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
     # 2. Intraday Volatility (Standard Deviation of log returns over 30 mins)
     recent_vol = np.std(returns_1m[-VOL_LOOKBACK:])
 
-    # Fragility: negative money flow during low volatility
+    # **Fragility: negative money flow during low volatility**
     benchmark_df = get_data_persistent("RSP", "1d")
     if benchmark_df.empty:
         liquidity_signals = {'cmf': 0.0, 'breadth_ratio': 1.0, 'breadth_slope': 0.0, 'rsi': 50.0}
     else:
         liquidity_signals = calculate_liquidity_signals(data_1d, benchmark_df)
 
+    fragility_threshold = calibrate_fragility_threshold_for_session(
+        session_date=current_session_date,
+        benchmark_df=benchmark_df,
+        base_threshold=FRAGILITY_THRESHOLD,
+    )
+
     cash_cmf = liquidity_signals['cmf']
-    fragility_score = abs(cash_cmf) / max(recent_vol, 1e-12)
-    if h_val < 0.53 and cash_cmf < -0.15 and fragility_score > FRAGILITY_THRESHOLD:
-        logger.warning(f"⚠️ {ticker} Critical fragility detected | high risk of phase transition")
+    fragility = calculate_fragility_score(
+        recent_vol=recent_vol,
+        returns_1m=returns_1m,
+        cmf=cash_cmf,
+        breadth_slope=liquidity_signals['breadth_slope'],
+        h_val=h_val,
+        threshold=fragility_threshold,
+    )
+    fragility_score = fragility["score"]
+    if fragility["is_critical"]:
+        logger.warning(
+            "⚠️ %s Critical fragility detected | score=%.2f | thr=%.2f | cmf=%.3f | eff_vol=%.6f",
+            ticker,
+            fragility_score,
+            fragility_threshold,
+            fragility["downside_cmf"],
+            fragility["effective_vol"],
+        )
+    elif fragility["is_watch"]:
+        logger.info(
+            "⚠️ %s Fragility watch | score=%.2f | thr=%.2f | cmf=%.3f | eff_vol=%.6f",
+            ticker,
+            fragility_score,
+            fragility_threshold,
+            fragility["downside_cmf"],
+            fragility["effective_vol"],
+        )
 
     # 3. Directional Check (Slope of last hour)
     slope = linregress(np.arange(60), prices[-60:]).slope
 
     # 4. REGIME CLASSIFICATION + SESSION BASELINES
-    # Normalize the latest timestamp to ET so session state is consistent.
-    market_ts_pd = pd.Timestamp(market_ts)
-    if market_ts_pd.tzinfo is not None:
-        market_ts_et = market_ts_pd.tz_convert("America/New_York")
-    else:
-        market_ts_et = market_ts_pd
-
     daily_index = pd.to_datetime(data_1d.index, errors="coerce")
-    current_session_date = market_ts_et.date()
     latest_daily_date = daily_index[-1].date() if len(daily_index) else None
 
     # Determine the previous close for premarket vs. regular session calculations.
@@ -592,6 +825,7 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
         "VPIN": float(0.0),
         "Regime": regime,
         "Fragility Score": float(fragility_score),
+        "Fragility Threshold": float(fragility_threshold),
         "Fragility Alert": "",
         "Tail Quality": tail_quality,
         "CVD Threshold": float(np.nan),
@@ -626,8 +860,10 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
             "VPIN": float(vpin)
         })
 
-    if h_val < 0.53 and cash_cmf < -0.15 and fragility_score > FRAGILITY_THRESHOLD:
+    if fragility["is_critical"]:
         result["Fragility Alert"] = "CRITICAL FRAGILITY"
+    elif fragility["is_watch"]:
+        result["Fragility Alert"] = "FRAGILITY WATCH"
 
     logger.debug("Scan complete | ticker=%s", ticker)
     return result
@@ -635,6 +871,8 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
 
 if __name__ == "__main__":
     # Test on your Core Universe
+    log_path = configure_scan_file_logging()
+    logger.info("Mandelbrot scan logging enabled | file=%s", log_path)
     tickers = ["SPY"]
     while True:
         for t in tickers:

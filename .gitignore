@@ -23,3 +23,4 @@ build/
 ./data/*
 !./data/.gitkeep
 *.html
+./models/*

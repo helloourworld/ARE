@@ -15,13 +15,20 @@ Example:
 from __future__ import annotations
 
 import argparse
+import json
+import os
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Tuple
 
+# Avoid loky physical-core detection warning on some Windows setups.
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(os.cpu_count() or 1))
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from joblib import dump
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error
 
@@ -31,6 +38,7 @@ from data_pipeline.data_cache import get_data_persistent
 MARKET_TIMEZONE = "America/New_York"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_ROOT / "data"
+MODEL_DIR = REPO_ROOT / "models"
 DAILY_FEATURE_COLUMNS = [
     "Open",
     "High",
@@ -158,12 +166,13 @@ def _load_ohlcv_from_data_dir(ticker: str, interval: str) -> pd.DataFrame:
     return _flatten_yf_columns(df)
 
 
-def _load_ohlcv(ticker: str, interval: str, period: str) -> pd.DataFrame:
+def _load_ohlcv(ticker: str, interval: str, period: str, prefer_pipeline: bool = True) -> pd.DataFrame:
     """Prefer project pipeline/cache data, then local CSV cache, then yfinance."""
-    pipeline_df = get_data_persistent(ticker, interval=interval, period=period, force_refresh=False)
-    ohlcv = _flatten_yf_columns(pipeline_df)
-    if not ohlcv.empty:
-        return ohlcv
+    if prefer_pipeline:
+        pipeline_df = get_data_persistent(ticker, interval=interval, period=period, force_refresh=False)
+        ohlcv = _flatten_yf_columns(pipeline_df)
+        if not ohlcv.empty:
+            return ohlcv
 
     local_df = _load_ohlcv_from_data_dir(ticker, interval)
     if not local_df.empty:
@@ -206,6 +215,254 @@ def _compute_regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[
     denom = np.where(np.abs(y_true_arr) > 1e-12, np.abs(y_true_arr), np.nan)
     mape = float(np.nanmean(np.abs(err) / denom)) if np.any(np.isfinite(denom)) else float("nan")
     return {"mae": mae, "rmse": rmse, "mape": mape}
+
+
+def _serialize_metrics(metrics: Dict[str, float]) -> Dict[str, float | None]:
+    out: Dict[str, float | None] = {}
+    for k, v in metrics.items():
+        try:
+            v_float = float(v)
+        except (TypeError, ValueError):
+            out[k] = None
+            continue
+        out[k] = v_float if np.isfinite(v_float) else None
+    return out
+
+
+def _rank_candidate(metrics: Dict[str, float]) -> Tuple[float, float, float]:
+    """Lower is better: RMSE, then MAE, then negative directional accuracy."""
+    rmse = float(metrics.get("rmse", float("inf")))
+    mae = float(metrics.get("mae", float("inf")))
+    directional_acc = float(metrics.get("directional_acc", float("nan")))
+
+    if not np.isfinite(rmse):
+        rmse = float("inf")
+    if not np.isfinite(mae):
+        mae = float("inf")
+    if not np.isfinite(directional_acc):
+        directional_acc = -1.0
+
+    return rmse, mae, -directional_acc
+
+
+def _search_best_hgb_params(
+    X: pd.DataFrame,
+    y: pd.Series,
+    train_min: int,
+    step: int,
+    direction_ref: pd.Series | None,
+    max_depth_grid: Tuple[int, ...],
+    learning_rate_grid: Tuple[float, ...],
+    max_iter_grid: Tuple[int, ...],
+    verbose: bool = False,
+    label: str = "model",
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    best_params: Dict[str, float] | None = None
+    best_metrics: Dict[str, float] | None = None
+    best_rank: Tuple[float, float, float] | None = None
+
+    total = len(max_depth_grid) * len(learning_rate_grid) * len(max_iter_grid)
+    candidate_idx = 0
+
+    for max_depth in max_depth_grid:
+        for learning_rate in learning_rate_grid:
+            for max_iter in max_iter_grid:
+                candidate_idx += 1
+                params = {
+                    "max_depth": int(max_depth),
+                    "learning_rate": float(learning_rate),
+                    "max_iter": int(max_iter),
+                    "random_state": 42,
+                }
+                if verbose:
+                    print(
+                        f"[{label}] Candidate {candidate_idx}/{total}: "
+                        f"depth={params['max_depth']}, lr={params['learning_rate']}, iter={params['max_iter']}",
+                        flush=True,
+                    )
+                wf_metrics = _walk_forward_metrics(
+                    X=X,
+                    y=y,
+                    model_factory=lambda p=params: HistGradientBoostingRegressor(**p),
+                    train_min=train_min,
+                    step=step,
+                    direction_ref=direction_ref,
+                )
+                rank = _rank_candidate(wf_metrics)
+                if best_rank is None or rank < best_rank:
+                    best_rank = rank
+                    best_params = params
+                    best_metrics = wf_metrics
+                    if verbose:
+                        rmse, mae, neg_dir = rank
+                        print(
+                            f"[{label}] New best: rmse={rmse:.6f}, mae={mae:.6f}, dir_acc={-neg_dir:.2%}",
+                            flush=True,
+                        )
+
+    if best_params is None or best_metrics is None:
+        raise ValueError("Could not determine best parameters from walk-forward search.")
+
+    return best_params, best_metrics
+
+
+def train_and_save_best_models(
+    ticker: str,
+    intraday_period: str = "60d",
+    intraday_interval: str = "5m",
+    daily_period: str = "3y",
+    output_dir: Path | None = None,
+    profile: str = "full",
+    use_pipeline: bool = True,
+    verbose: bool = True,
+) -> Dict[str, object]:
+    """Train tuned intraday/daily models and persist artifacts for reuse."""
+    profile_name = str(profile).strip().lower()
+    if profile_name not in {"fast", "full"}:
+        raise ValueError("profile must be either 'fast' or 'full'.")
+
+    out_dir = Path(output_dir) if output_dir is not None else MODEL_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if profile_name == "fast":
+        intra_depth_grid = (3, 4)
+        intra_lr_grid = (0.04, 0.05)
+        intra_iter_grid = (260, 360)
+
+        daily_depth_grid = (4, 5)
+        daily_lr_grid = (0.03, 0.04)
+        daily_iter_grid = (350, 500)
+    else:
+        intra_depth_grid = (3, 4, 5)
+        intra_lr_grid = (0.03, 0.05)
+        intra_iter_grid = (300, 450, 600)
+
+        daily_depth_grid = (4, 5, 6)
+        daily_lr_grid = (0.03, 0.04, 0.05)
+        daily_iter_grid = (450, 700, 900)
+
+    # Intraday training set and parameter search.
+    intraday_ohlcv = _load_ohlcv(
+        ticker=ticker,
+        interval=intraday_interval,
+        period=intraday_period,
+        prefer_pipeline=use_pipeline,
+    )
+    if intraday_ohlcv.empty:
+        raise ValueError(f"No intraday data returned for {ticker}.")
+
+    X_intra, y_intra = _build_intraday_training_data(intraday_ohlcv)
+    if len(X_intra) < 200:
+        raise ValueError(
+            f"Not enough intraday training rows for {ticker}. Need at least 200, got {len(X_intra)}."
+        )
+
+    intra_params, intra_wf_metrics = _search_best_hgb_params(
+        X=X_intra,
+        y=y_intra,
+        train_min=160,
+        step=20,
+        direction_ref=None,
+        max_depth_grid=intra_depth_grid,
+        learning_rate_grid=intra_lr_grid,
+        max_iter_grid=intra_iter_grid,
+        verbose=verbose,
+        label=f"{ticker.upper()} intraday",
+    )
+
+    intraday_model = HistGradientBoostingRegressor(**intra_params)
+    intraday_model.fit(X_intra, y_intra)
+
+    intraday_artifact = {
+        "model": intraday_model,
+        "feature_columns": list(X_intra.columns),
+        "target": "close_to_go_return",
+        "interval": intraday_interval,
+        "period": intraday_period,
+        "params": intra_params,
+    }
+    intraday_path = out_dir / f"{ticker.upper()}_intraday_close_model.joblib"
+    dump(intraday_artifact, intraday_path)
+
+    # Daily training set and parameter search.
+    daily_ohlcv = _load_ohlcv(
+        ticker=ticker,
+        interval="1d",
+        period=daily_period,
+        prefer_pipeline=use_pipeline,
+    )
+    if daily_ohlcv.empty:
+        raise ValueError(f"No daily data returned for {ticker}.")
+
+    daily_features = _build_daily_features(daily_ohlcv)
+    daily_target = daily_ohlcv["Close"].shift(-1)
+    daily_dataset = daily_features.copy()
+    daily_dataset["target"] = daily_target
+    daily_dataset = daily_dataset.dropna()
+
+    if len(daily_dataset) < 150:
+        raise ValueError(f"Not enough daily data for ML forecast on {ticker}. Need at least 150 rows.")
+
+    X_daily = daily_dataset[DAILY_FEATURE_COLUMNS]
+    y_daily = daily_dataset["target"]
+
+    daily_params, daily_wf_metrics = _search_best_hgb_params(
+        X=X_daily,
+        y=y_daily,
+        train_min=140,
+        step=5,
+        direction_ref=X_daily["Close"],
+        max_depth_grid=daily_depth_grid,
+        learning_rate_grid=daily_lr_grid,
+        max_iter_grid=daily_iter_grid,
+        verbose=verbose,
+        label=f"{ticker.upper()} daily",
+    )
+
+    daily_model = HistGradientBoostingRegressor(**daily_params)
+    daily_model.fit(X_daily, y_daily)
+
+    daily_artifact = {
+        "model": daily_model,
+        "feature_columns": DAILY_FEATURE_COLUMNS,
+        "target": "next_close",
+        "interval": "1d",
+        "period": daily_period,
+        "params": daily_params,
+    }
+    daily_path = out_dir / f"{ticker.upper()}_daily_next_close_model.joblib"
+    dump(daily_artifact, daily_path)
+
+    manifest = {
+        "ticker": ticker.upper(),
+        "training_profile": profile_name,
+        "trained_at_utc": datetime.now(timezone.utc).isoformat(),
+        "intraday_model_path": str(intraday_path),
+        "daily_model_path": str(daily_path),
+        "intraday": {
+            "training_rows": int(len(X_intra)),
+            "best_params": intra_params,
+            "walk_forward_metrics": _serialize_metrics(intra_wf_metrics),
+        },
+        "daily": {
+            "training_rows": int(len(X_daily)),
+            "best_params": daily_params,
+            "walk_forward_metrics": _serialize_metrics(daily_wf_metrics),
+        },
+    }
+    manifest_path = out_dir / f"{ticker.upper()}_forecast_models_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    return {
+        "ticker": ticker.upper(),
+        "intraday_model_path": str(intraday_path),
+        "daily_model_path": str(daily_path),
+        "manifest_path": str(manifest_path),
+        "intraday_best_params": intra_params,
+        "daily_best_params": daily_params,
+        "intraday_wf_metrics": intra_wf_metrics,
+        "daily_wf_metrics": daily_wf_metrics,
+    }
 
 
 def _walk_forward_metrics(
@@ -848,7 +1105,41 @@ def main() -> None:
     parser.add_argument("--ticker", type=str, default="AAPL", help="Ticker symbol (default: AAPL)")
     parser.add_argument("--intraday-period", type=str, default="60d", help="yfinance intraday period")
     parser.add_argument("--intraday-interval", type=str, default="5m", help="yfinance intraday interval")
+    parser.add_argument("--daily-period", type=str, default="3y", help="yfinance daily period")
     parser.add_argument("--portfolio-value", type=float, default=0.0, help="Portfolio value for risk sizing")
+    parser.add_argument(
+        "--train-save-best",
+        action="store_true",
+        help="Train tuned models and save best artifacts for later reuse.",
+    )
+    parser.add_argument(
+        "--models-dir",
+        type=str,
+        default=str(MODEL_DIR),
+        help="Directory to store trained model artifacts.",
+    )
+    parser.add_argument(
+        "--train-only",
+        action="store_true",
+        help="When used with --train-save-best, skip immediate forecast run.",
+    )
+    parser.add_argument(
+        "--train-profile",
+        type=str,
+        default="full",
+        choices=["fast", "full"],
+        help="Hyperparameter search profile: fast or full (default: full).",
+    )
+    parser.add_argument(
+        "--train-skip-pipeline",
+        action="store_true",
+        help="Bypass data_pipeline cache during training and use local CSV/yfinance sources.",
+    )
+    parser.add_argument(
+        "--train-quiet",
+        action="store_true",
+        help="Suppress per-candidate progress logs during hyperparameter search.",
+    )
     parser.add_argument(
         "--daily-risk-budget-pct",
         type=float,
@@ -862,6 +1153,29 @@ def main() -> None:
         help="Minimum edge threshold for trade decision (default: 0.0025)",
     )
     args = parser.parse_args()
+
+    if args.train_save_best:
+        training = train_and_save_best_models(
+            ticker=args.ticker.upper(),
+            intraday_period=args.intraday_period,
+            intraday_interval=args.intraday_interval,
+            daily_period=args.daily_period,
+            output_dir=Path(args.models_dir),
+            profile=args.train_profile,
+            use_pipeline=not args.train_skip_pipeline,
+            verbose=not args.train_quiet,
+        )
+
+        print("\n=== Model Training Complete ===")
+        print(f"Ticker: {training['ticker']}")
+        print(f"Intraday model: {training['intraday_model_path']}")
+        print(f"Daily model: {training['daily_model_path']}")
+        print(f"Manifest: {training['manifest_path']}")
+        print(f"Intraday best params: {training['intraday_best_params']}")
+        print(f"Daily best params: {training['daily_best_params']}")
+
+        if args.train_only:
+            return
 
     rules_config = RiskRulesConfig(
         min_edge_pct=args.min_edge_pct,
