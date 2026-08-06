@@ -16,14 +16,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
+import sys
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Dict, Tuple
 
 # Avoid loky physical-core detection warning on some Windows setups.
-os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(os.cpu_count() or 1))
+_logical_cores = max(int(os.cpu_count() or 1), 1)
+existing_loky_cores = (os.environ.get("LOKY_MAX_CPU_COUNT") or "").strip()
+if not existing_loky_cores.isdigit():
+    os.environ["LOKY_MAX_CPU_COUNT"] = str(_logical_cores)
+
+# Reduce non-actionable Streamlit cache warnings when running as a CLI tool.
+logging.getLogger("streamlit.runtime.caching.cache_data_api").setLevel(logging.ERROR)
 
 import numpy as np
 import pandas as pd
@@ -32,7 +41,13 @@ from joblib import dump
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error
 
-from data_pipeline.data_cache import get_data_persistent
+try:
+    from data_pipeline.data_cache import get_data_persistent
+except ImportError:
+    package_root = Path(__file__).resolve().parents[1]
+    if str(package_root) not in sys.path:
+        sys.path.insert(0, str(package_root))
+    from data_pipeline.data_cache import get_data_persistent
 
 
 MARKET_TIMEZONE = "America/New_York"
@@ -263,6 +278,7 @@ def _search_best_hgb_params(
 
     total = len(max_depth_grid) * len(learning_rate_grid) * len(max_iter_grid)
     candidate_idx = 0
+    search_start = perf_counter()
 
     for max_depth in max_depth_grid:
         for learning_rate in learning_rate_grid:
@@ -280,6 +296,7 @@ def _search_best_hgb_params(
                         f"depth={params['max_depth']}, lr={params['learning_rate']}, iter={params['max_iter']}",
                         flush=True,
                     )
+                candidate_start = perf_counter()
                 wf_metrics = _walk_forward_metrics(
                     X=X,
                     y=y,
@@ -289,6 +306,7 @@ def _search_best_hgb_params(
                     direction_ref=direction_ref,
                 )
                 rank = _rank_candidate(wf_metrics)
+                candidate_elapsed = perf_counter() - candidate_start
                 if best_rank is None or rank < best_rank:
                     best_rank = rank
                     best_params = params
@@ -299,11 +317,27 @@ def _search_best_hgb_params(
                             f"[{label}] New best: rmse={rmse:.6f}, mae={mae:.6f}, dir_acc={-neg_dir:.2%}",
                             flush=True,
                         )
+                if verbose:
+                    current_rmse = float(wf_metrics.get("rmse", float("nan")))
+                    best_rmse = float(best_rank[0]) if best_rank is not None else float("nan")
+                    total_elapsed = perf_counter() - search_start
+                    print(
+                        f"[{label}] Progress {candidate_idx}/{total} | "
+                        f"candidate_rmse={current_rmse:.6f} | best_rmse={best_rmse:.6f} | "
+                        f"candidate_s={candidate_elapsed:.1f} | elapsed_s={total_elapsed:.1f}",
+                        flush=True,
+                    )
 
     if best_params is None or best_metrics is None:
         raise ValueError("Could not determine best parameters from walk-forward search.")
 
     return best_params, best_metrics
+
+
+def _training_log(message: str, enabled: bool = True) -> None:
+    """Print training progress in real time for terminal visibility."""
+    if enabled:
+        print(message, flush=True)
 
 
 def train_and_save_best_models(
@@ -317,12 +351,19 @@ def train_and_save_best_models(
     verbose: bool = True,
 ) -> Dict[str, object]:
     """Train tuned intraday/daily models and persist artifacts for reuse."""
+    _training_log(
+        f"[training] Starting model training for {ticker.upper()} "
+        f"(profile={str(profile).strip().lower()}, use_pipeline={use_pipeline})",
+        enabled=verbose,
+    )
+
     profile_name = str(profile).strip().lower()
     if profile_name not in {"fast", "full"}:
         raise ValueError("profile must be either 'fast' or 'full'.")
 
     out_dir = Path(output_dir) if output_dir is not None else MODEL_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
+    _training_log(f"[training] Output directory: {out_dir}", enabled=verbose)
 
     if profile_name == "fast":
         intra_depth_grid = (3, 4)
@@ -342,6 +383,11 @@ def train_and_save_best_models(
         daily_iter_grid = (450, 700, 900)
 
     # Intraday training set and parameter search.
+    _training_log(
+        f"[training] Loading intraday data for {ticker.upper()} "
+        f"(interval={intraday_interval}, period={intraday_period})",
+        enabled=verbose,
+    )
     intraday_ohlcv = _load_ohlcv(
         ticker=ticker,
         interval=intraday_interval,
@@ -352,11 +398,16 @@ def train_and_save_best_models(
         raise ValueError(f"No intraday data returned for {ticker}.")
 
     X_intra, y_intra = _build_intraday_training_data(intraday_ohlcv)
+    _training_log(
+        f"[training] Intraday dataset prepared: rows={len(X_intra)}",
+        enabled=verbose,
+    )
     if len(X_intra) < 200:
         raise ValueError(
             f"Not enough intraday training rows for {ticker}. Need at least 200, got {len(X_intra)}."
         )
 
+    _training_log("[training] Starting intraday hyperparameter search...", enabled=verbose)
     intra_params, intra_wf_metrics = _search_best_hgb_params(
         X=X_intra,
         y=y_intra,
@@ -369,9 +420,14 @@ def train_and_save_best_models(
         verbose=verbose,
         label=f"{ticker.upper()} intraday",
     )
+    _training_log(
+        f"[training] Intraday best params selected: {intra_params}",
+        enabled=verbose,
+    )
 
     intraday_model = HistGradientBoostingRegressor(**intra_params)
     intraday_model.fit(X_intra, y_intra)
+    _training_log("[training] Intraday final model fit complete.", enabled=verbose)
 
     intraday_artifact = {
         "model": intraday_model,
@@ -383,8 +439,14 @@ def train_and_save_best_models(
     }
     intraday_path = out_dir / f"{ticker.upper()}_intraday_close_model.joblib"
     dump(intraday_artifact, intraday_path)
+    _training_log(f"[training] Saved intraday model: {intraday_path}", enabled=verbose)
 
     # Daily training set and parameter search.
+    _training_log(
+        f"[training] Loading daily data for {ticker.upper()} "
+        f"(period={daily_period})",
+        enabled=verbose,
+    )
     daily_ohlcv = _load_ohlcv(
         ticker=ticker,
         interval="1d",
@@ -405,7 +467,12 @@ def train_and_save_best_models(
 
     X_daily = daily_dataset[DAILY_FEATURE_COLUMNS]
     y_daily = daily_dataset["target"]
+    _training_log(
+        f"[training] Daily dataset prepared: rows={len(X_daily)}",
+        enabled=verbose,
+    )
 
+    _training_log("[training] Starting daily hyperparameter search...", enabled=verbose)
     daily_params, daily_wf_metrics = _search_best_hgb_params(
         X=X_daily,
         y=y_daily,
@@ -418,9 +485,14 @@ def train_and_save_best_models(
         verbose=verbose,
         label=f"{ticker.upper()} daily",
     )
+    _training_log(
+        f"[training] Daily best params selected: {daily_params}",
+        enabled=verbose,
+    )
 
     daily_model = HistGradientBoostingRegressor(**daily_params)
     daily_model.fit(X_daily, y_daily)
+    _training_log("[training] Daily final model fit complete.", enabled=verbose)
 
     daily_artifact = {
         "model": daily_model,
@@ -432,6 +504,7 @@ def train_and_save_best_models(
     }
     daily_path = out_dir / f"{ticker.upper()}_daily_next_close_model.joblib"
     dump(daily_artifact, daily_path)
+    _training_log(f"[training] Saved daily model: {daily_path}", enabled=verbose)
 
     manifest = {
         "ticker": ticker.upper(),
@@ -452,6 +525,8 @@ def train_and_save_best_models(
     }
     manifest_path = out_dir / f"{ticker.upper()}_forecast_models_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    _training_log(f"[training] Saved manifest: {manifest_path}", enabled=verbose)
+    _training_log("[training] Training run complete.", enabled=verbose)
 
     return {
         "ticker": ticker.upper(),
