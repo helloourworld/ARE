@@ -10,6 +10,7 @@ Practical price forecasting tools:
 
 Example:
     python -m alpha_research.price_forecasting --ticker AAPL
+    python -m alpha_research.price_forecasting --ticker MSFT --train-save-best --train-only --train-profile fast
 """
 
 from __future__ import annotations
@@ -24,6 +25,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Dict, Tuple
+import warnings
+
+warnings.filterwarnings("ignore")
 
 # Avoid loky physical-core detection warning on some Windows setups.
 _logical_cores = max(int(os.cpu_count() or 1), 1)
@@ -37,7 +41,7 @@ logging.getLogger("streamlit.runtime.caching.cache_data_api").setLevel(logging.E
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from joblib import dump
+from joblib import dump, load
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error
 
@@ -54,18 +58,39 @@ MARKET_TIMEZONE = "America/New_York"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_ROOT / "data"
 MODEL_DIR = REPO_ROOT / "models"
+MARKET_BENCHMARK_TICKER = "SPY"
 DAILY_FEATURE_COLUMNS = [
-    "Open",
-    "High",
-    "Low",
-    "Close",
-    "Volume",
-    "SMA_5",
-    "SMA_20",
+    "FracDiff_Close",
     "Daily_Return",
+    "Return_3D",
+    "Return_5D",
+    "Return_10D",
+    "Return_20D",
     "High_Low_Pct",
     "Open_Close_Pct",
+    "Close_vs_SMA5",
+    "Close_vs_SMA20",
+    "Close_vs_SMA50",
+    "SMA5_vs_SMA20",
+    "RSI_14",
+    "Vol_20D",
+    "ATR_Pct_14",
+    "Volume_vs_SMA20",
 ]
+
+MARKET_FEATURE_COLUMNS = [
+    "Benchmark_Return_1D",
+    "Benchmark_Return_5D",
+    "Benchmark_Return_20D",
+    "Benchmark_Close_vs_SMA20",
+    "Relative_Return_1D",
+    "Relative_Return_5D",
+    "Relative_Return_20D",
+]
+
+FRAC_DIFF_D = 0.40
+TIME_DECAY_HALF_LIFE_DAYS = 252.0
+PURGE_WINDOW_DAYS = 2
 
 
 @dataclass
@@ -93,6 +118,7 @@ class DailyForecastResult:
     walk_forward_directional_acc: float
     walk_forward_windows: int
     training_rows: int
+    market_context_bias_pct: float = 0.0
 
 
 @dataclass
@@ -105,6 +131,7 @@ class MonteCarloResult:
     mean_terminal_price: float
     quantiles: Dict[str, float]
     probability_above_start: float
+    terminal_confidence: float
 
 
 @dataclass
@@ -217,6 +244,43 @@ def _safe_div(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
     return out
 
 
+def _compute_frac_diff_weights(d: float, threshold: float = 1e-4) -> np.ndarray:
+    """Compute finite fractional-differencing weights via binomial expansion."""
+    weights = [1.0]
+    k = 1
+    while True:
+        w = -weights[-1] / k * (d - k + 1)
+        if abs(w) < threshold:
+            break
+        weights.append(w)
+        k += 1
+    return np.asarray(weights[::-1], dtype=float)
+
+
+def _fractional_differentiation(series: pd.Series, d: float = FRAC_DIFF_D, threshold: float = 1e-4) -> pd.Series:
+    """Apply fractional differentiation to preserve memory while improving stationarity."""
+    clean = pd.Series(series).dropna().astype(float)
+    if len(clean) < 30:
+        return clean
+
+    weights = _compute_frac_diff_weights(d=d, threshold=threshold)
+    if len(clean) < len(weights):
+        return pd.Series(index=clean.index, dtype=float)
+
+    conv = np.convolve(clean.to_numpy(), weights, mode="valid")
+    return pd.Series(conv, index=clean.index[len(weights) - 1:])
+
+
+def _calculate_time_decay_weights(n_samples: int, half_life_days: float = TIME_DECAY_HALF_LIFE_DAYS) -> np.ndarray:
+    """Exponential recency weights with mean-normalization to keep scale stable."""
+    if n_samples <= 0:
+        return np.asarray([], dtype=float)
+    decay_rate = np.log(2.0) / max(float(half_life_days), 1e-9)
+    time_steps = np.arange(n_samples, dtype=float)[::-1]
+    weights = np.exp(-decay_rate * time_steps)
+    return weights / max(float(np.mean(weights)), 1e-12)
+
+
 def _compute_regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     y_true_arr = np.asarray(y_true, dtype=float)
     y_pred_arr = np.asarray(y_pred, dtype=float)
@@ -269,6 +333,8 @@ def _search_best_hgb_params(
     max_depth_grid: Tuple[int, ...],
     learning_rate_grid: Tuple[float, ...],
     max_iter_grid: Tuple[int, ...],
+    purge_window: int = 0,
+    half_life_days: float | None = None,
     verbose: bool = False,
     label: str = "model",
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
@@ -304,6 +370,8 @@ def _search_best_hgb_params(
                     train_min=train_min,
                     step=step,
                     direction_ref=direction_ref,
+                    purge_window=purge_window,
+                    half_life_days=half_life_days,
                 )
                 rank = _rank_candidate(wf_metrics)
                 candidate_elapsed = perf_counter() - candidate_start
@@ -338,6 +406,28 @@ def _training_log(message: str, enabled: bool = True) -> None:
     """Print training progress in real time for terminal visibility."""
     if enabled:
         print(message, flush=True)
+
+
+def _load_saved_forecast_bundle(ticker: str, output_dir: Path | None = None) -> Dict[str, object] | None:
+    out_dir = Path(output_dir) if output_dir is not None else MODEL_DIR
+    manifest_path = out_dir / f"{ticker.upper()}_forecast_models_manifest.json"
+    if not manifest_path.exists():
+        return None
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        intraday_path = Path(manifest["intraday_model_path"])
+        daily_path = Path(manifest["daily_model_path"])
+        if not intraday_path.exists() or not daily_path.exists():
+            return None
+
+        return {
+            "manifest": manifest,
+            "intraday_artifact": load(intraday_path),
+            "daily_artifact": load(daily_path),
+        }
+    except Exception:
+        return None
 
 
 def train_and_save_best_models(
@@ -381,6 +471,8 @@ def train_and_save_best_models(
         daily_depth_grid = (4, 5, 6)
         daily_lr_grid = (0.03, 0.04, 0.05)
         daily_iter_grid = (450, 700, 900)
+
+    benchmark_ticker = _benchmark_ticker_for(ticker)
 
     # Intraday training set and parameter search.
     _training_log(
@@ -455,9 +547,19 @@ def train_and_save_best_models(
     )
     if daily_ohlcv.empty:
         raise ValueError(f"No daily data returned for {ticker}.")
+    daily_ohlcv = _to_ny_datetime_index(daily_ohlcv).sort_index()
 
-    daily_features = _build_daily_features(daily_ohlcv)
-    daily_target = daily_ohlcv["Close"].shift(-1)
+    benchmark_daily = None
+    if benchmark_ticker is not None:
+        benchmark_daily = _load_ohlcv(
+            ticker=benchmark_ticker,
+            interval="1d",
+            period=daily_period,
+            prefer_pipeline=use_pipeline,
+        )
+
+    daily_features = _build_daily_features(daily_ohlcv, benchmark_ohlcv=benchmark_daily)
+    daily_target = daily_ohlcv["Close"].pct_change(1).shift(-1)
     daily_dataset = daily_features.copy()
     daily_dataset["target"] = daily_target
     daily_dataset = daily_dataset.dropna()
@@ -465,7 +567,7 @@ def train_and_save_best_models(
     if len(daily_dataset) < 150:
         raise ValueError(f"Not enough daily data for ML forecast on {ticker}. Need at least 150 rows.")
 
-    X_daily = daily_dataset[DAILY_FEATURE_COLUMNS]
+    X_daily = daily_dataset[daily_features.columns]
     y_daily = daily_dataset["target"]
     _training_log(
         f"[training] Daily dataset prepared: rows={len(X_daily)}",
@@ -482,6 +584,8 @@ def train_and_save_best_models(
         max_depth_grid=daily_depth_grid,
         learning_rate_grid=daily_lr_grid,
         max_iter_grid=daily_iter_grid,
+        purge_window=PURGE_WINDOW_DAYS,
+        half_life_days=TIME_DECAY_HALF_LIFE_DAYS,
         verbose=verbose,
         label=f"{ticker.upper()} daily",
     )
@@ -491,16 +595,18 @@ def train_and_save_best_models(
     )
 
     daily_model = HistGradientBoostingRegressor(**daily_params)
-    daily_model.fit(X_daily, y_daily)
+    daily_weights = _calculate_time_decay_weights(len(X_daily), half_life_days=TIME_DECAY_HALF_LIFE_DAYS)
+    daily_model.fit(X_daily, y_daily, sample_weight=daily_weights)
     _training_log("[training] Daily final model fit complete.", enabled=verbose)
 
     daily_artifact = {
         "model": daily_model,
-        "feature_columns": DAILY_FEATURE_COLUMNS,
-        "target": "next_close",
+        "feature_columns": list(daily_features.columns),
+        "target": "next_close_return",
         "interval": "1d",
         "period": daily_period,
         "params": daily_params,
+        "benchmark_ticker": benchmark_ticker,
     }
     daily_path = out_dir / f"{ticker.upper()}_daily_next_close_model.joblib"
     dump(daily_artifact, daily_path)
@@ -521,6 +627,7 @@ def train_and_save_best_models(
             "training_rows": int(len(X_daily)),
             "best_params": daily_params,
             "walk_forward_metrics": _serialize_metrics(daily_wf_metrics),
+            "benchmark_ticker": benchmark_ticker,
         },
     }
     manifest_path = out_dir / f"{ticker.upper()}_forecast_models_manifest.json"
@@ -547,6 +654,8 @@ def _walk_forward_metrics(
     train_min: int,
     step: int,
     direction_ref: pd.Series | None = None,
+    purge_window: int = 0,
+    half_life_days: float | None = None,
 ) -> Dict[str, float]:
     """Rolling train-forward evaluation to reduce optimistic single-split bias."""
     if len(X) <= train_min + 1:
@@ -570,15 +679,23 @@ def _walk_forward_metrics(
         if test_end <= train_end:
             continue
 
+        effective_train_end = max(0, train_end - max(int(purge_window), 0))
+        if effective_train_end <= 0:
+            continue
+
         model = model_factory()
-        X_train = X.iloc[:train_end]
-        y_train = y.iloc[:train_end]
+        X_train = X.iloc[:effective_train_end]
+        y_train = y.iloc[:effective_train_end]
         X_test = X.iloc[train_end:test_end]
         y_test = y.iloc[train_end:test_end]
         if len(X_test) == 0:
             continue
 
-        model.fit(X_train, y_train)
+        if half_life_days is not None and half_life_days > 0:
+            sample_weights = _calculate_time_decay_weights(len(X_train), half_life_days=half_life_days)
+            model.fit(X_train, y_train, sample_weight=sample_weights)
+        else:
+            model.fit(X_train, y_train)
         preds = model.predict(X_test)
 
         y_true_part = y_test.to_numpy(dtype=float)
@@ -607,10 +724,10 @@ def _walk_forward_metrics(
     return metrics
 
 
-def _load_current_price_1m(ticker: str) -> float | None:
+def _load_current_price_1m(ticker: str, force_refresh: bool = False) -> float | None:
     """Return the freshest known close from 1-minute bars."""
     try:
-        one_min = get_data_persistent(ticker, interval="1m", period="2d", force_refresh=True)
+        one_min = get_data_persistent(ticker, interval="1m", period="2d", force_refresh=force_refresh)
         if one_min is not None and not one_min.empty and "Close" in one_min.columns:
             return float(one_min["Close"].dropna().iloc[-1])
     except Exception:
@@ -685,6 +802,72 @@ def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval:
     if len(X) < 200:
         raise ValueError(
             f"Not enough intraday training rows for {ticker}. Need at least 200, got {len(X)}."
+        )
+
+    saved_bundle = _load_saved_forecast_bundle(ticker)
+    if saved_bundle is not None:
+        artifact = saved_bundle["intraday_artifact"]
+        manifest = saved_bundle["manifest"]
+        model = artifact["model"]
+        feature_columns = list(artifact.get("feature_columns", list(X.columns)))
+
+        live = _to_ny_datetime_index(ohlcv).sort_index()
+        live["session"] = live.index.date
+        today = live.groupby("session").tail(1).copy()
+        if today.empty:
+            raise ValueError("Could not determine current session data.")
+
+        session_key = today["session"].iloc[-1]
+        session = live[live["session"] == session_key].copy()
+        if len(session) < 6:
+            raise ValueError("Current session does not have enough intraday bars for inference.")
+
+        closes = session["Close"].to_numpy(dtype=float)
+        highs = session["High"].to_numpy(dtype=float)
+        lows = session["Low"].to_numpy(dtype=float)
+        volumes = session["Volume"].fillna(0.0).to_numpy(dtype=float)
+
+        cum_high = np.maximum.accumulate(highs)
+        cum_low = np.minimum.accumulate(lows)
+        cum_vol = np.cumsum(volumes)
+        cum_vwap_num = np.cumsum(closes * volumes)
+        vwap = _safe_div(cum_vwap_num, np.where(cum_vol == 0.0, np.nan, cum_vol))
+
+        pct = pd.Series(closes).pct_change().fillna(0.0)
+        vol_so_far = float(pct.expanding(min_periods=5).std().fillna(0.0).iloc[-1])
+
+        i = len(session) - 1
+        current_close_session = float(closes[-1])
+        current_close_1m = _load_current_price_1m(ticker, force_refresh=False)
+        current_close = float(current_close_1m) if current_close_1m is not None else current_close_session
+        session_open = float(session["Open"].iloc[0])
+
+        x_live = pd.DataFrame(
+            [
+                {
+                    "open_to_now": (current_close / session_open) - 1.0,
+                    "range_so_far": (cum_high[i] / max(cum_low[i], 1e-12)) - 1.0,
+                    "price_vs_vwap": (current_close / max(vwap[i], 1e-12)) - 1.0,
+                    "cum_volume": np.log1p(cum_vol[i]),
+                    "progress": i / max(len(session) - 1, 1),
+                    "vol_so_far": vol_so_far,
+                }
+            ]
+        )
+
+        x_live = x_live.reindex(columns=feature_columns)
+        pred_ret = float(model.predict(x_live)[0])
+        pred_close = current_close * (1.0 + pred_ret)
+
+        metrics = manifest.get("intraday", {}).get("walk_forward_metrics", {}) if isinstance(manifest, dict) else {}
+
+        return IntradayForecastResult(
+            ticker=ticker,
+            current_price=current_close,
+            predicted_close=pred_close,
+            predicted_return_to_close=pred_ret,
+            training_rows=int(manifest.get("intraday", {}).get("training_rows", len(X))) if isinstance(manifest, dict) else len(X),
+            validation_metrics={k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))},
         )
 
     split = int(len(X) * 0.8)
@@ -806,84 +989,239 @@ def _atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
     return tr.ewm(alpha=1 / window, adjust=False, min_periods=window).mean()
 
 
-def _build_daily_features(daily_ohlcv: pd.DataFrame) -> pd.DataFrame:
+def _benchmark_ticker_for(ticker: str) -> str | None:
+    ticker_upper = ticker.upper()
+    if ticker_upper == MARKET_BENCHMARK_TICKER:
+        return None
+    return MARKET_BENCHMARK_TICKER
+
+
+def _daily_feature_columns(include_market_context: bool) -> list[str]:
+    columns = list(DAILY_FEATURE_COLUMNS)
+    if include_market_context:
+        columns.extend(MARKET_FEATURE_COLUMNS)
+    return columns
+
+
+def _market_context_bias(latest_features: pd.Series) -> float:
+    benchmark_close = float(latest_features.get("Benchmark_Close", np.nan))
+    benchmark_sma_20 = float(latest_features.get("Benchmark_SMA_20", np.nan))
+    benchmark_daily_return = float(latest_features.get("Benchmark_Daily_Return", 0.0))
+    relative_strength_5d = float(latest_features.get("Relative_Strength_5D", 0.0))
+
+    if not np.isfinite(benchmark_close):
+        return 0.0
+
+    trend_vs_sma = (benchmark_close / benchmark_sma_20 - 1.0) if np.isfinite(benchmark_sma_20) and benchmark_sma_20 > 0.0 else 0.0
+    bias = 0.20 * benchmark_daily_return + 0.35 * trend_vs_sma + 0.25 * relative_strength_5d
+    return float(np.clip(bias, -0.03, 0.03))
+
+
+def _build_daily_features(daily_ohlcv: pd.DataFrame, benchmark_ohlcv: pd.DataFrame | None = None) -> pd.DataFrame:
     df = daily_ohlcv.copy().dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+    df = _to_ny_datetime_index(df).sort_index()
 
     df_feat = pd.DataFrame(index=df.index)
-    df_feat["Open"] = df["Open"].astype(float)
-    df_feat["High"] = df["High"].astype(float)
-    df_feat["Low"] = df["Low"].astype(float)
-    df_feat["Close"] = df["Close"].astype(float)
-    df_feat["Volume"] = df["Volume"].astype(float)
+    
+    close = df["Close"].astype(float)
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+    open_p = df["Open"].astype(float)
+    volume = df["Volume"].astype(float)
 
-    df_feat["SMA_5"] = df_feat["Close"].rolling(5).mean()
-    df_feat["SMA_20"] = df_feat["Close"].rolling(20).mean()
-    df_feat["Daily_Return"] = df_feat["Close"].pct_change(1)
-    df_feat["High_Low_Pct"] = (df_feat["High"] - df_feat["Low"]) / df_feat["Low"].replace(0.0, np.nan)
-    df_feat["Open_Close_Pct"] = (df_feat["Close"] - df_feat["Open"]) / df_feat["Open"].replace(0.0, np.nan)
+    # Fractional differentiation keeps longer-memory structure while reducing non-stationarity.
+    df_feat["FracDiff_Close"] = _fractional_differentiation(close, d=FRAC_DIFF_D)
+
+    # 1. Multi-period Returns
+    df_feat["Daily_Return"] = close.pct_change(1)
+    df_feat["Return_3D"] = close.pct_change(3)
+    df_feat["Return_5D"] = close.pct_change(5)
+    df_feat["Return_10D"] = close.pct_change(10)
+    df_feat["Return_20D"] = close.pct_change(20)
+
+    # 2. Price Action Ratios
+    df_feat["High_Low_Pct"] = (high - low) / low.replace(0.0, np.nan)
+    df_feat["Open_Close_Pct"] = (close - open_p) / open_p.replace(0.0, np.nan)
+
+    # 3. Moving Average Distances (Stationary)
+    sma5 = close.rolling(5).mean()
+    sma20 = close.rolling(20).mean()
+    sma50 = close.rolling(50).mean()
+    
+    df_feat["Close_vs_SMA5"] = (close / sma5) - 1.0
+    df_feat["Close_vs_SMA20"] = (close / sma20) - 1.0
+    df_feat["Close_vs_SMA50"] = (close / sma50) - 1.0
+    df_feat["SMA5_vs_SMA20"] = (sma5 / sma20) - 1.0
+
+    # 4. Technical Indicators
+    df_feat["RSI_14"] = _rsi(close, window=14) / 100.0  # Normalized [0, 1]
+    df_feat["Vol_20D"] = df_feat["Daily_Return"].rolling(20).std()
+    
+    atr14 = _atr(df[["High", "Low", "Close"]], window=14)
+    df_feat["ATR_Pct_14"] = atr14 / close
+
+    # 5. Volume Indicators
+    vol_sma20 = volume.rolling(20).mean()
+    df_feat["Volume_vs_SMA20"] = (volume / vol_sma20.replace(0.0, np.nan)) - 1.0
+
+    # 6. Benchmark Context (Relative Strength)
+    if benchmark_ohlcv is not None and not benchmark_ohlcv.empty:
+        bm = benchmark_ohlcv.copy().dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+        bm = _to_ny_datetime_index(bm).sort_index()
+        bm_close = bm["Close"].astype(float).reindex(df_feat.index).ffill().bfill()
+        bm_sma20 = bm_close.rolling(20).mean()
+
+        df_feat["Benchmark_Return_1D"] = bm_close.pct_change(1)
+        df_feat["Benchmark_Return_5D"] = bm_close.pct_change(5)
+        df_feat["Benchmark_Return_20D"] = bm_close.pct_change(20)
+        df_feat["Benchmark_Close_vs_SMA20"] = (bm_close / bm_sma20) - 1.0
+
+        # Relative Excess Returns
+        df_feat["Relative_Return_1D"] = df_feat["Daily_Return"] - df_feat["Benchmark_Return_1D"]
+        df_feat["Relative_Return_5D"] = df_feat["Return_5D"] - df_feat["Benchmark_Return_5D"]
+        df_feat["Relative_Return_20D"] = df_feat["Return_20D"] - df_feat["Benchmark_Return_20D"]
 
     df_feat = df_feat.replace([np.inf, -np.inf], np.nan)
-    return df_feat[DAILY_FEATURE_COLUMNS]
+    feature_columns = _daily_feature_columns(include_market_context=benchmark_ohlcv is not None and not benchmark_ohlcv.empty)
+    return df_feat[feature_columns]
 
 
 def forecast_next_close_ml(ticker: str, period: str = "3y") -> DailyForecastResult:
-    """Forecast tomorrow's close from daily technical indicators."""
+    """Forecast tomorrow's close using stationary technical indicators & return targets."""
     ohlcv = _load_ohlcv(ticker=ticker, interval="1d", period=period)
     if ohlcv.empty:
         raise ValueError(f"No daily data returned for {ticker}.")
+    ohlcv = _to_ny_datetime_index(ohlcv).sort_index()
 
-    features = _build_daily_features(ohlcv)
-    target = ohlcv["Close"].shift(-1)
+    benchmark_ticker = _benchmark_ticker_for(ticker)
+    benchmark_daily = None
+    if benchmark_ticker is not None:
+        benchmark_daily = _load_ohlcv(ticker=benchmark_ticker, interval="1d", period=period)
+
+    features = _build_daily_features(ohlcv, benchmark_ohlcv=benchmark_daily)
+    
+    # STATIONARY TARGET: Next-Day Return
+    close_prices = ohlcv["Close"].astype(float)
+    target_returns = close_prices.pct_change(1).shift(-1)
 
     dataset = features.copy()
-    dataset["target"] = target
+    dataset["target_return"] = target_returns
+    dataset["close_price"] = close_prices
     dataset = dataset.dropna()
 
     if len(dataset) < 150:
         raise ValueError(f"Not enough daily data for ML forecast on {ticker}. Need at least 150 rows.")
 
-    X = dataset[DAILY_FEATURE_COLUMNS]
-    y = dataset["target"]
+    X = dataset[features.columns]
+    y = dataset["target_return"]
+    price_ref = dataset["close_price"]
 
+    # Load saved model or train expanding walk-forward model
+    saved_bundle = _load_saved_forecast_bundle(ticker)
+    if saved_bundle is not None:
+        artifact = saved_bundle["daily_artifact"]
+        manifest = saved_bundle["manifest"]
+        model = artifact["model"]
+        feature_columns = list(artifact.get("feature_columns", list(features.columns)))
+        target_kind = str(artifact.get("target", "next_close")).strip().lower()
+
+        latest_x = X.iloc[[-1]].reindex(columns=feature_columns)
+        latest_close = float(close_prices.iloc[-1])
+
+        raw_pred = float(model.predict(latest_x)[0])
+        if target_kind in {"next_close_return", "target_return", "return"}:
+            pred_next_return = raw_pred
+            pred_next_close = latest_close * (1.0 + pred_next_return)
+        else:
+            # Backward compatibility for older artifacts trained on price levels.
+            pred_next_close = raw_pred
+            pred_next_return = (pred_next_close / latest_close) - 1.0 if latest_close > 0.0 else 0.0
+
+        # Guardrail for stale/incompatible legacy artifacts while keeping inference fast.
+        if not np.isfinite(pred_next_close) or pred_next_close <= 0.0:
+            saved_bundle = None
+        else:
+            if abs(pred_next_return) > 0.15:
+                pred_next_return = float(np.clip(pred_next_return, -0.15, 0.15))
+                pred_next_close = latest_close * (1.0 + pred_next_return)
+
+            metrics = manifest.get("daily", {}).get("walk_forward_metrics", {}) if isinstance(manifest, dict) else {}
+
+            return DailyForecastResult(
+                ticker=ticker,
+                latest_close=latest_close,
+                predicted_next_close=pred_next_close,
+                holdout_mae=float(metrics.get("mae", float("nan"))),
+                holdout_rmse=float(metrics.get("rmse", float("nan"))),
+                holdout_mape=float(metrics.get("mape", float("nan"))),
+                holdout_directional_acc=float(metrics.get("directional_acc", float("nan"))),
+                walk_forward_mae=float(metrics.get("mae", float("nan"))),
+                walk_forward_rmse=float(metrics.get("rmse", float("nan"))),
+                walk_forward_mape=float(metrics.get("mape", float("nan"))),
+                walk_forward_directional_acc=float(metrics.get("directional_acc", float("nan"))),
+                walk_forward_windows=int(float(metrics.get("windows", 0.0))) if metrics else 0,
+                training_rows=int(manifest.get("daily", {}).get("training_rows", len(X))) if isinstance(manifest, dict) else len(X),
+                market_context_bias_pct=0.0,
+            )
+
+    # Split for holdout evaluation
     split = int(len(dataset) * 0.8)
     X_train, X_test = X.iloc[:split], X.iloc[split:]
     y_train, y_test = y.iloc[:split], y.iloc[split:]
+    price_test = price_ref.iloc[split:]
 
-    model = HistGradientBoostingRegressor(max_depth=5, learning_rate=0.04, max_iter=600, random_state=42)
-    model.fit(X_train, y_train)
+    model = HistGradientBoostingRegressor(
+        max_depth=4, 
+        learning_rate=0.03, 
+        max_iter=500, 
+        l2_regularization=1.0,
+        random_state=42
+    )
+    train_weights = _calculate_time_decay_weights(len(X_train), half_life_days=TIME_DECAY_HALF_LIFE_DAYS)
+    model.fit(X_train, y_train, sample_weight=train_weights)
 
-    pred_test = model.predict(X_test)
-    mae = float(mean_absolute_error(y_test, pred_test)) if len(X_test) else float("nan")
-    metrics = _compute_regression_metrics(y_test.to_numpy(dtype=float), np.asarray(pred_test, dtype=float))
-    if len(X_test):
-        current_ref = X_test["Close"].to_numpy(dtype=float)
-        true_dir = np.sign(y_test.to_numpy(dtype=float) - current_ref)
-        pred_dir = np.sign(np.asarray(pred_test, dtype=float) - current_ref)
-        directional_acc = float(np.mean(true_dir == pred_dir))
-    else:
-        directional_acc = float("nan")
+    pred_test_returns = model.predict(X_test)
+    pred_test_prices = price_test.to_numpy() * (1.0 + pred_test_returns)
+    true_test_prices = price_test.to_numpy() * (1.0 + y_test.to_numpy())
 
-    model_live = HistGradientBoostingRegressor(max_depth=5, learning_rate=0.04, max_iter=700, random_state=42)
-    model_live.fit(X, y)
+    metrics = _compute_regression_metrics(true_test_prices, pred_test_prices)
+    directional_acc = float(np.mean(np.sign(y_test.to_numpy()) == np.sign(pred_test_returns)))
 
+    # Fit live model on full dataset
+    model_live = HistGradientBoostingRegressor(
+        max_depth=4, 
+        learning_rate=0.03, 
+        max_iter=600, 
+        l2_regularization=1.0,
+        random_state=42
+    )
+    live_weights = _calculate_time_decay_weights(len(X), half_life_days=TIME_DECAY_HALF_LIFE_DAYS)
+    model_live.fit(X, y, sample_weight=live_weights)
+
+    # Walk-forward validation
     wf_metrics = _walk_forward_metrics(
         X=X,
         y=y,
-        model_factory=lambda: HistGradientBoostingRegressor(max_depth=5, learning_rate=0.04, max_iter=500, random_state=42),
+        model_factory=lambda: HistGradientBoostingRegressor(
+            max_depth=4, learning_rate=0.03, max_iter=450, l2_regularization=1.0, random_state=42
+        ),
         train_min=140,
         step=5,
-        direction_ref=X["Close"],
+        direction_ref=None,  # Return direction reference is 0.0
+        purge_window=PURGE_WINDOW_DAYS,
+        half_life_days=TIME_DECAY_HALF_LIFE_DAYS,
     )
 
     latest_x = X.iloc[[-1]]
-    pred_next_close = float(model_live.predict(latest_x)[0])
-    latest_close = float(ohlcv["Close"].iloc[-1])
+    latest_close = float(close_prices.iloc[-1])
+    pred_next_return = float(model_live.predict(latest_x)[0])
+    pred_next_close = latest_close * (1.0 + pred_next_return)
 
     return DailyForecastResult(
         ticker=ticker,
         latest_close=latest_close,
         predicted_next_close=pred_next_close,
-        holdout_mae=mae,
+        holdout_mae=metrics["mae"],
         holdout_rmse=metrics["rmse"],
         holdout_mape=metrics["mape"],
         holdout_directional_acc=directional_acc,
@@ -893,9 +1231,10 @@ def forecast_next_close_ml(ticker: str, period: str = "3y") -> DailyForecastResu
         walk_forward_directional_acc=wf_metrics["directional_acc"],
         walk_forward_windows=int(wf_metrics["windows"]),
         training_rows=len(X_train),
+        market_context_bias_pct=0.0,
     )
-
-
+    
+    
 def monte_carlo_gbm_close_range(
     ticker: str,
     start_price: float,
@@ -925,6 +1264,9 @@ def monte_carlo_gbm_close_range(
         "p95": float(np.quantile(terminal, 0.95)),
     }
 
+    spread_ratio = (q["p95"] - q["p05"]) / max(float(np.mean(terminal)), 1e-9)
+    terminal_confidence = float(np.clip(1.0 / (1.0 + spread_ratio), 0.0, 1.0))
+
     return MonteCarloResult(
         ticker=ticker,
         start_price=float(start_price),
@@ -934,6 +1276,7 @@ def monte_carlo_gbm_close_range(
         mean_terminal_price=float(np.mean(terminal)),
         quantiles=q,
         probability_above_start=float(np.mean(terminal > start_price)),
+        terminal_confidence=terminal_confidence,
     )
 
 
@@ -1139,6 +1482,7 @@ def _print_summary(results: Dict[str, object]) -> None:
     print(f"Walk-forward Directional Acc: {daily.walk_forward_directional_acc:.2%}")
     print(f"Walk-forward windows: {daily.walk_forward_windows}")
     print(f"Daily training rows: {daily.training_rows}")
+    print(f"Market-context bias: {daily.market_context_bias_pct * 100:.2f}%")
 
     print("\n=== Monte Carlo (GBM): Probabilistic Range ===")
     print(f"Start price: {mc.start_price:.2f}")
@@ -1154,6 +1498,7 @@ def _print_summary(results: Dict[str, object]) -> None:
         f"75%={mc.quantiles['p75']:.2f}, "
         f"95%={mc.quantiles['p95']:.2f}"
     )
+    print(f"Terminal confidence: {mc.terminal_confidence * 100:.2f}%")
     print(f"Probability terminal > start: {mc.probability_above_start * 100:.2f}%")
 
     decision = results.get("trade_decision")

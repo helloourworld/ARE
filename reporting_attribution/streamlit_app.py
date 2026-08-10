@@ -128,6 +128,8 @@ PORTFOLIO_VALUE = 10_000
 RS_WINDOW = 50
 RS_LOOKBACK_WINDOW = 200
 ANNUAL_TRADING_DAYS = 252
+BUBBLE_Z_THRESHOLD = 2.5
+BUBBLE_PCT_FALLBACK = 50.0
 
 
 def get_regime_icon(regime: str) -> str:
@@ -861,9 +863,10 @@ with tab8:
     """)
 
     # 1. Setup Universe & Benchmark
-    # We use XEQT.TO as the 'Global Beta' benchmark for RS comparison
+    # We use user-selected benchmark, and always include SPY as institutional reference.
     rs_benchmark = st.selectbox("RS Reference Benchmark", [
                                 "XWD.TO", "XEQT.TO", "SPY"], index=2)
+    st.caption("Institutional baseline is always tracked vs SPY in addition to the selected benchmark.")
 
     # Combined Universe from your SD and Managed accounts
     rs_universe = list(set(cfg['defaults']['selected_portfolio'] +
@@ -875,6 +878,22 @@ with tab8:
     # Fetch 2 years of data for the 52-week SMA
     rs_data = get_price_history_with_benchmark(
         rs_universe, rs_benchmark, period="2y", interval="1d")
+
+    # Always include SPY context, even when user selects another benchmark.
+    spy_ref_series = None
+    if rs_benchmark == "SPY" and "SPY" in rs_data.columns:
+        spy_ref_series = rs_data["SPY"].copy()
+    else:
+        spy_ref_df = get_data_persistent("SPY", interval="1d", period="2y")
+        if spy_ref_df is not None and not spy_ref_df.empty and "Close" in spy_ref_df.columns:
+            spy_ref_series = spy_ref_df["Close"].copy()
+            spy_ref_series.index = pd.to_datetime(spy_ref_series.index, errors="coerce")
+            rs_index = pd.to_datetime(rs_data.index, errors="coerce")
+            spy_ref_series = spy_ref_series[~spy_ref_series.index.isna()].sort_index()
+            rs_index_series = pd.Series(rs_index, index=rs_data.index)
+            rs_data = rs_data.loc[~rs_index_series.isna()].copy()
+            rs_data.index = rs_index_series[~rs_index_series.isna()].values
+            spy_ref_series = spy_ref_series.reindex(rs_data.index).ffill().bfill()
 
     for t in rs_universe:
         mrs_series, slope_series = calculate_mansfield_rs(
@@ -891,6 +910,14 @@ with tab8:
         current_score = mrs_series.ffill().iloc[-1]
         # print(f"Current RS Score for {t}: {current_score:.2f}")
         current_slope = slope_series.ffill().iloc[-1]
+
+        if spy_ref_series is not None:
+            mrs_spy, slope_spy = calculate_mansfield_rs(rs_data[t], spy_ref_series)
+            current_score_spy = mrs_spy.ffill().iloc[-1]
+            current_slope_spy = slope_spy.ffill().iloc[-1]
+        else:
+            current_score_spy = float("nan")
+            current_slope_spy = float("nan")
 
         def get_signal_logic(current_score, current_slope):
             # Qualitative Signal Logic
@@ -932,22 +959,41 @@ with tab8:
         else:
             hook_status = "Steady"
 
-        # bubble alert: If the price is more than 50% above the 200-day moving average,
-        # it may be overextended and at risk of a sharp pullback.
+        # Dynamic bubble alert: compare extension above 200DMA versus its own 252-day extension volatility.
         price_200ma = rs_data[t].ffill().rolling(
             window=RS_LOOKBACK_WINDOW).mean()
         dist_from_200ma = (rs_data[t].ffill().iloc[-1] /
                            price_200ma.ffill().iloc[-1] - 1) * 100
-        # print(dist_from_200ma)
-        if dist_from_200ma > 50:
-            bubble_alert = f"🚨 BURRY ALERT: Overextended: {dist_from_200ma:.2f}%"
+
+        extension = rs_data[t].ffill() - price_200ma
+        extension_std = extension.rolling(window=252, min_periods=126).std()
+
+        ext_now = float(extension.ffill().iloc[-1]) if not extension.empty else float("nan")
+        ext_std_now = float(extension_std.ffill().iloc[-1]) if not extension_std.empty else float("nan")
+
+        if np.isfinite(ext_now) and np.isfinite(ext_std_now) and ext_std_now > 1e-9:
+            extension_z = ext_now / ext_std_now
         else:
-            bubble_alert = "Safe"
+            extension_z = float("nan")
+
+        if np.isfinite(extension_z):
+            if extension_z >= BUBBLE_Z_THRESHOLD and dist_from_200ma > 0:
+                bubble_alert = (
+                    f"🚨 BURRY ALERT: Z={extension_z:.2f}σ | Overextended: {dist_from_200ma:.2f}%"
+                )
+            else:
+                bubble_alert = f"Safe: Z={extension_z:.2f}σ | 200MA: {dist_from_200ma:.2f}%"
+        elif dist_from_200ma > BUBBLE_PCT_FALLBACK:
+            bubble_alert = f"🚨 BURRY ALERT (Fallback): Overextended: {dist_from_200ma:.2f}%"
+        else:
+            bubble_alert = f"Safe: Z=N/A | >200MA: {dist_from_200ma:.2f}%"
 
         rs_results.append({
             "Ticker": t,
             "RS Score": round(current_score, 2),
             "RS Trend": round(current_slope, 2),
+            "RS Score vs SPY": round(current_score_spy, 2) if pd.notna(current_score_spy) else np.nan,
+            "RS Trend vs SPY": round(current_slope_spy, 2) if pd.notna(current_slope_spy) else np.nan,
             "Institutional Signal": signal,
             "Mean Reversion Alert": reversion_status,
             "Hook Alert": hook_status,
@@ -1242,6 +1288,13 @@ with tab9:
         if not isinstance(result, dict):
             st.error(f"Scan failed: {result}")
         else:
+            scan_status = str(result.get("Scan Status", "RUN")).upper()
+            latest_bar_time = result.get("Bar Time", "N/A")
+            if scan_status == "WAIT":
+                st.warning(f"Scan Status: WAIT (no new 1m bar). Latest bar: {latest_bar_time}")
+            else:
+                st.success(f"Scan Status: {scan_status}. Latest bar: {latest_bar_time}")
+
             st.write(f"**Price:** {result['Price']:.2f}")
             st.write(f"**Daily Return (Session Baseline):** {result['Day %']:.2f}%")
             st.write(f"**Daily Return (vs Prev Close):** {result.get('Day % vs Prev Close', float('nan')):.2f}%")
@@ -1319,6 +1372,7 @@ with tab9:
                 cvd_icon = get_cvd_icon(result.get("CVD Trend", "N/A"))
                 all_signals.append({
                     "Ticker": ticker,
+                    "Time": result.get("Bar Time", "N/A"),
                     "Price": f"{result.get('Price', 0.0):.2f}",
                     "Open": f"{result.get('Open', 0.0):.2f}",
                     "Day %": f"{result.get('Day %', 0.0):.2f}%",
@@ -1380,10 +1434,7 @@ with tab9:
                         print(f"Failed saving plot for {ticker}: {e}")
 
         # Display signals table
-        df_signals = pd.DataFrame(all_signals).sort_values(
-            by=["Signal/Regime", "Verdict", "Ticker"],
-            ascending=[True, True, True]
-        )
+        df_signals = pd.DataFrame(all_signals)
         st.subheader("📊 All Risk Alert Signals")
         st.dataframe(df_signals, hide_index=True, width='stretch')
 
@@ -1638,13 +1689,14 @@ with tab11:
                     min_edge_pct=fc_min_edge,
                     daily_tail_risk_budget_pct=fc_daily_budget,
                 )
-                forecast_results = run_all(
-                    ticker=fc_ticker,
-                    intraday_period=fc_intraday_period,
-                    intraday_interval=fc_intraday_interval,
-                    portfolio_value=fc_portfolio_value,
-                    rules_config=rules_cfg,
-                )
+                with st.spinner(f"Running forecast for {fc_ticker}..."):
+                    forecast_results = run_all(
+                        ticker=fc_ticker,
+                        intraday_period=fc_intraday_period,
+                        intraday_interval=fc_intraday_interval,
+                        portfolio_value=fc_portfolio_value,
+                        rules_config=rules_cfg,
+                    )
 
                 intraday = forecast_results["intraday_ml"]
                 daily = forecast_results["next_close_ml"]
@@ -1655,8 +1707,8 @@ with tab11:
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("Current Price (1m)", f"{intraday.current_price:.2f}")
                 m2.metric("Predicted Session Close", f"{intraday.predicted_close:.2f}", f"{intraday.predicted_return_to_close * 100:.2f}%")
-                m3.metric("Predicted Next Close", f"{daily.predicted_next_close:.2f}", f"MAE {daily.holdout_mae:.3f}")
-                m4.metric("P(Terminal > Start)", f"{mc.probability_above_start * 100:.2f}%")
+                m3.metric("Predicted Next Close", f"{daily.predicted_next_close:.2f}", f"Bias {daily.market_context_bias_pct * 100:.2f}%")
+                m4.metric("Terminal Confidence", f"{mc.terminal_confidence * 100:.2f}%")
 
                 with st.expander("Model Validation Metrics", expanded=True):
                     v1, v2, v3, v4 = st.columns(4)
@@ -1671,6 +1723,7 @@ with tab11:
                     w3.metric("Daily WF MAPE", f"{daily.walk_forward_mape:.2%}")
                     w4.metric("Daily WF Dir Acc", f"{daily.walk_forward_directional_acc:.2%}")
                     st.caption(f"Daily walk-forward windows: {daily.walk_forward_windows}")
+                    st.caption(f"Market-context bias from SPY overlay: {daily.market_context_bias_pct * 100:.2f}%")
 
                     intraday_metrics = getattr(intraday, "validation_metrics", {}) or {}
                     i1, i2, i3, i4 = st.columns(4)
@@ -1716,6 +1769,8 @@ with tab11:
                     )
                     fig_q.update_layout(title="GBM Probabilistic Close Range", yaxis_title="Price", height=320)
                     st.plotly_chart(fig_q, width='stretch')
+
+                st.caption(f"P(terminal > start): {mc.probability_above_start * 100:.2f}% | Terminal confidence: {mc.terminal_confidence * 100:.2f}%")
 
                 if decision is not None:
                     st.subheader("Action Engine")

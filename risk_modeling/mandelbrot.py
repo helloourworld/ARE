@@ -51,6 +51,8 @@ LOG_DIR = REPO_ROOT / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_SCAN_LOG_PATH = LOG_DIR / "mandelbrot_scan.log"
 FRAGILITY_CALIBRATION_PATH = DATA_DIR / "fragility_calibration.csv"
+_LAST_SCAN_BAR_TS = {}
+_LAST_SCAN_RESULT = {}
 
 
 def configure_scan_file_logging(log_path: Path = DEFAULT_SCAN_LOG_PATH) -> Path:
@@ -611,7 +613,7 @@ def _get_session_open(data_1m, data_1d, session_date):
     return float(regular_rows["Close"].iloc[0])
 
 
-def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
+def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_new_data=True):
     """
     Scan one ticker and return regime metrics + actionable fields.
 
@@ -633,6 +635,25 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
     if data_1m is None or data_1d is None or data_1m.empty or data_1d.empty:
         logger.error("Insufficient data returned from data source")
         return "ERROR - No Data"
+
+    ticker_key = str(ticker).upper()
+    market_ts = data_1m.index[-1] if len(data_1m.index) > 0 else "N/A"
+    market_ts_pd = pd.Timestamp(market_ts)
+    market_ts_key = market_ts_pd.tz_convert("UTC") if market_ts_pd.tzinfo is not None else market_ts_pd
+
+    if check_new_data:
+        last_seen_ts = _LAST_SCAN_BAR_TS.get(ticker_key)
+        if last_seen_ts is not None and market_ts_key <= last_seen_ts:
+            logger.info("Waiting for new 1m data | ticker=%s | latest_bar=%s", ticker, market_ts_pd)
+            stale_result = dict(_LAST_SCAN_RESULT.get(ticker_key, {}))
+            stale_result.update({
+                "Scan Status": "WAIT",
+                "Wait Reason": "No new 1m bar",
+                "Bar Time": market_ts_pd.strftime("%H:%M:%S"),
+            })
+            return stale_result if stale_result else "WAIT - No new 1m data"
+
+    _LAST_SCAN_BAR_TS[ticker_key] = market_ts_key
 
     required_1m = max(HURST_WINDOW, VOL_LOOKBACK, 60) + 1
     if len(data_1m) < required_1m and not ticker.endswith(".TO"):
@@ -667,14 +688,12 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
     prices = data_1m['Close'].values
     volumes = data_1m['Volume'].values
     returns_1m = np.diff(np.log(prices))
-    market_ts = data_1m.index[-1] if len(data_1m.index) > 0 else "N/A"
-
     # Normalize latest timestamp to ET for session-state consistency.
-    market_ts_pd = pd.Timestamp(market_ts)
     if market_ts_pd.tzinfo is not None:
         market_ts_et = market_ts_pd.tz_convert("America/New_York")
     else:
         market_ts_et = market_ts_pd
+    bar_time_hms = market_ts_et.strftime("%H:%M:%S")
     current_session_date = market_ts_et.date()
 
     # 1. Calculate Core Metrics
@@ -865,6 +884,10 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None):
     elif fragility["is_watch"]:
         result["Fragility Alert"] = "FRAGILITY WATCH"
 
+    result["Scan Status"] = "RUN"
+    result["Bar Time"] = bar_time_hms
+    _LAST_SCAN_RESULT[ticker_key] = dict(result)
+
     logger.debug("Scan complete | ticker=%s", ticker)
     return result
 
@@ -873,7 +896,7 @@ if __name__ == "__main__":
     # Test on your Core Universe
     log_path = configure_scan_file_logging()
     logger.info("Mandelbrot scan logging enabled | file=%s", log_path)
-    tickers = ["SPY"]
+    tickers = ["MSFT"]
     while True:
         for t in tickers:
             scan_market(t)     
