@@ -106,6 +106,8 @@ FRAGILITY_THRESHOLD_MIN = 25.0
 FRAGILITY_THRESHOLD_MAX = 60.0
 FRAGILITY_CAL_MIN_SAMPLES = 8
 
+# Others
+GAP_THRESHOLD = 0.05  # e.g., 0.05 = 5% or 0.005 = 0.5% depending on scale
 # ============================================================================
 # 2. FRACTAL MATHEMATICS
 # ============================================================================
@@ -796,63 +798,125 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
     gap_pct = (session_open - prev_close) / prev_close
     # print("premarket:", pre_market, "prev_close:", prev_close, "session_open:", session_open, "current_price:", current_price, "gap_pct:", gap_pct
     #       )
-    day_baseline = prev_close if pre_market else session_open
-    day_pct = ((current_price - day_baseline) / day_baseline) * 100.0
-    day_pct_prev_close = ((current_price - prev_close) / prev_close) * 100.0
+    # day_baseline = prev_close if pre_market else session_open
+    # day_pct = ((current_price - day_baseline) / day_baseline) * 100.0
+    # net_pct = ((current_price - prev_close) / prev_close) * 100.0
+    # tail_state = "ACTIVE" if recent_vol > VOL_THRESHOLD else "DORMANT"
+
+
+
+    # ---------------------------------------------------------------------
+    # 1. Price Action Diagnostics
+    # ---------------------------------------------------------------------
+    # Intraday performance relative to open (Session acceptance)
+    day_pct = ((current_price - session_open) / session_open) * 100.0
+
+    # Overall performance relative to previous close (Net market state)
+    net_pct = ((current_price - prev_close) / prev_close) * 100.0
+
+    # Post-gap intraday behavior flags
+    is_gap_up = gap_pct > GAP_THRESHOLD
+    is_gap_down = gap_pct < -GAP_THRESHOLD
+
+    holding_gap_up = is_gap_up and day_pct >= 0      # Price holding or expanding above Open
+    fading_gap_up  = is_gap_up and day_pct < 0       # Price failing & filling gap back to Prev Close
+
+    holding_gap_dn = is_gap_down and day_pct <= 0    # Price holding or expanding below Open
+    bouncing_gap_dn = is_gap_down and day_pct > 0    # Price recovering back towards Prev Close
+
     tail_state = "ACTIVE" if recent_vol > VOL_THRESHOLD else "DORMANT"
 
+    # Optional: Add VWAP alignment if available (e.g., current_price > vwap)
+    # vwap_bullish = current_price > vwap if vwap else True
+
+    # ---------------------------------------------------------------------
+    # 2. Regime Classification
+    # ---------------------------------------------------------------------
+
+    # A. Tail Risk Override (Highest Priority)
     if alpha_eff < TAIL_RISKY:
         regime = f"5 - TAIL RISK ({tail_state} Danger of Sudden Move)"
-    elif gap_pct > 0.05 and h_val < HURST_TREND_MIN:
-        regime = "1 - BULLISH PERSISTENCE (Post-Gap Consolidation)"
-    elif gap_pct < -0.05 and h_val < HURST_TREND_MIN:
-        regime = "2 - BEARISH PERSISTENCE (Post-Gap Breakdown)"
+        tail_quality = "Tail-Risk"
+
+    # B. Strong Trend Regimes (Hurst indicates strong persistence)
     elif h_val > HURST_TREND_MIN:
-        is_bullish = day_pct > 0 or gap_pct > 0
-        if alpha_eff >= TAIL_SAFE:
-            regime = "1 - BULLISH PERSISTENCE (Trend is Real | Tail-Stable)" if is_bullish else "2 - BEARISH PERSISTENCE (Trend is Real | Tail-Stable)"
-            tail_quality = "Tail-Stable"
+        # Intraday AND net direction must agree for true trend persistence
+        is_bullish = net_pct > 0 and day_pct >= -0.2  # Net positive without severe intraday collapse
+        
+        tail_quality = "Tail-Stable" if alpha_eff >= TAIL_SAFE else "Tail-Caution"
+        
+        if is_bullish:
+            regime = f"1 - BULLISH PERSISTENCE (Trend is Real | {tail_quality})"
         else:
-            regime = "1 - BULLISH PERSISTENCE (Trend is Real | Tail-Caution)" if is_bullish else "2 - BEARISH PERSISTENCE (Trend is Real | Tail-Caution)"
-            tail_quality = "Tail-Caution"
+            regime = f"2 - BEARISH PERSISTENCE (Trend is Real | {tail_quality})"
+
+    # C. Post-Gap Regimes (Hurst is low/neutral, so intraday hold/fade dictates outcome)
+    elif holding_gap_up:
+        regime = "1 - BULLISH PERSISTENCE (Post-Gap Acceptance & Hold)"
+        tail_quality = "N/A"
+
+    elif fading_gap_up:
+        regime = "4 - UNSTABLE (Post-Gap Fade / Supply Overhead)"
+        tail_quality = "N/A"
+
+    elif holding_gap_dn:
+        regime = "2 - BEARISH PERSISTENCE (Post-Gap Breakdown & Hold)"
+        tail_quality = "N/A"
+
+    elif bouncing_gap_dn:
+        regime = "4 - UNSTABLE (Post-Gap Short Cover / Counter-Bounce)"
+        tail_quality = "N/A"
+
+    # D. Low Hurst (Mean Reverting / Range Bound)
     elif h_val < HURST_CHOP_MAX:
         regime = "4 - UNSTABLE (Mean Reverting / Chop)"
         tail_quality = "N/A"
+
+    # E. Random Walk
     else:
         regime = "3 - NEUTRAL / RANDOM WALK"
         tail_quality = "N/A"
 
-    if alpha_eff < TAIL_RISKY:
-        tail_quality = "Tail-Risk"
-    elif gap_pct > 0.05 and h_val < HURST_TREND_MIN:
-        tail_quality = "N/A"
-    elif gap_pct < -0.05 and h_val < HURST_TREND_MIN:
-        tail_quality = "N/A"
-
-    # 5. OUTPUT
+    # 5. OUTPUT (Organized in logical sequence)
     logger.info("StockTs=%s | Price=%.2f | Hurst=%.3f | TailIndex=%.3f | IntradayVol=%.5f | Regime=%s", market_ts, prices[-1], h_val, alpha_eff, recent_vol, regime)
 
-    # Compute liquidity signals for better tape/flow context.
+    # Build result in logical sequence: Metadata → Price → Metrics → Regime → Risk → Flow → Action
     result = {
+        # --- METADATA & TIME ---
+        "Bar Time": bar_time_hms,
+        "Scan Status": "RUN",
+        
+        # --- PRICE ACTION ---
         "Price": float(prices[-1]),
         "Open": float(session_open) if session_open is not None else float(prices[0]),
         "Day %": float(day_pct),
-        "Day % vs Prev Close": float(day_pct_prev_close),
+        "Day % Net": float(net_pct),
+        
+        # --- FRACTAL METRICS (Quality of Price Movement) ---
         "Hurst": float(h_val),
         "Tail Index": float(alpha_eff),
         "Intraday Vol": float(recent_vol),
-        "VPIN": float(0.0),
+        
+        # --- REGIME CLASSIFICATION ---
         "Regime": regime,
+        "Tail Quality": tail_quality,
+        
+        # --- RISK ASSESSMENT (Fragility / Stability) ---
         "Fragility Score": float(fragility_score),
         "Fragility Threshold": float(fragility_threshold),
         "Fragility Alert": "",
-        "Tail Quality": tail_quality,
+        
+        # --- FLOW & LIQUIDITY ANALYSIS ---
+        "VPIN": float(0.0),
+        "CVD Trend": "N/A",
         "CVD Threshold": float(np.nan),
+        
+        # --- VERDICT & ACTION (What to Do) ---
         "Verdict": "N/A",
         "Suggestion": "N/A",
         "Reason": "N/A",
-        "CVD Trend": "N/A",
     }
+    # Merge hybrid signal results into flow section
     result.update(hybrid_signal_result)
 
     if show_judgment:
@@ -870,13 +934,16 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
             regime, judgment, entropy, alpha_eff, h_val, vpin, cvd_slope)
         logger.info("StockTs=%s | Suggestion=%s | Reason=%s", market_ts, action, reason)
 
+        # Update flow and action sections with judgment-derived data
         result.update({
+            # Flow section updates
+            "VPIN": float(vpin),
+            "CVD Trend": f"{cvd_slope:.2f} {cvd_label}",
+            "CVD Threshold": float(cvd_threshold),
+            # Action section updates
             "Verdict": judgment,
             "Suggestion": action,
             "Reason": reason,
-            "CVD Trend": f"{cvd_slope:.2f} {cvd_label}",
-            "CVD Threshold": float(cvd_threshold),
-            "VPIN": float(vpin)
         })
 
     if fragility["is_critical"]:
@@ -884,8 +951,6 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
     elif fragility["is_watch"]:
         result["Fragility Alert"] = "FRAGILITY WATCH"
 
-    result["Scan Status"] = "RUN"
-    result["Bar Time"] = bar_time_hms
     _LAST_SCAN_RESULT[ticker_key] = dict(result)
 
     logger.debug("Scan complete | ticker=%s", ticker)

@@ -33,6 +33,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import statsmodels.api as sm
+import streamlit.components.v1 as components
 import yfinance as yf
 import yaml
 from sklearn.covariance import LedoitWolf
@@ -261,8 +262,27 @@ def render_headline_benchmark_alert() -> None:
 
 
 # --- CONFIGURATION & STYLING ---
-st.set_page_config(page_title="Alpha Risk Engine (ARE)", layout="wide")
+st.set_page_config(page_title="Alpha Risk Engine (ARE)", page_icon="🤖", layout="wide")
 
+@st.fragment(run_every="60s")
+def update_browser_tab_title():
+    try:
+        monitor_list = ['SPY']
+        live_data = get_live_intraday(monitor_list, period="1d")
+
+        bench_series = live_data['SPY'].dropna()
+        bench_current = bench_series.iloc[-1]
+        st.text(f"Current SPY Price: ${bench_current:,.2f}")
+        # JavaScript to dynamically update the browser tab title
+        html_script = f"""
+            10 {bench_current:,.2f}
+        """
+        st.set_page_config(page_title=html_script, page_icon="🤖", layout="wide")
+        # st.title(html_script, height=0, width=0)
+    except Exception:
+        st.error("Error updating browser tab title. Please check your internet connection or data source.")
+# Run browser title updater in background
+update_browser_tab_title()
 
 # --- LOAD CONFIGURATION ---
 def load_config():
@@ -1297,7 +1317,7 @@ with tab9:
 
             st.write(f"**Price:** {result['Price']:.2f}")
             st.write(f"**Daily Return (Session Baseline):** {result['Day %']:.2f}%")
-            st.write(f"**Daily Return (vs Prev Close):** {result.get('Day % vs Prev Close', float('nan')):.2f}%")
+            st.write(f"**Daily Return (Net):** {result.get('Day % Net', float('nan')):.2f}%")
             render_metric_with_threshold(
                 "Hurst (Trend)",
                 result['Hurst'],
@@ -1371,26 +1391,42 @@ with tab9:
             if isinstance(result, dict) and result.get("Regime"):
                 cvd_icon = get_cvd_icon(result.get("CVD Trend", "N/A"))
                 all_signals.append({
-                    "Ticker": ticker,
+                    # --- METADATA & TIME ---
                     "Time": result.get("Bar Time", "N/A"),
+                    "Ticker": ticker,
+                    
+                    # --- PRICE ACTION ---
                     "Price": f"{result.get('Price', 0.0):.2f}",
                     "Open": f"{result.get('Open', 0.0):.2f}",
+                    "Day % Net": f"{result.get('Day % Net', 0.0):.2f}%",
                     "Day %": f"{result.get('Day %', 0.0):.2f}%",
-                    "Day % vs Prev Close": f"{result.get('Day % vs Prev Close', 0.0):.2f}%",
+                    
+                    # --- REGIME CLASSIFICATION ---
+                    "Signal/Regime": f"{result.get('Regime')} {get_regime_icon(result.get('Regime'))}",
+                    "Tail Quality": result.get('Tail Quality', 'N/A'),
+                    
+                    # --- VERDICT & ACTION ---
+                    "Verdict": result.get('Verdict', ''),
                     "Suggestion": result.get('Suggestion', ''),
                     "Reason": result.get('Reason', ''),
+                    
+                    # --- FRACTAL METRICS ---
                     "Hurst": f"{result.get('Hurst', 0.0):.3f}",
                     "Tail Index": f"{result.get('Tail Index', 0.0):.3f}",
-                    "VPIN": f"{result.get('VPIN', 0.0):.3f}",
-                    "Hybrid VPIN": f"{result.get('Hybrid VPIN', 0.0):.3f}",
-                    "CVD Threshold": f"{result.get('CVD Threshold', 0.0):.3f}",
-                    "Tail Quality": result.get('Tail Quality', 'N/A'),
+                    
+                    # --- RISK ASSESSMENT ---
+                    "Fragility": result.get('Fragility Alert', ''),
+                    
+                    # --- FLOW & LIQUIDITY ---
                     "Hybrid Signal": result.get('Hybrid Signal', 'N/A'),
+                    "Hybrid VPIN": f"{result.get('Hybrid VPIN', 0.0):.3f}",                    
                     "Hybrid CVD Trend": result.get('Hybrid CVD Trend', 'N/A'),
+                    "VPIN": f"{result.get('VPIN', 0.0):.3f}",
                     "CVD Trend": f"{cvd_icon} {result.get('CVD Trend', 'N/A')}",
-                    "Signal/Regime": f"{result.get('Regime')} {get_regime_icon(result.get('Regime'))}",
-                    "Verdict": result.get('Verdict', ''),
-                    "Fragility": result.get('Fragility Alert', '')
+                    "CVD Threshold": f"{result.get('CVD Threshold', 0.0):.3f}",
+
+                    "Intraday Vol": f"{result.get('Intraday Vol', 0.0):.5f}"
+
                 })
 
                 # Optionally save plots per ticker
