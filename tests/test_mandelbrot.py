@@ -2,7 +2,7 @@ import datetime
 
 import pandas as pd
 
-from risk_modeling.mandelbrot import _get_session_open
+from risk_modeling.mandelbrot import _get_session_open, _resolve_day_baseline
 
 
 def test_session_open_prefers_official_daily_open_over_premarket_bar():
@@ -18,3 +18,19 @@ def test_session_open_prefers_official_daily_open_over_premarket_bar():
     session_open = _get_session_open(intraday_data, daily_data, datetime.date(2026, 7, 15))
 
     assert session_open == 754.24
+
+
+def test_day_baseline_uses_prev_close_before_market_open():
+    ts = pd.Timestamp("2026-07-15 09:29:00", tz="America/New_York")
+
+    baseline = _resolve_day_baseline(100.0, 101.5, ts)
+
+    assert baseline == 100.0
+
+
+def test_day_baseline_uses_session_open_when_market_is_open():
+    ts = pd.Timestamp("2026-07-15 09:31:00", tz="America/New_York")
+
+    baseline = _resolve_day_baseline(100.0, 101.5, ts)
+
+    assert baseline == 101.5

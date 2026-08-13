@@ -150,18 +150,18 @@ def get_regime_icon(regime: str) -> str:
     return "❔"
 
 
-def get_cvd_icon(cvd_value: str) -> str:
+def get_cvd_icon(cvd_value) -> str:
     try:
-        if isinstance(cvd_value, str):
-            if "UP" in cvd_value.upper() or "⬆️" in cvd_value:
-                return "⬆️"
-            if "DOWN" in cvd_value.upper() or "⬇️" in cvd_value:
-                return "⬇️"
-            if "FLAT" in cvd_value.upper() or "→" in cvd_value:
-                return "→"
-            # Parse fallback: numeric slope sign
-            slope = float(cvd_value.split()[0])
-            return "⬆️" if slope > 0 else "⬇️" if slope < 0 else "→"
+
+        if "UP" in cvd_value.upper() or "⬆️" in cvd_value or float(cvd_value) > 0:
+            return "⬆️"
+        if "DOWN" in cvd_value.upper() or "⬇️" in cvd_value or float(cvd_value) < 0:
+            return "⬇️"
+        if "FLAT" in cvd_value.upper() or "→" in cvd_value:
+            return "→"
+        # Parse fallback: numeric slope sign
+        slope = float(cvd_value.split()[0])
+        return "⬆️" if slope > 0 else "⬇️" if slope < 0 else "→"
     except Exception:
         pass
     return "→"
@@ -190,8 +190,15 @@ def get_reference_price(ticker: str, series: pd.Series):
     premarket = last_ts.time() < datetime.time(9, 30)
 
     prev_close_vals = [i for i, d in enumerate(est_index.date) if d < current_date]
-    prev_close = series.iloc[prev_close_vals[-1]] if prev_close_vals else None
+    # prev_close = series.iloc[prev_close_vals[-1]] if prev_close_vals else None
+    _, hist = get_premarket_data(selected_benchmark)
 
+    # 1. Previous Day Close
+    if premarket:
+        prev_close = hist[selected_benchmark].iloc[-1]
+    else:
+        prev_close = hist[selected_benchmark].iloc[-2]
+        
     today_open_mask = [d == current_date and t >= datetime.time(9, 30)
                        for d, t in zip(est_index.date, est_index.time)]
     today_open = get_official_session_open(ticker, current_date) if any(today_open_mask) else None
@@ -1183,7 +1190,7 @@ with tab9:
 
             # Calculate Benchmark change first for relative comparison
             bench_series = live_data[selected_benchmark].dropna()
-            bench_current = bench_series.iloc[-1]
+            bench_current = live_data[selected_benchmark].dropna().iloc[-1]
             bench_ref_price, bench_ref_label = get_reference_price(selected_benchmark, bench_series)
             benchmark_change = (bench_current / bench_ref_price - 1) * 100 if bench_ref_price is not None else float('nan')
             st.session_state["live_benchmark_change_pct"] = float(benchmark_change) if not pd.isna(benchmark_change) else None
@@ -1280,7 +1287,7 @@ with tab9:
     st.subheader("Risk Alert Portal")
     st.markdown(
         """**Regime Icon Legend:** 🟢 Bullish | 🔴 Bearish | 🟡 Neutral | ⚠️ Unstable | 🚨 Tail Risk | 🔎 Other  
-        **CVD Trend Icons:** ⬆️ Up | ⬇️ Down | → Flat"""
+        **CVD Trend Icons:** 📈 Up | ⬇️ Down | → Flat"""
     )
     with st.expander("Evaluation Legend", expanded=False):
                 st.markdown(
@@ -1372,7 +1379,7 @@ with tab9:
 
     st.divider()
     st.subheader("Scan All Tickers & List Signals")
-    save_plots = st.checkbox("Save VPIN/CVD plots for all tickers", value=False)
+    save_plots = st.checkbox("Save Volume plots for all tickers", value=False)
     if st.button("Scan All Tickers & List Signals"):
         import io
         from contextlib import redirect_stdout
@@ -1403,7 +1410,7 @@ with tab9:
                     
                     # --- REGIME CLASSIFICATION ---
                     "Signal/Regime": f"{result.get('Regime')} {get_regime_icon(result.get('Regime'))}",
-                    "Tail Quality": result.get('Tail Quality', 'N/A'),
+                    # "Tail Quality": result.get('Tail Quality', 'N/A'),
                     
                     # --- VERDICT & ACTION ---
                     "Verdict": result.get('Verdict', ''),
@@ -1420,12 +1427,12 @@ with tab9:
                     # --- FLOW & LIQUIDITY ---
                     "Hybrid Signal": result.get('Hybrid Signal', 'N/A'),
                     "Hybrid VPIN": f"{result.get('Hybrid VPIN', 0.0):.3f}",                    
-                    "Hybrid CVD Trend": result.get('Hybrid CVD Trend', 'N/A'),
+                    "Hybrid CVD": f"{get_cvd_icon(result.get("Hybrid CVD Trend", "N/A"))} {result.get('Hybrid CVD Trend', 'N/A')}",
                     "VPIN": f"{result.get('VPIN', 0.0):.3f}",
                     "CVD Trend": f"{cvd_icon} {result.get('CVD Trend', 'N/A')}",
                     "CVD Threshold": f"{result.get('CVD Threshold', 0.0):.3f}",
 
-                    "Intraday Vol": f"{result.get('Intraday Vol', 0.0):.5f}"
+                    "Intraday Vol": f"{result.get('Intraday Vol', 0.0):.4f}"
 
                 })
 
@@ -1470,7 +1477,7 @@ with tab9:
                         print(f"Failed saving plot for {ticker}: {e}")
 
         # Display signals table
-        df_signals = pd.DataFrame(all_signals)
+        df_signals = pd.DataFrame(all_signals).sort_values(by=["Signal/Regime", "Day % Net"], ascending=False)
         st.subheader("📊 All Risk Alert Signals")
         st.dataframe(df_signals, hide_index=True, width='stretch')
 

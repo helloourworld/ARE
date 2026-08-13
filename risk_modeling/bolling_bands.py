@@ -55,7 +55,7 @@ def _calculate_vpin(series_close: pd.Series, series_volume: pd.Series, window: i
 def _calculate_cvd(series_close: pd.Series, series_volume: pd.Series, window: int) -> tuple[pd.Series, float, str]:
     price_delta = series_close.diff().fillna(0)
     direction = np.sign(price_delta).replace(0, 0.0)
-    cvd = (direction * series_volume).cumsum()
+    cvd = (direction * series_volume/series_volume.mean()).cumsum() if series_volume.mean() else (direction * series_volume).cumsum()
     cvd_window = min(len(cvd), window)
     if cvd_window > 1:
         x = np.arange(cvd_window)
@@ -186,7 +186,7 @@ def compute_rolling_cvd(minute_df: pd.DataFrame, resample_rule: str = '5min') ->
     return pd.Series(cvd.values, index=resampled.index, name='CVD')
 
 
-def get_hybrid_risk_signal(minute_df: pd.DataFrame, vpin_window: int = 50, cvd_window: int = 20, vpin_window_minutes: int = None) -> dict:
+def get_hybrid_risk_signal(minute_df: pd.DataFrame, vpin_window: int = 50, cvd_window: int = 30, vpin_window_minutes: int = None) -> dict:
     """Generate a hybrid risk signal from 1-minute OHLCV.
 
     The function resamples 1-minute bars into 5-minute bars for Bollinger Bands
@@ -255,9 +255,9 @@ def get_hybrid_risk_signal(minute_df: pd.DataFrame, vpin_window: int = 50, cvd_w
             cvd_series = delta.cumsum()
             cvd_value = float(cvd_series.iloc[-1])
             cvd_trend = 'UP' if cvd_slope > 0 else 'DOWN' if cvd_slope < 0 else 'FLAT'
-        except Exception:
-            cvd_series, cvd_slope, cvd_trend = _calculate_cvd(df['Close'], df['Volume'], window=cvd_window)
-            cvd_value = float(cvd_series.iloc[-1])
+        except Exception as e:
+            print("Error occurred while calculating refined CVD | error=%s", e)
+
     else:
         cvd_series, cvd_slope, cvd_trend = _calculate_cvd(df['Close'], df['Volume'], window=cvd_window)
         cvd_value = float(cvd_series.iloc[-1])
@@ -281,7 +281,7 @@ def get_hybrid_risk_signal(minute_df: pd.DataFrame, vpin_window: int = 50, cvd_w
         'vpin': round(vpin_value, 4),
         'vpin_window': int(vpin_window),
         'cvd': round(cvd_value, 3),
-        'cvd_slope': round(cvd_slope, 6),
+        'cvd_slope': round(cvd_slope, 3),
         'cvd_trend': cvd_trend,
         'bb_source': '5-minute Bollinger Bands (20,2) from resampled 1-minute data',
         'cvd_window': int(cvd_window),

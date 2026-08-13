@@ -251,7 +251,11 @@ def calculate_cvd_refined(data_df, window=100):
     
     # Probability of buy volume (0 to 1)
     buy_prob = norm.cdf(returns / sigma)
-    delta = (2 * buy_prob - 1) * df['Volume'] # Scales from -Volume to +Volume
+    
+    # Normalize slope by the average volume to make it asset-agnostic
+    avg_vol = df['Volume'].mean()
+    
+    delta = (2 * buy_prob - 1) * df['Volume'] / avg_vol if avg_vol else 0  # Scales from -Volume to +Volume
     
     cvd = delta.cumsum()
 
@@ -268,9 +272,8 @@ def calculate_cvd_refined(data_df, window=100):
     # This tells you how "solid" the CVD trend is.
     # If r_value is -0.9, the CVD is crashing in a perfect line.
     
-    # Normalize slope by the average volume to make it asset-agnostic
-    avg_vol = df['Volume'].mean()
-    normalized_slope = slope / avg_vol 
+
+    normalized_slope = slope
 
     return normalized_slope, r_value
 
@@ -615,6 +618,17 @@ def _get_session_open(data_1m, data_1d, session_date):
     return float(regular_rows["Close"].iloc[0])
 
 
+def _resolve_day_baseline(prev_close, session_open, market_ts_et):
+    """Use the prior close before the market opens and the session open once live."""
+    if market_ts_et is None:
+        return float(prev_close)
+    if market_ts_et.time() < time(9, 30):
+        return float(prev_close)
+    if session_open is not None:
+        return float(session_open)
+    return float(prev_close)
+
+
 def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_new_data=True):
     """
     Scan one ticker and return regime metrics + actionable fields.
@@ -680,7 +694,7 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
             "Hybrid Signal": hybrid.get("signal", "N/A"),
             "Hybrid Reason": hybrid.get("signal_reason", "N/A"),
             "Hybrid VPIN": float(hybrid.get("vpin", 0.0)),
-            "Hybrid CVD Trend": hybrid.get("cvd_trend", "N/A"),
+            "Hybrid CVD Trend": hybrid.get("cvd_slope", "N/A"),
             "Hybrid Upper Band": float(hybrid.get("upper_band", np.nan)),
             "Hybrid Lower Band": float(hybrid.get("lower_band", np.nan)),
         })
@@ -761,7 +775,7 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
     latest_daily_date = daily_index[-1].date() if len(daily_index) else None
 
     # Determine the previous close for premarket vs. regular session calculations.
-    if latest_daily_date == current_session_date and len(data_1d) >= 2:
+    if latest_daily_date == current_session_date:
         prev_close = float(data_1d['Close'].iloc[-2])
     else:
         prev_close = float(data_1d['Close'].iloc[-1])
@@ -793,9 +807,9 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
     # Baseline switch:
     # - Premarket uses previous close.
     # - Regular session uses today's session open.
-    pre_market = market_ts_et.time() < time(9, 30)
+    day_baseline = _resolve_day_baseline(prev_close, session_open, market_ts_et)
 
-    gap_pct = (session_open - prev_close) / prev_close
+    gap_pct = (session_open - prev_close) / prev_close if session_open is not None else 0.0
     # print("premarket:", pre_market, "prev_close:", prev_close, "session_open:", session_open, "current_price:", current_price, "gap_pct:", gap_pct
     #       )
     # day_baseline = prev_close if pre_market else session_open
@@ -808,8 +822,8 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
     # ---------------------------------------------------------------------
     # 1. Price Action Diagnostics
     # ---------------------------------------------------------------------
-    # Intraday performance relative to open (Session acceptance)
-    day_pct = ((current_price - session_open) / session_open) * 100.0
+    # Performance relative to the active intraday baseline.
+    day_pct = ((current_price - day_baseline) / day_baseline) * 100.0
 
     # Overall performance relative to previous close (Net market state)
     net_pct = ((current_price - prev_close) / prev_close) * 100.0
@@ -888,7 +902,7 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
         
         # --- PRICE ACTION ---
         "Price": float(prices[-1]),
-        "Open": float(session_open) if session_open is not None else float(prices[0]),
+        "Open": float(session_open) if latest_daily_date == current_session_date else float(prev_close),
         "Day %": float(day_pct),
         "Day % Net": float(net_pct),
         
@@ -938,7 +952,7 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
         result.update({
             # Flow section updates
             "VPIN": float(vpin),
-            "CVD Trend": f"{cvd_slope:.2f} {cvd_label}",
+            "CVD Trend": f"{cvd_slope:.2f}",
             "CVD Threshold": float(cvd_threshold),
             # Action section updates
             "Verdict": judgment,
