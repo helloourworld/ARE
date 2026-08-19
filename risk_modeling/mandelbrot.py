@@ -569,7 +569,7 @@ def generate_suggestion(regime, judgment, entropy, alpha, h_val, vpin, cvd_slope
     # --- 3. TREND PERSISTENCE (Regime 1 & 2) ---
     if "1 - BULLISH PERSISTENCE" in regime:
         if "BEARISH DIVERGENCE" in judgment or "DISTRIBUTION" in judgment:
-            return "📉 REDUCE / TAKE PROFIT", "Trend is real (Hurst > 0.6) but aggressive sellers are dominating the tape."
+            return "📉 REDUCE / TAKE PROFIT", "In Trend (Hurst > 0.6) but aggressive sellers are dominating the tape."
         if "HEALTHY MOMENTUM" in judgment:
             return "🚀 STRONG BUY / HOLD", "Price and Order Flow are in sync. High conviction uptrend."
         return "✅ HOLD / BUY DIPS", "Healthy persistent uptrend."
@@ -854,9 +854,9 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
         tail_quality = "Tail-Stable" if alpha_eff >= TAIL_SAFE else "Tail-Caution"
         
         if is_bullish:
-            regime = f"1 - BULLISH PERSISTENCE (Trend is Real | {tail_quality})"
+            regime = f"1 - BULLISH PERSISTENCE (In Trend | {tail_quality})"
         else:
-            regime = f"2 - BEARISH PERSISTENCE (Trend is Real | {tail_quality})"
+            regime = f"2 - BEARISH PERSISTENCE (In Trend | {tail_quality})"
 
     # C. Post-Gap Regimes (Hurst is low/neutral, so intraday hold/fade dictates outcome)
     elif holding_gap_up:

@@ -641,7 +641,25 @@ with tab2:
     **Objective:** Real-time monitoring of Price vs. Benchmark.
     Use this to identify 'Slippage' and 'Relative Strength' during intraday surges.
     """)
-
+    
+    # Tactical Consultant Action
+    st.subheader("Consultant's Intraday Audit")
+    benchmark_change = st.session_state.get("live_benchmark_change_pct", 0)
+    
+    if benchmark_change > 1.5:
+        st.warning(
+            "🚨 **Momentum Risk Alert:** Benchmark is up more than 1.5% from baseline. "
+            "Melt-up conditions can reverse sharply; avoid late entries and tighten risk controls."
+        )
+    elif benchmark_change < -1.5:
+        st.error(
+            "📉 **Drawdown Alert:** Benchmark is down more than 1.5% from baseline. "
+            "Prioritize capital protection, reduce gross exposure, and focus on liquidity quality."
+        )
+    else:
+        st.info("Regime: Intraday move is within normal variance; keep execution disciplined and size by risk.")
+    
+    st.divider()
     if not selected_tickers:
         st.warning("Please select tickers in the sidebar to monitor prices.")
     else:
@@ -725,23 +743,6 @@ with tab2:
 
         except Exception as e:
             st.error(f"Execution Terminal Error: {e}")
-    
-    # Tactical Consultant Action
-    st.divider()
-    st.subheader("Consultant's Intraday Audit")
-
-    if benchmark_change > 1.5:
-        st.warning(
-            "🚨 **Momentum Risk Alert:** Benchmark is up more than 1.5% from baseline. "
-            "Melt-up conditions can reverse sharply; avoid late entries and tighten risk controls."
-        )
-    elif benchmark_change < -1.5:
-        st.error(
-            "📉 **Drawdown Alert:** Benchmark is down more than 1.5% from baseline. "
-            "Prioritize capital protection, reduce gross exposure, and focus on liquidity quality."
-        )
-    else:
-        st.info("Regime: Intraday move is within normal variance; keep execution disciplined and size by risk.")
 
 
 # =============================================================================
@@ -851,8 +852,14 @@ with tab3:
         # Display signals table
         df_signals = pd.DataFrame(all_signals).sort_values(by=["Signal/Regime", "Day % Net"], ascending=False)
         st.subheader("📊 All Risk Alert Signals")
-        st.dataframe(df_signals, hide_index=True, width='stretch')
-
+        st.dataframe(
+            df_signals,
+            hide_index=True,
+            width='stretch',
+            column_config={"Ticker": st.column_config.TextColumn("Ticker", pinned=True)},
+        )
+        
+        
         # Summary statistics
         st.subheader("🎯 Signal Summary")
         signal_counts = df_signals["Signal/Regime"].value_counts()
