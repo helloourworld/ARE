@@ -226,7 +226,7 @@ def _refresh_local_cache(local_df: pd.DataFrame, ticker: str, interval: str, fil
     if new_data.empty:
         return local_df
 
-    new_data = new_data[1:]
+    new_data = new_data[1:].dropna(how="all")  # Skip the first row to avoid overlap with last cached row
     new_data = _normalize_yf_df(new_data, interval=interval)
     combined = pd.concat([local_df, new_data])
     combined = combined[~combined.index.duplicated(keep="last")].sort_index()

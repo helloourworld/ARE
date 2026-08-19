@@ -530,7 +530,7 @@ def compute_judgment(prices, volumes, data_1m, h_val, alpha, cmf=0.0, breadth_sl
         if entropy > 2.8: # High Entropy = Chaos
             judgment = "NOISY TREND (Persistence is high but price action is erratic)"
         else:
-            judgment = "BULLISH PERSISTENCE (Clean, high-confidence trend)"
+            judgment = "PERSISTENCE Trend(Low Entropy) - Price likely to continue in the same direction"
             
     # --- REGIME D: EXHAUSTION ---
     elif h_val < 0.45 and entropy < 2.2:
@@ -810,14 +810,8 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
     day_baseline = _resolve_day_baseline(prev_close, session_open, market_ts_et)
 
     gap_pct = (session_open - prev_close) / prev_close if session_open is not None else 0.0
-    # print("premarket:", pre_market, "prev_close:", prev_close, "session_open:", session_open, "current_price:", current_price, "gap_pct:", gap_pct
+    # print("prev_close:", prev_close, "session_open:", session_open, "current_price:", current_price, "gap_pct:", gap_pct
     #       )
-    # day_baseline = prev_close if pre_market else session_open
-    # day_pct = ((current_price - day_baseline) / day_baseline) * 100.0
-    # net_pct = ((current_price - prev_close) / prev_close) * 100.0
-    # tail_state = "ACTIVE" if recent_vol > VOL_THRESHOLD else "DORMANT"
-
-
 
     # ---------------------------------------------------------------------
     # 1. Price Action Diagnostics
