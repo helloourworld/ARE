@@ -31,7 +31,12 @@ def _build_requests_session(retries: int = 3, backoff_factor: float = 1.0):
         allowed_methods=frozenset(["GET", "HEAD", "OPTIONS"]),
         raise_on_status=False,
     )
-    adapter = HTTPAdapter(max_retries=retry)
+    adapter = HTTPAdapter(
+        pool_connections=32,
+        pool_maxsize=32,
+        pool_block=False,
+        max_retries=retry,
+    )
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session

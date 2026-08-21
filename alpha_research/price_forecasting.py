@@ -14,6 +14,12 @@ Example:
 """
 
 from __future__ import annotations
+from sklearn.metrics import mean_absolute_error
+from sklearn.ensemble import HistGradientBoostingRegressor
+from joblib import dump, load
+import yfinance as yf
+import pandas as pd
+import numpy as np
 
 import argparse
 import json
@@ -36,14 +42,9 @@ if not existing_loky_cores.isdigit():
     os.environ["LOKY_MAX_CPU_COUNT"] = str(_logical_cores)
 
 # Reduce non-actionable Streamlit cache warnings when running as a CLI tool.
-logging.getLogger("streamlit.runtime.caching.cache_data_api").setLevel(logging.ERROR)
+logging.getLogger(
+    "streamlit.runtime.caching.cache_data_api").setLevel(logging.ERROR)
 
-import numpy as np
-import pandas as pd
-import yfinance as yf
-from joblib import dump, load
-from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.metrics import mean_absolute_error
 
 try:
     from data_pipeline.data_cache import get_data_persistent
@@ -137,8 +138,8 @@ class MonteCarloResult:
 @dataclass
 class RiskRulesConfig:
     min_edge_pct: float = 0.0025
-    min_prob_up: float = 0.60
-    min_reward_to_risk: float = 1.30
+    min_prob_up: float = 0.02
+    min_reward_to_risk: float = 1.10
     skip_edge_pct: float = 0.0015
     max_iqr_pct_for_small_edge: float = 0.02
     max_position_weight: float = 0.05
@@ -179,7 +180,8 @@ class DailyRiskBudgetTracker:
         return additional_tail_risk_notional <= self.remaining_notional
 
     def register(self, additional_tail_risk_notional: float) -> None:
-        self.consumed_tail_risk_notional += max(0.0, additional_tail_risk_notional)
+        self.consumed_tail_risk_notional += max(0.0,
+                                                additional_tail_risk_notional)
 
 
 def _flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -191,7 +193,8 @@ def _flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(out.columns, pd.MultiIndex):
         out.columns = out.columns.get_level_values(0)
 
-    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in out.columns]
+    keep = [c for c in ["Open", "High", "Low",
+                        "Close", "Volume"] if c in out.columns]
     out = out.loc[:, keep]
     out = out.dropna(how="all")
     return out
@@ -211,7 +214,8 @@ def _load_ohlcv_from_data_dir(ticker: str, interval: str) -> pd.DataFrame:
 def _load_ohlcv(ticker: str, interval: str, period: str, prefer_pipeline: bool = True) -> pd.DataFrame:
     """Prefer project pipeline/cache data, then local CSV cache, then yfinance."""
     if prefer_pipeline:
-        pipeline_df = get_data_persistent(ticker, interval=interval, period=period, force_refresh=False)
+        pipeline_df = get_data_persistent(
+            ticker, interval=interval, period=period, force_refresh=False)
         ohlcv = _flatten_yf_columns(pipeline_df)
         if not ohlcv.empty:
             return ohlcv
@@ -220,7 +224,8 @@ def _load_ohlcv(ticker: str, interval: str, period: str, prefer_pipeline: bool =
     if not local_df.empty:
         return local_df
 
-    raw = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
+    raw = yf.download(ticker, period=period, interval=interval,
+                      progress=False, auto_adjust=False)
     return _flatten_yf_columns(raw)
 
 
@@ -292,7 +297,8 @@ def _compute_regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[
     rmse = float(np.sqrt(np.mean(np.square(err))))
 
     denom = np.where(np.abs(y_true_arr) > 1e-12, np.abs(y_true_arr), np.nan)
-    mape = float(np.nanmean(np.abs(err) / denom)) if np.any(np.isfinite(denom)) else float("nan")
+    mape = float(np.nanmean(np.abs(err) / denom)
+                 ) if np.any(np.isfinite(denom)) else float("nan")
     return {"mae": mae, "rmse": rmse, "mape": mape}
 
 
@@ -366,7 +372,8 @@ def _search_best_hgb_params(
                 wf_metrics = _walk_forward_metrics(
                     X=X,
                     y=y,
-                    model_factory=lambda p=params: HistGradientBoostingRegressor(**p),
+                    model_factory=lambda p=params: HistGradientBoostingRegressor(
+                        **p),
                     train_min=train_min,
                     step=step,
                     direction_ref=direction_ref,
@@ -387,7 +394,8 @@ def _search_best_hgb_params(
                         )
                 if verbose:
                     current_rmse = float(wf_metrics.get("rmse", float("nan")))
-                    best_rmse = float(best_rank[0]) if best_rank is not None else float("nan")
+                    best_rmse = float(
+                        best_rank[0]) if best_rank is not None else float("nan")
                     total_elapsed = perf_counter() - search_start
                     print(
                         f"[{label}] Progress {candidate_idx}/{total} | "
@@ -397,7 +405,8 @@ def _search_best_hgb_params(
                     )
 
     if best_params is None or best_metrics is None:
-        raise ValueError("Could not determine best parameters from walk-forward search.")
+        raise ValueError(
+            "Could not determine best parameters from walk-forward search.")
 
     return best_params, best_metrics
 
@@ -499,7 +508,8 @@ def train_and_save_best_models(
             f"Not enough intraday training rows for {ticker}. Need at least 200, got {len(X_intra)}."
         )
 
-    _training_log("[training] Starting intraday hyperparameter search...", enabled=verbose)
+    _training_log(
+        "[training] Starting intraday hyperparameter search...", enabled=verbose)
     intra_params, intra_wf_metrics = _search_best_hgb_params(
         X=X_intra,
         y=y_intra,
@@ -519,7 +529,8 @@ def train_and_save_best_models(
 
     intraday_model = HistGradientBoostingRegressor(**intra_params)
     intraday_model.fit(X_intra, y_intra)
-    _training_log("[training] Intraday final model fit complete.", enabled=verbose)
+    _training_log(
+        "[training] Intraday final model fit complete.", enabled=verbose)
 
     intraday_artifact = {
         "model": intraday_model,
@@ -531,7 +542,8 @@ def train_and_save_best_models(
     }
     intraday_path = out_dir / f"{ticker.upper()}_intraday_close_model.joblib"
     dump(intraday_artifact, intraday_path)
-    _training_log(f"[training] Saved intraday model: {intraday_path}", enabled=verbose)
+    _training_log(
+        f"[training] Saved intraday model: {intraday_path}", enabled=verbose)
 
     # Daily training set and parameter search.
     _training_log(
@@ -558,14 +570,16 @@ def train_and_save_best_models(
             prefer_pipeline=use_pipeline,
         )
 
-    daily_features = _build_daily_features(daily_ohlcv, benchmark_ohlcv=benchmark_daily)
+    daily_features = _build_daily_features(
+        daily_ohlcv, benchmark_ohlcv=benchmark_daily)
     daily_target = daily_ohlcv["Close"].pct_change(1).shift(-1)
     daily_dataset = daily_features.copy()
     daily_dataset["target"] = daily_target
     daily_dataset = daily_dataset.dropna()
 
     if len(daily_dataset) < 150:
-        raise ValueError(f"Not enough daily data for ML forecast on {ticker}. Need at least 150 rows.")
+        raise ValueError(
+            f"Not enough daily data for ML forecast on {ticker}. Need at least 150 rows.")
 
     X_daily = daily_dataset[daily_features.columns]
     y_daily = daily_dataset["target"]
@@ -574,7 +588,8 @@ def train_and_save_best_models(
         enabled=verbose,
     )
 
-    _training_log("[training] Starting daily hyperparameter search...", enabled=verbose)
+    _training_log(
+        "[training] Starting daily hyperparameter search...", enabled=verbose)
     daily_params, daily_wf_metrics = _search_best_hgb_params(
         X=X_daily,
         y=y_daily,
@@ -595,9 +610,11 @@ def train_and_save_best_models(
     )
 
     daily_model = HistGradientBoostingRegressor(**daily_params)
-    daily_weights = _calculate_time_decay_weights(len(X_daily), half_life_days=TIME_DECAY_HALF_LIFE_DAYS)
+    daily_weights = _calculate_time_decay_weights(
+        len(X_daily), half_life_days=TIME_DECAY_HALF_LIFE_DAYS)
     daily_model.fit(X_daily, y_daily, sample_weight=daily_weights)
-    _training_log("[training] Daily final model fit complete.", enabled=verbose)
+    _training_log("[training] Daily final model fit complete.",
+                  enabled=verbose)
 
     daily_artifact = {
         "model": daily_model,
@@ -610,7 +627,8 @@ def train_and_save_best_models(
     }
     daily_path = out_dir / f"{ticker.upper()}_daily_next_close_model.joblib"
     dump(daily_artifact, daily_path)
-    _training_log(f"[training] Saved daily model: {daily_path}", enabled=verbose)
+    _training_log(
+        f"[training] Saved daily model: {daily_path}", enabled=verbose)
 
     manifest = {
         "ticker": ticker.upper(),
@@ -632,7 +650,8 @@ def train_and_save_best_models(
     }
     manifest_path = out_dir / f"{ticker.upper()}_forecast_models_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    _training_log(f"[training] Saved manifest: {manifest_path}", enabled=verbose)
+    _training_log(
+        f"[training] Saved manifest: {manifest_path}", enabled=verbose)
     _training_log("[training] Training run complete.", enabled=verbose)
 
     return {
@@ -692,7 +711,8 @@ def _walk_forward_metrics(
             continue
 
         if half_life_days is not None and half_life_days > 0:
-            sample_weights = _calculate_time_decay_weights(len(X_train), half_life_days=half_life_days)
+            sample_weights = _calculate_time_decay_weights(
+                len(X_train), half_life_days=half_life_days)
             model.fit(X_train, y_train, sample_weight=sample_weights)
         else:
             model.fit(X_train, y_train)
@@ -704,7 +724,8 @@ def _walk_forward_metrics(
         y_pred_all.extend(y_pred_part.tolist())
 
         if direction_ref is not None:
-            ref_part = direction_ref.iloc[train_end:test_end].to_numpy(dtype=float)
+            ref_part = direction_ref.iloc[train_end:test_end].to_numpy(
+                dtype=float)
             dir_true_all.extend(np.sign(y_true_part - ref_part).tolist())
             dir_pred_all.extend(np.sign(y_pred_part - ref_part).tolist())
         else:
@@ -713,10 +734,12 @@ def _walk_forward_metrics(
 
         windows += 1
 
-    metrics = _compute_regression_metrics(np.asarray(y_true_all, dtype=float), np.asarray(y_pred_all, dtype=float))
+    metrics = _compute_regression_metrics(np.asarray(
+        y_true_all, dtype=float), np.asarray(y_pred_all, dtype=float))
     if len(dir_true_all):
         metrics["directional_acc"] = float(
-            np.mean(np.asarray(dir_true_all, dtype=float) == np.asarray(dir_pred_all, dtype=float))
+            np.mean(np.asarray(dir_true_all, dtype=float) ==
+                    np.asarray(dir_pred_all, dtype=float))
         )
     else:
         metrics["directional_acc"] = float("nan")
@@ -727,7 +750,8 @@ def _walk_forward_metrics(
 def _load_current_price_1m(ticker: str, force_refresh: bool = False) -> float | None:
     """Return the freshest known close from 1-minute bars."""
     try:
-        one_min = get_data_persistent(ticker, interval="1m", period="2d", force_refresh=force_refresh)
+        one_min = get_data_persistent(
+            ticker, interval="1m", period="2d", force_refresh=force_refresh)
         if one_min is not None and not one_min.empty and "Close" in one_min.columns:
             return float(one_min["Close"].dropna().iloc[-1])
     except Exception:
@@ -761,10 +785,12 @@ def _build_intraday_training_data(intraday_ohlcv: pd.DataFrame) -> Tuple[pd.Data
         cum_low = np.minimum.accumulate(lows)
         cum_vol = np.cumsum(volumes)
         cum_vwap_num = np.cumsum(closes * volumes)
-        vwap = _safe_div(cum_vwap_num, np.where(cum_vol == 0.0, np.nan, cum_vol))
+        vwap = _safe_div(cum_vwap_num, np.where(
+            cum_vol == 0.0, np.nan, cum_vol))
 
         pct = pd.Series(closes).pct_change().fillna(0.0).to_numpy(dtype=float)
-        running_vol = pd.Series(pct).expanding(min_periods=5).std().fillna(0.0).to_numpy(dtype=float)
+        running_vol = pd.Series(pct).expanding(
+            min_periods=5).std().fillna(0.0).to_numpy(dtype=float)
 
         day_open = float(day["Open"].iloc[0])
         day_final_close = float(closes[-1])
@@ -794,7 +820,8 @@ def _build_intraday_training_data(intraday_ohlcv: pd.DataFrame) -> Tuple[pd.Data
 
 def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval: str = "5m") -> IntradayForecastResult:
     """Forecast today's close from current intraday state using learned intraday patterns."""
-    ohlcv = _load_ohlcv(ticker=ticker, interval=interval, period=intraday_period)
+    ohlcv = _load_ohlcv(ticker=ticker, interval=interval,
+                        period=intraday_period)
     if ohlcv.empty:
         raise ValueError(f"No intraday data returned for {ticker}.")
 
@@ -809,7 +836,8 @@ def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval:
         artifact = saved_bundle["intraday_artifact"]
         manifest = saved_bundle["manifest"]
         model = artifact["model"]
-        feature_columns = list(artifact.get("feature_columns", list(X.columns)))
+        feature_columns = list(artifact.get(
+            "feature_columns", list(X.columns)))
 
         live = _to_ny_datetime_index(ohlcv).sort_index()
         live["session"] = live.index.date
@@ -820,7 +848,8 @@ def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval:
         session_key = today["session"].iloc[-1]
         session = live[live["session"] == session_key].copy()
         if len(session) < 6:
-            raise ValueError("Current session does not have enough intraday bars for inference.")
+            raise ValueError(
+                "Current session does not have enough intraday bars for inference.")
 
         closes = session["Close"].to_numpy(dtype=float)
         highs = session["High"].to_numpy(dtype=float)
@@ -831,15 +860,18 @@ def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval:
         cum_low = np.minimum.accumulate(lows)
         cum_vol = np.cumsum(volumes)
         cum_vwap_num = np.cumsum(closes * volumes)
-        vwap = _safe_div(cum_vwap_num, np.where(cum_vol == 0.0, np.nan, cum_vol))
+        vwap = _safe_div(cum_vwap_num, np.where(
+            cum_vol == 0.0, np.nan, cum_vol))
 
         pct = pd.Series(closes).pct_change().fillna(0.0)
-        vol_so_far = float(pct.expanding(min_periods=5).std().fillna(0.0).iloc[-1])
+        vol_so_far = float(pct.expanding(
+            min_periods=5).std().fillna(0.0).iloc[-1])
 
         i = len(session) - 1
         current_close_session = float(closes[-1])
         current_close_1m = _load_current_price_1m(ticker, force_refresh=False)
-        current_close = float(current_close_1m) if current_close_1m is not None else current_close_session
+        current_close = float(
+            current_close_1m) if current_close_1m is not None else current_close_session
         session_open = float(session["Open"].iloc[0])
 
         x_live = pd.DataFrame(
@@ -859,15 +891,18 @@ def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval:
         pred_ret = float(model.predict(x_live)[0])
         pred_close = current_close * (1.0 + pred_ret)
 
-        metrics = manifest.get("intraday", {}).get("walk_forward_metrics", {}) if isinstance(manifest, dict) else {}
+        metrics = manifest.get("intraday", {}).get(
+            "walk_forward_metrics", {}) if isinstance(manifest, dict) else {}
 
         return IntradayForecastResult(
             ticker=ticker,
             current_price=current_close,
             predicted_close=pred_close,
             predicted_return_to_close=pred_ret,
-            training_rows=int(manifest.get("intraday", {}).get("training_rows", len(X))) if isinstance(manifest, dict) else len(X),
-            validation_metrics={k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))},
+            training_rows=int(manifest.get("intraday", {}).get(
+                "training_rows", len(X))) if isinstance(manifest, dict) else len(X),
+            validation_metrics={
+                k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))},
         )
 
     split = int(len(X) * 0.8)
@@ -875,19 +910,23 @@ def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval:
     X_train, X_test = X.iloc[:split], X.iloc[split:]
     y_train, y_test = y.iloc[:split], y.iloc[split:]
 
-    model_eval = HistGradientBoostingRegressor(max_depth=4, learning_rate=0.05, max_iter=400, random_state=42)
+    model_eval = HistGradientBoostingRegressor(
+        max_depth=4, learning_rate=0.05, max_iter=400, random_state=42)
     model_eval.fit(X_train, y_train)
 
     pred_test = model_eval.predict(X_test)
-    metrics = _compute_regression_metrics(y_test.to_numpy(dtype=float), pred_test)
+    metrics = _compute_regression_metrics(
+        y_test.to_numpy(dtype=float), pred_test)
     y_test_arr = y_test.to_numpy(dtype=float)
     pred_test_arr = np.asarray(pred_test, dtype=float)
-    metrics["directional_acc"] = float(np.mean(np.sign(y_test_arr) == np.sign(pred_test_arr)))
+    metrics["directional_acc"] = float(
+        np.mean(np.sign(y_test_arr) == np.sign(pred_test_arr)))
 
     wf_metrics = _walk_forward_metrics(
         X=X,
         y=y,
-        model_factory=lambda: HistGradientBoostingRegressor(max_depth=4, learning_rate=0.05, max_iter=350, random_state=42),
+        model_factory=lambda: HistGradientBoostingRegressor(
+            max_depth=4, learning_rate=0.05, max_iter=350, random_state=42),
         train_min=160,
         step=20,
         direction_ref=None,
@@ -898,7 +937,8 @@ def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval:
     metrics["wf_directional_acc"] = wf_metrics["directional_acc"]
     metrics["wf_windows"] = wf_metrics["windows"]
 
-    model = HistGradientBoostingRegressor(max_depth=4, learning_rate=0.05, max_iter=450, random_state=42)
+    model = HistGradientBoostingRegressor(
+        max_depth=4, learning_rate=0.05, max_iter=450, random_state=42)
     model.fit(X, y)
 
     live = _to_ny_datetime_index(ohlcv).sort_index()
@@ -910,7 +950,8 @@ def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval:
     session_key = today["session"].iloc[-1]
     session = live[live["session"] == session_key].copy()
     if len(session) < 6:
-        raise ValueError("Current session does not have enough intraday bars for inference.")
+        raise ValueError(
+            "Current session does not have enough intraday bars for inference.")
 
     closes = session["Close"].to_numpy(dtype=float)
     highs = session["High"].to_numpy(dtype=float)
@@ -929,7 +970,8 @@ def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval:
     i = len(session) - 1
     current_close_session = float(closes[-1])
     current_close_1m = _load_current_price_1m(ticker)
-    current_close = float(current_close_1m) if current_close_1m is not None else current_close_session
+    current_close = float(
+        current_close_1m) if current_close_1m is not None else current_close_session
     session_open = float(session["Open"].iloc[0])
 
     x_live = pd.DataFrame(
@@ -963,8 +1005,10 @@ def _rsi(close: pd.Series, window: int = 14) -> pd.Series:
     gain = delta.clip(lower=0.0)
     loss = -delta.clip(upper=0.0)
 
-    avg_gain = gain.ewm(alpha=1 / window, adjust=False, min_periods=window).mean()
-    avg_loss = loss.ewm(alpha=1 / window, adjust=False, min_periods=window).mean()
+    avg_gain = gain.ewm(alpha=1 / window, adjust=False,
+                        min_periods=window).mean()
+    avg_loss = loss.ewm(alpha=1 / window, adjust=False,
+                        min_periods=window).mean()
 
     rs = avg_gain / avg_loss.replace(0.0, np.nan)
     rsi = 100.0 - (100.0 / (1.0 + rs))
@@ -1006,23 +1050,28 @@ def _daily_feature_columns(include_market_context: bool) -> list[str]:
 def _market_context_bias(latest_features: pd.Series) -> float:
     benchmark_close = float(latest_features.get("Benchmark_Close", np.nan))
     benchmark_sma_20 = float(latest_features.get("Benchmark_SMA_20", np.nan))
-    benchmark_daily_return = float(latest_features.get("Benchmark_Daily_Return", 0.0))
-    relative_strength_5d = float(latest_features.get("Relative_Strength_5D", 0.0))
+    benchmark_daily_return = float(
+        latest_features.get("Benchmark_Daily_Return", 0.0))
+    relative_strength_5d = float(
+        latest_features.get("Relative_Strength_5D", 0.0))
 
     if not np.isfinite(benchmark_close):
         return 0.0
 
-    trend_vs_sma = (benchmark_close / benchmark_sma_20 - 1.0) if np.isfinite(benchmark_sma_20) and benchmark_sma_20 > 0.0 else 0.0
-    bias = 0.20 * benchmark_daily_return + 0.35 * trend_vs_sma + 0.25 * relative_strength_5d
+    trend_vs_sma = (benchmark_close / benchmark_sma_20 -
+                    1.0) if np.isfinite(benchmark_sma_20) and benchmark_sma_20 > 0.0 else 0.0
+    bias = 0.20 * benchmark_daily_return + 0.35 * \
+        trend_vs_sma + 0.25 * relative_strength_5d
     return float(np.clip(bias, -0.03, 0.03))
 
 
 def _build_daily_features(daily_ohlcv: pd.DataFrame, benchmark_ohlcv: pd.DataFrame | None = None) -> pd.DataFrame:
-    df = daily_ohlcv.copy().dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+    df = daily_ohlcv.copy().dropna(
+        subset=["Open", "High", "Low", "Close", "Volume"])
     df = _to_ny_datetime_index(df).sort_index()
 
     df_feat = pd.DataFrame(index=df.index)
-    
+
     close = df["Close"].astype(float)
     high = df["High"].astype(float)
     low = df["Low"].astype(float)
@@ -1030,7 +1079,8 @@ def _build_daily_features(daily_ohlcv: pd.DataFrame, benchmark_ohlcv: pd.DataFra
     volume = df["Volume"].astype(float)
 
     # Fractional differentiation keeps longer-memory structure while reducing non-stationarity.
-    df_feat["FracDiff_Close"] = _fractional_differentiation(close, d=FRAC_DIFF_D)
+    df_feat["FracDiff_Close"] = _fractional_differentiation(
+        close, d=FRAC_DIFF_D)
 
     # 1. Multi-period Returns
     df_feat["Daily_Return"] = close.pct_change(1)
@@ -1047,7 +1097,7 @@ def _build_daily_features(daily_ohlcv: pd.DataFrame, benchmark_ohlcv: pd.DataFra
     sma5 = close.rolling(5).mean()
     sma20 = close.rolling(20).mean()
     sma50 = close.rolling(50).mean()
-    
+
     df_feat["Close_vs_SMA5"] = (close / sma5) - 1.0
     df_feat["Close_vs_SMA20"] = (close / sma20) - 1.0
     df_feat["Close_vs_SMA50"] = (close / sma50) - 1.0
@@ -1056,19 +1106,22 @@ def _build_daily_features(daily_ohlcv: pd.DataFrame, benchmark_ohlcv: pd.DataFra
     # 4. Technical Indicators
     df_feat["RSI_14"] = _rsi(close, window=14) / 100.0  # Normalized [0, 1]
     df_feat["Vol_20D"] = df_feat["Daily_Return"].rolling(20).std()
-    
+
     atr14 = _atr(df[["High", "Low", "Close"]], window=14)
     df_feat["ATR_Pct_14"] = atr14 / close
 
     # 5. Volume Indicators
     vol_sma20 = volume.rolling(20).mean()
-    df_feat["Volume_vs_SMA20"] = (volume / vol_sma20.replace(0.0, np.nan)) - 1.0
+    df_feat["Volume_vs_SMA20"] = (
+        volume / vol_sma20.replace(0.0, np.nan)) - 1.0
 
     # 6. Benchmark Context (Relative Strength)
     if benchmark_ohlcv is not None and not benchmark_ohlcv.empty:
-        bm = benchmark_ohlcv.copy().dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+        bm = benchmark_ohlcv.copy().dropna(
+            subset=["Open", "High", "Low", "Close", "Volume"])
         bm = _to_ny_datetime_index(bm).sort_index()
-        bm_close = bm["Close"].astype(float).reindex(df_feat.index).ffill().bfill()
+        bm_close = bm["Close"].astype(float).reindex(
+            df_feat.index).ffill().bfill()
         bm_sma20 = bm_close.rolling(20).mean()
 
         df_feat["Benchmark_Return_1D"] = bm_close.pct_change(1)
@@ -1077,12 +1130,16 @@ def _build_daily_features(daily_ohlcv: pd.DataFrame, benchmark_ohlcv: pd.DataFra
         df_feat["Benchmark_Close_vs_SMA20"] = (bm_close / bm_sma20) - 1.0
 
         # Relative Excess Returns
-        df_feat["Relative_Return_1D"] = df_feat["Daily_Return"] - df_feat["Benchmark_Return_1D"]
-        df_feat["Relative_Return_5D"] = df_feat["Return_5D"] - df_feat["Benchmark_Return_5D"]
-        df_feat["Relative_Return_20D"] = df_feat["Return_20D"] - df_feat["Benchmark_Return_20D"]
+        df_feat["Relative_Return_1D"] = df_feat["Daily_Return"] - \
+            df_feat["Benchmark_Return_1D"]
+        df_feat["Relative_Return_5D"] = df_feat["Return_5D"] - \
+            df_feat["Benchmark_Return_5D"]
+        df_feat["Relative_Return_20D"] = df_feat["Return_20D"] - \
+            df_feat["Benchmark_Return_20D"]
 
     df_feat = df_feat.replace([np.inf, -np.inf], np.nan)
-    feature_columns = _daily_feature_columns(include_market_context=benchmark_ohlcv is not None and not benchmark_ohlcv.empty)
+    feature_columns = _daily_feature_columns(
+        include_market_context=benchmark_ohlcv is not None and not benchmark_ohlcv.empty)
     return df_feat[feature_columns]
 
 
@@ -1096,10 +1153,11 @@ def forecast_next_close_ml(ticker: str, period: str = "3y") -> DailyForecastResu
     benchmark_ticker = _benchmark_ticker_for(ticker)
     benchmark_daily = None
     if benchmark_ticker is not None:
-        benchmark_daily = _load_ohlcv(ticker=benchmark_ticker, interval="1d", period=period)
+        benchmark_daily = _load_ohlcv(
+            ticker=benchmark_ticker, interval="1d", period=period)
 
     features = _build_daily_features(ohlcv, benchmark_ohlcv=benchmark_daily)
-    
+
     # STATIONARY TARGET: Next-Day Return
     close_prices = ohlcv["Close"].astype(float)
     target_returns = close_prices.pct_change(1).shift(-1)
@@ -1110,7 +1168,8 @@ def forecast_next_close_ml(ticker: str, period: str = "3y") -> DailyForecastResu
     dataset = dataset.dropna()
 
     if len(dataset) < 150:
-        raise ValueError(f"Not enough daily data for ML forecast on {ticker}. Need at least 150 rows.")
+        raise ValueError(
+            f"Not enough daily data for ML forecast on {ticker}. Need at least 150 rows.")
 
     X = dataset[features.columns]
     y = dataset["target_return"]
@@ -1122,7 +1181,8 @@ def forecast_next_close_ml(ticker: str, period: str = "3y") -> DailyForecastResu
         artifact = saved_bundle["daily_artifact"]
         manifest = saved_bundle["manifest"]
         model = artifact["model"]
-        feature_columns = list(artifact.get("feature_columns", list(features.columns)))
+        feature_columns = list(artifact.get(
+            "feature_columns", list(features.columns)))
         target_kind = str(artifact.get("target", "next_close")).strip().lower()
 
         latest_x = X.iloc[[-1]].reindex(columns=feature_columns)
@@ -1135,17 +1195,20 @@ def forecast_next_close_ml(ticker: str, period: str = "3y") -> DailyForecastResu
         else:
             # Backward compatibility for older artifacts trained on price levels.
             pred_next_close = raw_pred
-            pred_next_return = (pred_next_close / latest_close) - 1.0 if latest_close > 0.0 else 0.0
+            pred_next_return = (pred_next_close / latest_close) - \
+                1.0 if latest_close > 0.0 else 0.0
 
         # Guardrail for stale/incompatible legacy artifacts while keeping inference fast.
         if not np.isfinite(pred_next_close) or pred_next_close <= 0.0:
             saved_bundle = None
         else:
             if abs(pred_next_return) > 0.15:
-                pred_next_return = float(np.clip(pred_next_return, -0.15, 0.15))
+                pred_next_return = float(
+                    np.clip(pred_next_return, -0.15, 0.15))
                 pred_next_close = latest_close * (1.0 + pred_next_return)
 
-            metrics = manifest.get("daily", {}).get("walk_forward_metrics", {}) if isinstance(manifest, dict) else {}
+            metrics = manifest.get("daily", {}).get(
+                "walk_forward_metrics", {}) if isinstance(manifest, dict) else {}
 
             return DailyForecastResult(
                 ticker=ticker,
@@ -1154,13 +1217,17 @@ def forecast_next_close_ml(ticker: str, period: str = "3y") -> DailyForecastResu
                 holdout_mae=float(metrics.get("mae", float("nan"))),
                 holdout_rmse=float(metrics.get("rmse", float("nan"))),
                 holdout_mape=float(metrics.get("mape", float("nan"))),
-                holdout_directional_acc=float(metrics.get("directional_acc", float("nan"))),
+                holdout_directional_acc=float(
+                    metrics.get("directional_acc", float("nan"))),
                 walk_forward_mae=float(metrics.get("mae", float("nan"))),
                 walk_forward_rmse=float(metrics.get("rmse", float("nan"))),
                 walk_forward_mape=float(metrics.get("mape", float("nan"))),
-                walk_forward_directional_acc=float(metrics.get("directional_acc", float("nan"))),
-                walk_forward_windows=int(float(metrics.get("windows", 0.0))) if metrics else 0,
-                training_rows=int(manifest.get("daily", {}).get("training_rows", len(X))) if isinstance(manifest, dict) else len(X),
+                walk_forward_directional_acc=float(
+                    metrics.get("directional_acc", float("nan"))),
+                walk_forward_windows=int(
+                    float(metrics.get("windows", 0.0))) if metrics else 0,
+                training_rows=int(manifest.get("daily", {}).get(
+                    "training_rows", len(X))) if isinstance(manifest, dict) else len(X),
                 market_context_bias_pct=0.0,
             )
 
@@ -1171,13 +1238,14 @@ def forecast_next_close_ml(ticker: str, period: str = "3y") -> DailyForecastResu
     price_test = price_ref.iloc[split:]
 
     model = HistGradientBoostingRegressor(
-        max_depth=4, 
-        learning_rate=0.03, 
-        max_iter=500, 
+        max_depth=4,
+        learning_rate=0.03,
+        max_iter=500,
         l2_regularization=1.0,
         random_state=42
     )
-    train_weights = _calculate_time_decay_weights(len(X_train), half_life_days=TIME_DECAY_HALF_LIFE_DAYS)
+    train_weights = _calculate_time_decay_weights(
+        len(X_train), half_life_days=TIME_DECAY_HALF_LIFE_DAYS)
     model.fit(X_train, y_train, sample_weight=train_weights)
 
     pred_test_returns = model.predict(X_test)
@@ -1185,17 +1253,19 @@ def forecast_next_close_ml(ticker: str, period: str = "3y") -> DailyForecastResu
     true_test_prices = price_test.to_numpy() * (1.0 + y_test.to_numpy())
 
     metrics = _compute_regression_metrics(true_test_prices, pred_test_prices)
-    directional_acc = float(np.mean(np.sign(y_test.to_numpy()) == np.sign(pred_test_returns)))
+    directional_acc = float(
+        np.mean(np.sign(y_test.to_numpy()) == np.sign(pred_test_returns)))
 
     # Fit live model on full dataset
     model_live = HistGradientBoostingRegressor(
-        max_depth=4, 
-        learning_rate=0.03, 
-        max_iter=600, 
+        max_depth=4,
+        learning_rate=0.03,
+        max_iter=600,
         l2_regularization=1.0,
         random_state=42
     )
-    live_weights = _calculate_time_decay_weights(len(X), half_life_days=TIME_DECAY_HALF_LIFE_DAYS)
+    live_weights = _calculate_time_decay_weights(
+        len(X), half_life_days=TIME_DECAY_HALF_LIFE_DAYS)
     model_live.fit(X, y, sample_weight=live_weights)
 
     # Walk-forward validation
@@ -1233,8 +1303,8 @@ def forecast_next_close_ml(ticker: str, period: str = "3y") -> DailyForecastResu
         training_rows=len(X_train),
         market_context_bias_pct=0.0,
     )
-    
-    
+
+
 def monte_carlo_gbm_close_range(
     ticker: str,
     start_price: float,
@@ -1245,7 +1315,8 @@ def monte_carlo_gbm_close_range(
     """Estimate probabilistic terminal close range with one-step GBM."""
     clean = pd.Series(daily_close_series).dropna().astype(float)
     if len(clean) < 60:
-        raise ValueError("Need at least 60 daily closes for stable GBM parameter estimation.")
+        raise ValueError(
+            "Need at least 60 daily closes for stable GBM parameter estimation.")
 
     log_ret = np.log(clean / clean.shift(1)).dropna()
     mu_annual = float(log_ret.mean() * 252.0)
@@ -1254,7 +1325,9 @@ def monte_carlo_gbm_close_range(
     dt = float(max(horizon_days, 1e-6) / 252.0)
     z = np.random.default_rng(42).standard_normal(int(n_sims))
 
-    terminal = start_price * np.exp((mu_annual - 0.5 * sigma_annual * sigma_annual) * dt + sigma_annual * np.sqrt(dt) * z)
+    terminal = start_price * \
+        np.exp((mu_annual - 0.5 * sigma_annual * sigma_annual)
+               * dt + sigma_annual * np.sqrt(dt) * z)
 
     q = {
         "p05": float(np.quantile(terminal, 0.05)),
@@ -1292,13 +1365,15 @@ def _size_position_from_quantiles(
 
     sigma = max(mc.sigma_annual, 1e-8)
     vol_scalar = np.clip(config.base_vol_target / sigma, 0.20, 1.50)
-    weight = min(config.max_position_weight, config.max_position_weight * float(vol_scalar))
+    weight = min(config.max_position_weight,
+                 config.max_position_weight * float(vol_scalar))
 
     if mc.sigma_annual >= config.high_vol_cutoff:
         weight *= config.high_vol_size_multiplier
 
     notional = portfolio_value * weight
-    downside_pct = max(0.0, (current_price - mc.quantiles["p05"]) / current_price)
+    downside_pct = max(
+        0.0, (current_price - mc.quantiles["p05"]) / current_price)
     tail_risk_notional = notional * downside_pct
 
     single_trade_cap = portfolio_value * config.max_single_trade_tail_loss_pct
@@ -1322,7 +1397,8 @@ def evaluate_intraday_trade_decision(
     reasons = []
 
     current_price = intraday.current_price
-    edge_pct = (intraday.predicted_close / current_price) - 1.0 if current_price > 0.0 else 0.0
+    edge_pct = (intraday.predicted_close / current_price) - \
+        1.0 if current_price > 0.0 else 0.0
     prob_up = mc.probability_above_start
     q25 = mc.quantiles["p25"]
     q75 = mc.quantiles["p75"]
@@ -1334,9 +1410,9 @@ def evaluate_intraday_trade_decision(
     if edge_pct < cfg.min_edge_pct:
         reasons.append("edge_below_threshold")
     if prob_up < cfg.min_prob_up:
-        reasons.append("probability_below_threshold")
+        reasons.append(rf"{{prob_up}} < {cfg.min_prob_up}")
     if reward_to_risk < cfg.min_reward_to_risk:
-        reasons.append("reward_to_risk_below_threshold")
+        reasons.append(rf"{{reward_to_risk}} < {cfg.min_reward_to_risk}")
     if abs(edge_pct) < cfg.skip_edge_pct and iqr_pct > cfg.max_iqr_pct_for_small_edge:
         reasons.append("small_edge_wide_distribution")
 
@@ -1412,7 +1488,8 @@ def run_all(
     risk_tracker: DailyRiskBudgetTracker | None = None,
     rules_config: RiskRulesConfig | None = None,
 ) -> Dict[str, object]:
-    intraday = forecast_intraday_close(ticker, intraday_period=intraday_period, interval=intraday_interval)
+    intraday = forecast_intraday_close(
+        ticker, intraday_period=intraday_period, interval=intraday_interval)
     daily = forecast_next_close_ml(ticker)
 
     daily_ohlcv = _load_ohlcv(ticker=ticker, interval="1d", period="3y")
@@ -1459,7 +1536,8 @@ def _print_summary(results: Dict[str, object]) -> None:
     print(f"Ticker: {intraday.ticker}")
     print(f"Current price: {intraday.current_price:.2f}")
     print(f"Predicted session close: {intraday.predicted_close:.2f}")
-    print(f"Predicted return to close: {intraday.predicted_return_to_close * 100:.2f}%")
+    print(
+        f"Predicted return to close: {intraday.predicted_return_to_close * 100:.2f}%")
     print(f"Intraday training rows: {intraday.training_rows}")
     print(
         "Intraday holdout metrics: "
@@ -1479,7 +1557,8 @@ def _print_summary(results: Dict[str, object]) -> None:
     print(f"Walk-forward MAE: {daily.walk_forward_mae:.4f}")
     print(f"Walk-forward RMSE: {daily.walk_forward_rmse:.4f}")
     print(f"Walk-forward MAPE: {daily.walk_forward_mape:.4f}")
-    print(f"Walk-forward Directional Acc: {daily.walk_forward_directional_acc:.2%}")
+    print(
+        f"Walk-forward Directional Acc: {daily.walk_forward_directional_acc:.2%}")
     print(f"Walk-forward windows: {daily.walk_forward_windows}")
     print(f"Daily training rows: {daily.training_rows}")
     print(f"Market-context bias: {daily.market_context_bias_pct * 100:.2f}%")
@@ -1499,7 +1578,8 @@ def _print_summary(results: Dict[str, object]) -> None:
         f"95%={mc.quantiles['p95']:.2f}"
     )
     print(f"Terminal confidence: {mc.terminal_confidence * 100:.2f}%")
-    print(f"Probability terminal > start: {mc.probability_above_start * 100:.2f}%")
+    print(
+        f"Probability terminal > start: {mc.probability_above_start * 100:.2f}%")
 
     decision = results.get("trade_decision")
     if isinstance(decision, TradeDecision):
@@ -1517,16 +1597,23 @@ def _print_summary(results: Dict[str, object]) -> None:
         remaining = results.get("risk_budget_remaining")
         total = results.get("risk_budget_total")
         if isinstance(remaining, (float, int)) and isinstance(total, (float, int)):
-            print(f"Daily risk budget remaining: {float(remaining):.2f} / {float(total):.2f}")
+            print(
+                f"Daily risk budget remaining: {float(remaining):.2f} / {float(total):.2f}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Practical ML + Monte Carlo close forecasting")
-    parser.add_argument("--ticker", type=str, default="AAPL", help="Ticker symbol (default: AAPL)")
-    parser.add_argument("--intraday-period", type=str, default="60d", help="yfinance intraday period")
-    parser.add_argument("--intraday-interval", type=str, default="5m", help="yfinance intraday interval")
-    parser.add_argument("--daily-period", type=str, default="3y", help="yfinance daily period")
-    parser.add_argument("--portfolio-value", type=float, default=0.0, help="Portfolio value for risk sizing")
+    parser = argparse.ArgumentParser(
+        description="Practical ML + Monte Carlo close forecasting")
+    parser.add_argument("--ticker", type=str, default="AAPL",
+                        help="Ticker symbol (default: AAPL)")
+    parser.add_argument("--intraday-period", type=str,
+                        default="60d", help="yfinance intraday period")
+    parser.add_argument("--intraday-interval", type=str,
+                        default="5m", help="yfinance intraday interval")
+    parser.add_argument("--daily-period", type=str,
+                        default="3y", help="yfinance daily period")
+    parser.add_argument("--portfolio-value", type=float,
+                        default=0.0, help="Portfolio value for risk sizing")
     parser.add_argument(
         "--train-save-best",
         action="store_true",

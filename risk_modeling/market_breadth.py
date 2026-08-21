@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from io import StringIO
 import requests
+from requests.adapters import HTTPAdapter
 
 
 """
@@ -31,6 +32,8 @@ session = requests.Session()
 session.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 })
+session.mount("https://", HTTPAdapter(pool_connections=64, pool_maxsize=64, pool_block=False))
+session.mount("http://", HTTPAdapter(pool_connections=64, pool_maxsize=64, pool_block=False))
 
 # -----------------------------
 # Helper: get S&P 500 tickers
