@@ -28,6 +28,7 @@ REPO_ROOT = ensure_repo_root(REPO_ROOT)
 import appdirs as ad
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import plotly.express as px
 import plotly.graph_objects as go
 import requests
@@ -57,6 +58,14 @@ from risk_modeling.market_breadth import (
 from risk_modeling.bolling_bands import compute_rolling_vpin, compute_rolling_cvd
 from data_pipeline.data_cache import DATA_DIR
 from alpha_research.price_forecasting import run_all, RiskRulesConfig
+from alpha_research.Port_Stock_dd import (
+    calculate_drawdown_analysis,
+    calculate_drawdown_stats,
+    plot_drawdown_histogram,
+    plot_multiple_stocks_from_cache,
+    plot_recovery_histogram,
+)
+from alpha_research.Port_stock_watch import plot_market_data_from_cache
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -279,7 +288,7 @@ def update_browser_tab_title():
 
         bench_series = live_data['SPY'].dropna()
         bench_current = bench_series.iloc[-1]
-        st.text(f"Current SPY Price: ${bench_current:,.2f}")
+        # st.text(f"Current SPY Price: ${bench_current:,.2f}")
         # JavaScript to dynamically update the browser tab title
         html_script = f"""
             10 {bench_current:,.2f}
@@ -409,9 +418,9 @@ if returns.empty:
     st.stop()
 
 # --- DISPLAY METADATA ---
-st.title(cfg['metadata']['report_title'])
-st.caption(
-    f"Analyst: {cfg['metadata']['analyst_name']} | Strategy: {cfg['metadata']['strategy_id']}")
+# st.title(cfg['metadata']['report_title'])
+# st.caption(
+#     f"Analyst: {cfg['metadata']['analyst_name']} | Strategy: {cfg['metadata']['strategy_id']}")
 render_headline_benchmark_alert()
 
 # Access parameters for math
@@ -430,9 +439,10 @@ market_caps = {ticker: yf.Ticker(ticker).info.get(
 
 
 # --- APP TABS ---
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, *rest = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab_dd, tab_watch, *rest = st.tabs(
     ["📈 MARKET BREADTH", "⚖️LIVE MARKET", "📊 MARKET RISK", "📡 ALPHA PERSISTENCE", "🔮 FORECAST PORTAL",
-     "🧠 FACTOR ATTRIBUTION", "🛡️ RISK REPORT", "📶 REBALANCING (BL)", "🧭 EFFICIENT FRONTIER", "🧪 SCENARIO STRESS TEST",])
+     "🧠 FACTOR ATTRIBUTION", "🛡️ RISK REPORT", "📶 REBALANCING (BL)", "🧭 EFFICIENT FRONTIER", "🧪 SCENARIO STRESS TEST",
+     "DD", "Watch"])
 
 # =============================================================================
 # TAB 1: MARKET BREADTH PORTAL
@@ -824,6 +834,30 @@ with tab3:
                             volume_data = intraday[['Volume']].copy()
                             volume_data.index = pd.to_datetime(volume_data.index, errors="coerce")
                             volume_data = volume_data[~volume_data.index.isna()].sort_index()
+                            if volume_data.index.tz is None:
+                                volume_data.index = volume_data.index.tz_localize("America/New_York")
+                            else:
+                                volume_data.index = volume_data.index.tz_convert("America/New_York")
+
+                            # Keep regular-session bars with real traded volume only.
+                            volume_data["Volume"] = pd.to_numeric(volume_data["Volume"], errors="coerce")
+                            session_mask = (
+                                (volume_data.index.dayofweek < 5)
+                                & (volume_data.index.time >= datetime.time(9, 30))
+                                & (volume_data.index.time < datetime.time(16, 0))
+                                & (volume_data["Volume"] > 0)
+                            )
+                            volume_data = volume_data.loc[session_mask].dropna(subset=["Volume"])
+
+                            if not volume_data.empty:
+                                first_quartile = volume_data["Volume"].quantile(0.25)
+                                third_quartile = volume_data["Volume"].quantile(0.75)
+                                iqr = third_quartile - first_quartile
+                                if iqr > 0:
+                                    upper_outlier_limit = third_quartile + 3 * iqr
+                                    volume_data = volume_data[
+                                        volume_data["Volume"] <= upper_outlier_limit
+                                    ]
                             
                             if volume_data.empty:
                                 continue
@@ -969,7 +1003,6 @@ with tab4:
     st.markdown("""
     **Objective:** Identify 'Institutional Footprints'.
     We look for assets with **RS Score > 0** (Outperforming) and **Positive Slope** (Accumulating).
-
     """)
 
     # 1. Setup Universe & Benchmark
@@ -1683,7 +1716,96 @@ with tab10:
              Note that **REMD.NE** (Emerging Markets) may show negative contagion due to risk-off sentiment
              in Taiwan/Korea foundries.
              """)
-     
+
+# =============================================================================
+# TAB: PORTFOLIO DRAWDOWN
+# =============================================================================
+with tab_dd:
+    st.header("Portfolio Drawdown")
+
+    dd_tickers = st.multiselect(
+        "Drawdown tickers", options=sorted(set(globals().get('all_monitor_tickers', [])+cfg['universe']['benchmarks'])),
+        default=selected_benchmark, key="dd_tickers")
+    if dd_tickers:
+        with st.spinner("Loading cached drawdown history..."):
+            dd_fig = plot_multiple_stocks_from_cache(dd_tickers)
+        if dd_fig is None:
+            st.warning(
+                "No cached daily data is available for the selected tickers.")
+        else:
+            st.pyplot(dd_fig, width="stretch")
+            plt.close(dd_fig)
+        
+        dd_threshold_pct = st.slider(
+        "Minimum drawdown threshold (%)",
+        min_value=0.0,
+        max_value=20.0,
+        value=2.0,
+        step=0.5,
+        key="dd_threshold_pct",
+        help="Exclude drawdown observations and events smaller than this threshold.",
+    )    
+        if st.button("Calculate Drawdown Stats", key="dd_stats"):
+            with st.spinner("Calculating drawdown statistics..."):
+                dd_analysis = calculate_drawdown_analysis(
+                    dd_tickers, threshold=dd_threshold_pct / 100
+                )
+                dd_stats = dd_analysis["stats"]
+            if dd_stats.empty:
+                st.warning("No cached daily data is available for the selected tickers.")
+            else:
+                st.subheader("Drawdown Statistics")
+                st.dataframe(
+                    dd_stats.style.format({
+                        "Current Drawdown": "{:.2%}",
+                        "Average Drawdown": "{:.2%}",
+                        "Average Event Drawdown": "{:.2%}",
+                        "Maximum Drawdown": "{:.2%}",
+                        "Average Recovery Days": "{:.1f}",
+                    }),
+                    width="stretch",
+                    hide_index=True,
+                )
+                st.subheader("Drawdown Series")
+                st.dataframe(
+                    dd_analysis["series"].tail(250).style.format("{:.2%}"),
+                    width="stretch",
+                )
+                st.subheader("Drawdown and Recovery Distributions")
+                hist_col1, hist_col2 = st.columns(2)
+                with hist_col1:
+                    dd_hist = plot_drawdown_histogram(dd_analysis)
+                    st.pyplot(dd_hist, width="stretch")
+                    plt.close(dd_hist)
+                with hist_col2:
+                    recovery_hist = plot_recovery_histogram(dd_analysis)
+                    st.pyplot(recovery_hist, width="stretch")
+                    plt.close(recovery_hist)
+                with st.expander("Drawdown event detail"):
+                    st.dataframe(dd_analysis["events"], width="stretch", hide_index=True)
+    else:
+        st.info("Select at least one ticker to display drawdown history.")
+
+# =============================================================================
+# TAB: MARKET WATCH
+# =============================================================================
+with tab_watch:
+    st.header("Market Watch")
+    watch_tickers = st.multiselect(
+        "Watch tickers", options=sorted(set(globals().get('all_monitor_tickers', [])+cfg['universe']['benchmarks'])),
+        default=selected_benchmark, key="watch_tickers")
+    if watch_tickers:
+        with st.spinner("Loading cached market history..."):
+            watch_fig = plot_market_data_from_cache(watch_tickers)
+        if watch_fig is None:
+            st.warning(
+                "No cached daily data is available for the selected tickers.")
+        else:
+            st.pyplot(watch_fig, width="stretch")
+            plt.close(watch_fig)
+    else:
+        st.info("Select at least one ticker to display the market watch.")
+
 
 # --- FOOTER: DECISION LOG ---
 st.divider()
