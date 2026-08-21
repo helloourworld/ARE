@@ -86,7 +86,7 @@ def download_prices(tickers, period="2y"):
         auto_adjust=True,
         progress=False,
         threads=True,
-        session=session  # Use the custom session with headers to avoid 403 errors
+        # Let yfinance manage its own session (curl_cffi required for recent yfinance)
     )
 
     # yfinance returns a MultiIndex when multiple tickers are requested
@@ -115,7 +115,7 @@ def download_etfs(period="2y"):
         auto_adjust=True,
         progress=False,
         threads=True,
-        session=session  # Use the custom session with headers to avoid 403 errors
+        # Let yfinance manage its own session (curl_cffi required for recent yfinance)
     )
 
     # Reuse same normalization logic as download_prices for ETF list
@@ -147,7 +147,7 @@ def append_current_prices(close_df, tickers):
                 auto_adjust=True,
                 progress=False,
                 threads=True,
-                session=session  # Use the custom session with headers to avoid 403 errors
+                # Let yfinance manage its own session (curl_cffi required for recent yfinance)
             )
 
             if isinstance(current_data.columns, pd.MultiIndex):
