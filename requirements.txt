@@ -12,3 +12,5 @@ pyyaml
 appdirs
 pandas_ta
 torch
+seaborn
+schedule
