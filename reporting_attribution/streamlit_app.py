@@ -139,7 +139,8 @@ RS_WINDOW = 50
 RS_LOOKBACK_WINDOW = 200
 ANNUAL_TRADING_DAYS = 252
 BUBBLE_Z_THRESHOLD = 2.5
-BUBBLE_PCT_FALLBACK = 50.0
+BUBBLE_MIN_DISTANCE_PCT = 15.0
+BUBBLE_PCT_FALLBACK = BUBBLE_MIN_DISTANCE_PCT
 
 
 def get_regime_icon(regime: str) -> str:
@@ -255,6 +256,14 @@ def format_vol_color(value: float) -> str:
     if value >= vol_threshold * 2:
         return "red"
     if value >= vol_threshold:
+        return "orange"
+    return "green"
+
+
+def format_stress_color(value: float) -> str:
+    if value >= 85.0:
+        return "red"
+    if value >= 60.0:
         return "orange"
     return "green"
 
@@ -441,8 +450,8 @@ market_caps = {ticker: yf.Ticker(ticker).info.get(
 # --- APP TABS ---
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab_dd, tab_watch, *rest = st.tabs(
     ["📈 MARKET BREADTH", "⚖️LIVE MARKET", "📊 MARKET RISK", "📡 ALPHA PERSISTENCE", "🔮 FORECAST PORTAL",
-     "🧠 FACTOR ATTRIBUTION", "🛡️ RISK REPORT", "📶 REBALANCING (BL)", "🧭 EFFICIENT FRONTIER", "🧪 SCENARIO STRESS TEST",
-     "DD", "Watch"])
+    "🧠 FACTOR ATTRIBUTION", "🛡️ RISK REPORT", "📶 REBALANCING (BL)", "🧭 EFFICIENT FRONTIER", "🧪 SCENARIO STRESS TEST",
+    "📉 DrawDown", "👀 Watch List"])
 
 # =============================================================================
 # TAB 1: MARKET BREADTH PORTAL
@@ -805,12 +814,10 @@ with tab3:
                     "Tail Index": f"{result.get('Tail Index', 0.0):.3f}",
                     
                     # --- RISK ASSESSMENT ---
-                    "Fragility": result.get('Fragility Alert', ''),
+                    "Fragility": f"{result.get('Fragility Icon', '')} {result.get('Fragility Interpretation', 'N/A')} ({result.get('Fragility Score', 0.0):.1f})",
+                    "Stress": f"{result.get('Stress Icon', '⚪')} {result.get('Stress Score', float('nan')):.1f} ({result.get('Stress Risk Level', 'unavailable')})",
                     
                     # --- FLOW & LIQUIDITY ---
-                    "Hybrid Signal": result.get('Hybrid Signal', 'N/A'),
-                    "Hybrid VPIN": f"{result.get('Hybrid VPIN', 0.0):.3f}",                    
-                    "Hybrid CVD": f"{get_cvd_icon(result.get("Hybrid CVD Trend", "N/A"))} {result.get('Hybrid CVD Trend', 'N/A')}",
                     "VPIN": f"{result.get('VPIN', 0.0):.3f}",
                     "CVD Trend": f"{cvd_icon} {result.get('CVD Trend', 'N/A')}",
                     "CVD Threshold": f"{result.get('CVD Threshold', 0.0):.3f}",
@@ -876,7 +883,7 @@ with tab3:
                                 yaxis_title="Volume",
                                 hovermode='x unified'
                             )
-                            out_dir = DATA_DIR / 'hybrid_plots'
+                            out_dir = DATA_DIR / 'volume_plots'
                             out_dir.mkdir(parents=True, exist_ok=True)
                             out_file = out_dir / f"{ticker}_volume.html"
                             fig.write_html(str(out_file))
@@ -949,14 +956,16 @@ with tab3:
                 st.write(f"**Calibrated CVD Threshold:** {result.get('CVD Threshold', 0.0):.3f}")
             st.write(f"**Tail Quality:** {result.get('Tail Quality', 'N/A')}")
             render_metric_with_threshold(
-                "Hybrid Signal VPIN",
-                result.get('Hybrid VPIN', 0.0),
-                "< 0.45 = Accumulate bias, > 0.70 = Exit bias",
-                format_vpin_color(result.get('Hybrid VPIN', 0.0)),
-                precision=3
+                "Stress Score",
+                result.get('Stress Score', float('nan')),
+                "< 60 = Normal, >= 60 = Watch, >= 85 = Critical",
+                format_stress_color(result.get('Stress Score', 0.0)),
+                precision=2
             )
-            st.write(f"**Hybrid Signal:** {result.get('Hybrid Signal', 'N/A')} | {result.get('Hybrid Reason', '')}")
-            st.write(f"**Hybrid CVD Trend:** {result.get('Hybrid CVD Trend', 'N/A')}")
+            st.write(
+                f"**Stress Risk Level:** {result.get('Stress Icon', '⚪')} "
+                f"{result.get('Stress Risk Level', 'unavailable').title()}"
+            )
             render_metric_with_threshold(
                 "Intraday Volatility",
                 result['Intraday Vol'],
@@ -973,8 +982,15 @@ with tab3:
             st.write(f"**Verdict:** {result['Verdict']}")
             st.write(f"**Suggestion:** {result['Suggestion']}")
             st.write(f"**Reason:** {result['Reason']}")
+            fragility_text = (
+                f"{result.get('Fragility Icon', '')} "
+                f"{result.get('Fragility Interpretation', 'N/A')} | "
+                f"Score: {result['Fragility Score']:.2f} / 100"
+            )
             if result.get("Fragility Alert"):
-                st.error(f"⚠️ {result['Fragility Alert']} | Score: {result['Fragility Score']:.2f}")
+                st.error(f"{fragility_text} | {result['Fragility Alert']}")
+            else:
+                st.write(f"**Fragility:** {fragility_text}")
 
    
     st.divider()
@@ -1006,21 +1022,34 @@ with tab4:
     """)
 
     # 1. Setup Universe & Benchmark
-    # We use user-selected benchmark, and always include SPY as institutional reference.
     rs_benchmark = st.selectbox("RS Reference Benchmark", [
-                                "XWD.TO", "XEQT.TO", "SPY"], index=2)
-    st.caption("Institutional baseline is always tracked vs SPY in addition to the selected benchmark.")
+                                "Auto (Canada: XIU / US: SPY)", "XWD.TO", "XEQT.TO", "SPY"], index=0)
+    auto_rs_benchmark = rs_benchmark.startswith("Auto")
+    st.caption(
+        "Auto mode uses XIU.TO for Canadian-listed tickers and SPY for US tickers."
+        if auto_rs_benchmark
+        else f"All assets are compared with {rs_benchmark}."
+    )
 
     # Combined Universe from your SD and Managed accounts
     rs_universe = list(set(cfg['defaults']['selected_portfolio'] +
                        [ticker.upper() for ticker in st.session_state['external_tickers']]))
+
+    benchmark_for_ticker = {
+        ticker: (
+            ("XIU.TO" if ticker.endswith(".TO") else "SPY")
+            if auto_rs_benchmark else rs_benchmark
+        )
+        for ticker in rs_universe
+    }
+    benchmark_tickers = sorted(set(benchmark_for_ticker.values()) | {"SPY"})
 
     # 2. Process RS Signals
     rs_results = []
 
     # Fetch 2 years of data for the 52-week SMA
     rs_data = get_price_history_with_benchmark(
-        rs_universe, rs_benchmark, period="2y", interval="1d")
+        rs_universe + benchmark_tickers, "SPY", period="2y", interval="1d")
 
     # Always include SPY context, even when user selects another benchmark.
     spy_ref_series = None
@@ -1039,8 +1068,9 @@ with tab4:
             spy_ref_series = spy_ref_series.reindex(rs_data.index).ffill().bfill()
 
     for t in rs_universe:
+        ticker_benchmark = benchmark_for_ticker[t]
         mrs_series, slope_series = calculate_mansfield_rs(
-            rs_data[t], rs_data[rs_benchmark])
+            rs_data[t], rs_data[ticker_benchmark])
 
         # ratio = rs_data[t] / rs_data[rs_benchmark]
 
@@ -1102,25 +1132,35 @@ with tab4:
         else:
             hook_status = "Steady"
 
-        # Dynamic bubble alert: compare extension above 200DMA versus its own 252-day extension volatility.
+        # Dynamic bubble alert: use percentage extension so price level does not distort the z-score.
         price_200ma = rs_data[t].ffill().rolling(
             window=RS_LOOKBACK_WINDOW).mean()
         dist_from_200ma = (rs_data[t].ffill().iloc[-1] /
                            price_200ma.ffill().iloc[-1] - 1) * 100
 
-        extension = rs_data[t].ffill() - price_200ma
+        extension = rs_data[t].ffill() / price_200ma - 1.0
+        extension_mean = extension.rolling(window=252, min_periods=126).mean()
         extension_std = extension.rolling(window=252, min_periods=126).std()
 
         ext_now = float(extension.ffill().iloc[-1]) if not extension.empty else float("nan")
+        ext_mean_now = float(extension_mean.ffill().iloc[-1]) if not extension_mean.empty else float("nan")
         ext_std_now = float(extension_std.ffill().iloc[-1]) if not extension_std.empty else float("nan")
 
-        if np.isfinite(ext_now) and np.isfinite(ext_std_now) and ext_std_now > 1e-9:
-            extension_z = ext_now / ext_std_now
+        if (
+            np.isfinite(ext_now)
+            and np.isfinite(ext_mean_now)
+            and np.isfinite(ext_std_now)
+            and ext_std_now > 1e-9
+        ):
+            extension_z = (ext_now - ext_mean_now) / ext_std_now
         else:
             extension_z = float("nan")
 
         if np.isfinite(extension_z):
-            if extension_z >= BUBBLE_Z_THRESHOLD and dist_from_200ma > 0:
+            if (
+                extension_z >= BUBBLE_Z_THRESHOLD
+                and dist_from_200ma >= BUBBLE_MIN_DISTANCE_PCT
+            ):
                 bubble_alert = (
                     f"🚨 BURRY ALERT: Z={extension_z:.2f}σ | Overextended: {dist_from_200ma:.2f}%"
                 )
@@ -1135,6 +1175,7 @@ with tab4:
             "Ticker": t,
             "RS Score": round(current_score, 2),
             "RS Trend": round(current_slope, 2),
+            "RS Benchmark": ticker_benchmark,
             "RS Score vs SPY": round(current_score_spy, 2) if pd.notna(current_score_spy) else np.nan,
             "RS Trend vs SPY": round(current_slope_spy, 2) if pd.notna(current_slope_spy) else np.nan,
             "Institutional Signal": signal,
@@ -1145,8 +1186,11 @@ with tab4:
 
         # breakpoint()
     # 3. RS Ranking Table
-    rs_df = pd.DataFrame(rs_results).sort_values(
-        by="RS Score", ascending=False)
+    rs_df = (
+        pd.DataFrame(rs_results)
+        .dropna(subset=["RS Score", "RS Trend"])
+        .sort_values(by="RS Score", ascending=False)
+    )
 
     def color_signal(val):
         color = 'red' if 'Avoid' in val else 'green' if 'Accumulation' in val else 'orange' if 'Early' in val else 'blue'
@@ -1172,7 +1216,7 @@ with tab4:
         color="Institutional Signal",
         labels={
             "RS Score": "Outperformance (Mansfield)", "RS Trend": "Momentum (5D Slope)"},
-        title=f"Relative Strength Quadrant vs {rs_benchmark}"
+        title="Relative Strength Quadrant (Auto benchmark by ticker)" if auto_rs_benchmark else f"Relative Strength Quadrant vs {rs_benchmark}"
     )
     # Add quadrant lines
     fig_quad.add_hline(y=0, line_dash="dash", line_color="gray")
@@ -1189,8 +1233,9 @@ with tab4:
                             rs_universe, index=rs_universe.index("GOOG"))
 
     # Recalculate for specific ticker
+    target_benchmark = benchmark_for_ticker[target_t]
     mrs_t, slope_t = calculate_mansfield_rs(
-        rs_data[target_t], rs_data[rs_benchmark])
+        rs_data[target_t], rs_data[target_benchmark])
     sma_t, upper_t, lower_t, rs_series_t = calculate_rs_bollinger_bands(mrs_t)
     # # check the data first:
     # print(f"Upper Band for {target_t}:\n{upper_t}")
@@ -1220,7 +1265,7 @@ with tab4:
                         0]*len(mrs_t), name="Institutional Floor (0)", line=dict(color='red', width=1)))
 
     fig_bands.update_layout(
-        title=f"Statistical RS Bands: {target_t} vs {rs_benchmark}",
+        title=f"Statistical RS Bands: {target_t} vs {target_benchmark}",
         yaxis_title="RS Score (%)",
         template="plotly_dark",
         hovermode="x unified"

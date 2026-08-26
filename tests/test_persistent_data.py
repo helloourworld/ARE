@@ -50,6 +50,30 @@ def test_get_data_persistent_uses_existing_cache(tmp_path, monkeypatch):
     assert result.index.tz is None
 
 
+def test_get_data_persistent_initial_daily_download_uses_two_years(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "data"
+    cache_dir.mkdir()
+    yahoo = DummyYF(pd.DataFrame(
+        {"Open": [10.0], "High": [11.0], "Low": [9.0], "Close": [10.5], "Volume": [1000]},
+        index=pd.to_datetime(["2024-01-01"]),
+    ))
+
+    monkeypatch.setattr(data_cache, "DATA_DIR", cache_dir)
+    monkeypatch.setattr(data_cache, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(data_cache, "yf", yahoo)
+    monkeypatch.setattr(data_cache, "IB_FALLBACK_ENABLED", False)
+
+    result = data_cache.get_data_persistent("NEW", interval="1d", period="5d")
+
+    assert not result.empty
+    assert yahoo.calls == [{
+        "ticker": "NEW",
+        "period": "2y",
+        "interval": "1d",
+        "start": None,
+    }]
+
+
 def test_get_daily_returns_includes_start_date_return_and_excludes_today(monkeypatch):
     dates = pd.date_range("2024-01-02", periods=4, freq="D")
     prices = pd.DataFrame(

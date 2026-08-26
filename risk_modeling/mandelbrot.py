@@ -19,25 +19,50 @@ except ImportError:
             sys.path.insert(0, str(package_root))
         from liquidity import calculate_liquidity_signals
 try:
-    from .bolling_bands import get_hybrid_risk_signal
+    from .fragility import FragilityConfig, calculate_fragility_score as calculate_production_fragility_score
 except ImportError:
     try:
-        from risk_modeling.bolling_bands import get_hybrid_risk_signal
+        from risk_modeling.fragility import FragilityConfig, calculate_fragility_score as calculate_production_fragility_score
     except ImportError:
         package_root = Path(__file__).resolve().parent.parent
         if str(package_root) not in sys.path:
             sys.path.insert(0, str(package_root))
-        from bolling_bands import get_hybrid_risk_signal
+        from fragility import FragilityConfig, calculate_fragility_score as calculate_production_fragility_score
 try:
-    from ..data_pipeline.data_cache import get_data_persistent
+    from .stress import calculate_stress_score as calculate_production_stress_score
 except ImportError:
     try:
-        from data_pipeline.data_cache import get_data_persistent
+        from risk_modeling.stress import calculate_stress_score as calculate_production_stress_score
     except ImportError:
         package_root = Path(__file__).resolve().parent.parent
         if str(package_root) not in sys.path:
             sys.path.insert(0, str(package_root))
-        from data_pipeline.data_cache import get_data_persistent
+        from stress import calculate_stress_score as calculate_production_stress_score
+try:
+    from ..data_pipeline.data_cache import (
+        FRED_HIGH_YIELD_SERIES,
+        FRED_INVESTMENT_GRADE_SERIES,
+        get_data_persistent,
+        get_fred_series_persistent,
+    )
+except ImportError:
+    try:
+        from data_pipeline.data_cache import (
+            FRED_HIGH_YIELD_SERIES,
+            FRED_INVESTMENT_GRADE_SERIES,
+            get_data_persistent,
+            get_fred_series_persistent,
+        )
+    except ImportError:
+        package_root = Path(__file__).resolve().parent.parent
+        if str(package_root) not in sys.path:
+            sys.path.insert(0, str(package_root))
+        from data_pipeline.data_cache import (
+            FRED_HIGH_YIELD_SERIES,
+            FRED_INVESTMENT_GRADE_SERIES,
+            get_data_persistent,
+            get_fred_series_persistent,
+        )
         
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -45,12 +70,9 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = REPO_ROOT / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR = REPO_ROOT / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_SCAN_LOG_PATH = LOG_DIR / "mandelbrot_scan.log"
-FRAGILITY_CALIBRATION_PATH = DATA_DIR / "fragility_calibration.csv"
 _LAST_SCAN_BAR_TS = {}
 _LAST_SCAN_RESULT = {}
 
@@ -97,17 +119,10 @@ TAIL_SAFE = 1.70              # Required for Regime 1/2 stability
 # Volatility: For Active vs. Dormant Risk
 VOL_LOOKBACK = 30             # 30-minute window for "Current Vol"
 VOL_THRESHOLD = 0.0015        # Threshold to define "Active" movement
-FRAGILITY_THRESHOLD = 35.0    # Tuned trigger: avoids low-signal criticals while preserving severe cases
-FRAGILITY_CMF_MIN = 0.12      # Stronger downside flow gate to reduce fragility false positives
-FRAGILITY_BREADTH_MIN = -0.002  # Require clearer negative breadth confirmation
-FRAGILITY_VOL_FLOOR_RATIO = 0.35  # Adaptive floor vs VOL_THRESHOLD to avoid divide-by-micro-vol noise
-FRAGILITY_UNIVERSE_Q = 0.80   # Cross-sectional score quantile for dynamic critical trigger
-FRAGILITY_THRESHOLD_MIN = 25.0
-FRAGILITY_THRESHOLD_MAX = 60.0
-FRAGILITY_CAL_MIN_SAMPLES = 8
 
 # Others
 GAP_THRESHOLD = 0.05  # e.g., 0.05 = 5% or 0.005 = 0.5% depending on scale
+BROAD_ETF_TICKERS = {"XDIV.TO", "XEQT.TO", "XIU.TO"}
 # ============================================================================
 # 2. FRACTAL MATHEMATICS
 # ============================================================================
@@ -303,172 +318,104 @@ def calibrate_cvd_threshold(data_df, lookback=240, base_threshold=0.03):
     return float(np.clip(adaptive, 0.02, 0.25))
 
 
-def _get_universe_symbols_from_cache(max_symbols=80):
-    """Infer active symbol universe from local 1m cache files."""
-    symbols = []
-    for path in sorted(DATA_DIR.glob("cache_*_1m.csv")):
-        stem = path.stem
-        if not stem.startswith("cache_") or not stem.endswith("_1m"):
-            continue
-        symbol = stem[len("cache_"):-len("_1m")]
-        if symbol:
-            symbols.append(symbol)
-    return symbols[:max_symbols]
-
-
-def _load_fragility_calibration(session_date):
-    """Load a same-day universe calibration if present and valid."""
-    if not FRAGILITY_CALIBRATION_PATH.exists():
-        return None
-    try:
-        cal = pd.read_csv(FRAGILITY_CALIBRATION_PATH)
-        if cal.empty or "date" not in cal.columns or "threshold" not in cal.columns:
-            return None
-        same_day = cal.loc[cal["date"].astype(str) == str(session_date)]
-        if same_day.empty:
-            return None
-        sample_size = int(same_day.get("sample_size", pd.Series([0])).iloc[-1])
-        if sample_size < FRAGILITY_CAL_MIN_SAMPLES:
-            return None
-        threshold = float(same_day["threshold"].iloc[-1])
-        return float(np.clip(threshold, FRAGILITY_THRESHOLD_MIN, FRAGILITY_THRESHOLD_MAX))
-    except Exception:
-        return None
-
-
-def _save_fragility_calibration(session_date, threshold, sample_size):
-    """Persist daily calibration for reuse across scans."""
-    row = pd.DataFrame([
-        {
-            "date": str(session_date),
-            "threshold": float(threshold),
-            "sample_size": int(sample_size),
-        }
-    ])
-    try:
-        if FRAGILITY_CALIBRATION_PATH.exists():
-            old = pd.read_csv(FRAGILITY_CALIBRATION_PATH)
-            old = old.loc[old.get("date", pd.Series(dtype=str)).astype(str) != str(session_date)]
-            out = pd.concat([old, row], ignore_index=True)
-        else:
-            out = row
-        out.to_csv(FRAGILITY_CALIBRATION_PATH, index=False)
-    except Exception as exc:
-        logger.debug("Failed to persist fragility calibration | error=%s", exc)
-
-
-def calibrate_fragility_threshold_for_session(session_date, benchmark_df=None, base_threshold=FRAGILITY_THRESHOLD):
-    """Calibrate fragility threshold from same-day cross-sectional universe scores.
-
-    The goal is to keep CRITICAL alerts sparse and meaningful as market-wide
-    volatility/liquidity regimes drift.
-    """
-    cached = _load_fragility_calibration(session_date)
-    if cached is not None:
-        return float(cached)
-
-    symbols = _get_universe_symbols_from_cache(max_symbols=80)
-    if not symbols:
-        return float(base_threshold)
-
-    if benchmark_df is None or benchmark_df.empty:
-        benchmark_df = get_data_persistent("RSP", "1d")
-
-    scores = []
-    for symbol in symbols:
-        try:
-            data_1m = get_data_persistent(symbol, "1m")
-            data_1d = get_data_persistent(symbol, "1d")
-            if data_1m is None or data_1d is None or data_1m.empty or data_1d.empty:
-                continue
-            if len(data_1m) < (HURST_WINDOW + 1):
-                continue
-
-            prices = data_1m["Close"].values
-            volumes = data_1m["Volume"].values
-            returns_1m = np.diff(np.log(prices))
-            if len(returns_1m) < VOL_LOOKBACK:
-                continue
-
-            h_val = calculate_hurst_vw(prices, volumes, window=HURST_WINDOW)
-            recent_vol = float(np.std(returns_1m[-VOL_LOOKBACK:]))
-
-            if benchmark_df is None or benchmark_df.empty:
-                liq = {"cmf": 0.0, "breadth_slope": 0.0}
-            else:
-                liq = calculate_liquidity_signals(data_1d, benchmark_df)
-
-            fragility = calculate_fragility_score(
-                recent_vol=recent_vol,
-                returns_1m=returns_1m,
-                cmf=liq.get("cmf", 0.0),
-                breadth_slope=liq.get("breadth_slope", 0.0),
-                h_val=h_val,
-                threshold=base_threshold,
-            )
-
-            # Use full cross-section (including low/zero scores) so the threshold
-            # tracks universe-wide tape conditions instead of only stressed names.
-            scores.append(float(fragility["score"]))
-        except Exception:
-            continue
-
-    if len(scores) < FRAGILITY_CAL_MIN_SAMPLES:
-        threshold = float(base_threshold)
-    else:
-        q_score = float(np.quantile(scores, FRAGILITY_UNIVERSE_Q))
-        threshold = float(np.clip(q_score, FRAGILITY_THRESHOLD_MIN, FRAGILITY_THRESHOLD_MAX))
-
-    _save_fragility_calibration(session_date, threshold, len(scores))
-    return threshold
-
-
-def calculate_fragility_score(recent_vol, returns_1m, cmf, breadth_slope, h_val, threshold=FRAGILITY_THRESHOLD):
-    """Compute a robust fragility score with adaptive vol floor and flow/breadth confirmation.
-
-    Why this is more stable:
-    - Uses a percentile-based volatility floor to prevent low-volatility explosions.
-    - Requires downside money flow to be present before scoring.
-    - Penalizes negative breadth and weak memory regimes.
-    """
-    downside_cmf = max(-float(cmf), 0.0)
-
-    ret = np.asarray(returns_1m[-180:], dtype=float)
-    if ret.size > 0:
-        abs_ret = np.abs(ret)
-        vol_floor = float(np.percentile(abs_ret, 60))
-    else:
-        vol_floor = VOL_THRESHOLD
-
-    adaptive_floor = max(VOL_THRESHOLD * FRAGILITY_VOL_FLOOR_RATIO, vol_floor, 1e-6)
-    effective_vol = max(float(recent_vol), adaptive_floor)
-
-    flow_component = downside_cmf / effective_vol
-    breadth_multiplier = 1.0 + min(max(-float(breadth_slope), 0.0) * 40.0, 1.0)
-    memory_multiplier = 1.15 if float(h_val) < 0.53 else 1.0
-    score = float(flow_component * breadth_multiplier * memory_multiplier)
-
-    is_critical = (
-        downside_cmf > FRAGILITY_CMF_MIN
-        and float(breadth_slope) < FRAGILITY_BREADTH_MIN
-        and float(h_val) < 0.55
-        and score > float(threshold)
+def _fragility_histories(data_1d, benchmark_df, h_val, cmf, breadth_slope):
+    """Build aligned histories required by the production fragility model."""
+    asset = data_1d.copy()
+    benchmark = benchmark_df.reindex(asset.index).ffill().bfill() if not benchmark_df.empty else asset
+    close = asset["Close"].astype(float)
+    high = asset["High"].astype(float)
+    low = asset["Low"].astype(float)
+    volume = asset["Volume"].astype(float)
+    money_flow = ((close - low) - (high - close)) / (high - low).replace(0.0, np.nan)
+    cmf_history = (money_flow * volume).rolling(20, min_periods=1).sum() / volume.rolling(20, min_periods=1).sum().replace(0.0, np.nan)
+    breadth_ratio = benchmark["Close"].astype(float) / close
+    breadth_history = breadth_ratio.rolling(5, min_periods=2).apply(
+        lambda values: linregress(np.arange(len(values)), values).slope,
+        raw=True,
     )
-    is_watch = (
-        not is_critical
-        and downside_cmf > (FRAGILITY_CMF_MIN * 0.75)
-        and float(h_val) < 0.56
-        and score > (float(threshold) * 0.75)
-    )
-
+    drawdown = close / close.cummax() - 1.0
+    drawdown_accel = drawdown.diff().diff()
+    history_size = max(len(asset), 126)
     return {
-        "score": score,
-        "effective_vol": float(effective_vol),
-        "downside_cmf": float(downside_cmf),
-        "is_critical": bool(is_critical),
-        "is_watch": bool(is_watch),
-        "threshold": float(threshold),
+        "cmf": cmf_history.fillna(float(cmf)).to_numpy()[-history_size:],
+        "breadth": breadth_history.fillna(float(breadth_slope)).to_numpy()[-history_size:],
+        "hurst": np.full(history_size, float(h_val)),
+        "concentration": np.full(history_size, 0.0),
+        "drawdown_accel": drawdown_accel.fillna(0.0).to_numpy()[-history_size:],
     }
+
+
+def calculate_fragility_score(
+    data_1d,
+    benchmark_df,
+    returns_1m,
+    cmf,
+    breadth_slope,
+    h_val,
+    config=None,
+):
+    histories = _fragility_histories(data_1d, benchmark_df, h_val, cmf, breadth_slope)
+    result = calculate_production_fragility_score(
+        returns_1m=np.asarray(returns_1m, dtype=float),
+        cmf_history=histories["cmf"],
+        breadth_slope_history=histories["breadth"],
+        hurst_history=histories["hurst"],
+        concentration_history=histories["concentration"],
+        drawdown_accel_history=histories["drawdown_accel"],
+        config=config or FragilityConfig(),
+    )
+    result.update({
+        "effective_vol": float(np.std(np.asarray(returns_1m, dtype=float)[-VOL_LOOKBACK:])),
+        "downside_cmf": float(result["current_signals"]["downside_flow"]),
+        "threshold": float(result["thresholds"]["critical"]),
+    })
+    return result
+
+
+def calculate_stress_score(
+    data_1d,
+    benchmark_df,
+    vix_df=None,
+    credit_spread_df=None,
+    ig_spread_df=None,
+):
+    """Build daily stress histories from asset, FRED, and Yahoo VIX data."""
+    close = data_1d["Close"].astype(float).rename("asset_close")
+    daily_returns = np.log(close).diff()
+
+    if vix_df is None:
+        vix_df = get_data_persistent("^VIX", "1d", period="10y")
+    if credit_spread_df is None:
+        credit_spread_df = get_fred_series_persistent(FRED_HIGH_YIELD_SERIES, period="10y")
+    if ig_spread_df is None:
+        ig_spread_df = get_fred_series_persistent(FRED_INVESTMENT_GRADE_SERIES, period="10y")
+
+    history = pd.concat(
+        [
+            daily_returns.rename("daily_return"),
+            vix_df["Close"].astype(float).rename("vix"),
+            credit_spread_df[FRED_HIGH_YIELD_SERIES].astype(float).rename("hy_spread"),
+            ig_spread_df[FRED_INVESTMENT_GRADE_SERIES].astype(float).rename("ig_spread"),
+        ],
+        axis=1,
+        join="inner",
+    ).dropna()
+    if history.empty:
+        raise ValueError("No aligned asset, VIX, and credit-spread observations.")
+
+    realized_vol = history["daily_return"].rolling(20, min_periods=2).std() * np.sqrt(252.0)
+    drawdown = close / close.cummax() - 1.0
+    downside_momentum = history["daily_return"].rolling(20, min_periods=2).sum()
+    credit_risk_premium = history["hy_spread"] - history["ig_spread"]
+
+    return calculate_production_stress_score(
+        realized_vol_history=realized_vol.to_numpy(),
+        drawdown_history=drawdown.reindex(history.index).to_numpy(),
+        vix_history=history["vix"].to_numpy(),
+        hy_spread_history=history["hy_spread"].to_numpy(),
+        ig_spread_history=history["ig_spread"].to_numpy(),
+        credit_risk_premium_history=credit_risk_premium.to_numpy(),
+    )
 
 # ============================================================================
 # UPDATED SCANNER WITH JUDGMENT LOGIC
@@ -680,27 +627,6 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
         logger.error("Not enough daily history")
         return "ERROR - Insufficient 1d data"
 
-    hybrid_signal_result = {
-        "Hybrid Signal": "N/A",
-        "Hybrid Reason": "Unable to compute hybrid signal.",
-        "Hybrid VPIN": 0.0,
-        "Hybrid CVD Trend": "N/A",
-        "Hybrid Upper Band": None,
-        "Hybrid Lower Band": None,
-    }
-    try:
-        hybrid = get_hybrid_risk_signal(data_1m)
-        hybrid_signal_result.update({
-            "Hybrid Signal": hybrid.get("signal", "N/A"),
-            "Hybrid Reason": hybrid.get("signal_reason", "N/A"),
-            "Hybrid VPIN": float(hybrid.get("vpin", 0.0)),
-            "Hybrid CVD Trend": hybrid.get("cvd_slope", "N/A"),
-            "Hybrid Upper Band": float(hybrid.get("upper_band", np.nan)),
-            "Hybrid Lower Band": float(hybrid.get("lower_band", np.nan)),
-        })
-    except Exception as exc:
-        logger.warning(f"⚠️ {ticker} Hybrid signal computation failed | error=%s", exc)
-
     prices = data_1m['Close'].values
     volumes = data_1m['Volume'].values
     returns_1m = np.diff(np.log(prices))
@@ -726,26 +652,34 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
     recent_vol = np.std(returns_1m[-VOL_LOOKBACK:])
 
     # **Fragility: negative money flow during low volatility**
-    benchmark_df = get_data_persistent("RSP", "1d")
+    benchmark_ticker = "XIU.TO" if ticker_key.endswith(".TO") else "RSP"
+    benchmark_df = get_data_persistent(benchmark_ticker, "1d")
     if benchmark_df.empty:
         liquidity_signals = {'cmf': 0.0, 'breadth_ratio': 1.0, 'breadth_slope': 0.0, 'rsi': 50.0}
     else:
         liquidity_signals = calculate_liquidity_signals(data_1d, benchmark_df)
 
-    fragility_threshold = calibrate_fragility_threshold_for_session(
-        session_date=current_session_date,
-        benchmark_df=benchmark_df,
-        base_threshold=FRAGILITY_THRESHOLD,
-    )
+    fragility_threshold = float(FragilityConfig().critical_threshold)
 
     cash_cmf = liquidity_signals['cmf']
     fragility = calculate_fragility_score(
-        recent_vol=recent_vol,
+        data_1d=data_1d,
+        benchmark_df=benchmark_df,
         returns_1m=returns_1m,
         cmf=cash_cmf,
         breadth_slope=liquidity_signals['breadth_slope'],
         h_val=h_val,
-        threshold=fragility_threshold,
+        config=(
+            FragilityConfig(
+                flow_weight=0.0,
+                breadth_weight=0.55,
+                hurst_weight=0.0,
+                concentration_weight=0.0,
+                drawdown_accel_weight=0.45,
+            )
+            if ticker_key in BROAD_ETF_TICKERS
+            else None
+        ),
     )
     fragility_score = fragility["score"]
     if fragility["is_critical"]:
@@ -765,6 +699,32 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
             fragility_threshold,
             fragility["downside_cmf"],
             fragility["effective_vol"],
+        )
+
+    stress_result = None
+    try:
+        stress_result = calculate_stress_score(data_1d, benchmark_df)
+    except (KeyError, ValueError, OSError) as exc:
+        logger.warning("%s Stress score unavailable | error=%s", ticker, exc)
+    stress_score = float(stress_result["score"]) if stress_result else float("nan")
+    stress_risk_level = stress_result["risk_level"] if stress_result else "unavailable"
+    stress_icon = {
+        "normal": "🟢",
+        "watch": "⚠️",
+        "elevated": "🟠",
+        "critical": "🚨",
+    }.get(stress_risk_level, "⚪")
+    stress_alert = (
+        stress_risk_level.upper()
+        if stress_risk_level in {"watch", "elevated", "critical"}
+        else ""
+    )
+    if stress_result and stress_risk_level != "normal":
+        logger.info(
+            "%s Stress %s | score=%.2f",
+            ticker,
+            stress_risk_level,
+            stress_score,
         )
 
     # 3. Directional Check (Slope of last hour)
@@ -911,8 +871,16 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
         
         # --- RISK ASSESSMENT (Fragility / Stability) ---
         "Fragility Score": float(fragility_score),
+        "Fragility Interpretation": fragility["interpretation"],
+        "Fragility Icon": fragility["icon"],
         "Fragility Threshold": float(fragility_threshold),
         "Fragility Alert": "",
+
+        # --- REALIZED MARKET STRESS ---
+        "Stress Score": stress_score,
+        "Stress Risk Level": stress_risk_level,
+        "Stress Icon": stress_icon,
+        "Stress Alert": stress_alert,
         
         # --- FLOW & LIQUIDITY ANALYSIS ---
         "VPIN": float(0.0),
@@ -924,9 +892,6 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
         "Suggestion": "N/A",
         "Reason": "N/A",
     }
-    # Merge hybrid signal results into flow section
-    result.update(hybrid_signal_result)
-
     if show_judgment:
         judgment, entropy, vpin, cvd_slope, cvd_threshold = compute_judgment(
             prices, volumes, data_1m, h_val, alpha_eff,

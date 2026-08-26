@@ -13,6 +13,7 @@ from .data_utils import (
 )
 
 from .data_cache import (
+    get_fred_series_persistent,
     get_data_persistent,
     get_ohlcv_history,
     force_refresh_ticker,
@@ -29,6 +30,7 @@ __all__ = [
     "get_official_session_open",
     # Lower-level persistent cache functions
     "get_data_persistent",
+    "get_fred_series_persistent",
     "get_ohlcv_history",
     "force_refresh_ticker",
     "get_10y_yield"

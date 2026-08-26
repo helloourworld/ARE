@@ -14,11 +14,15 @@ Usage example:
 """
 
 from datetime import datetime, timedelta, timezone
+import json
+import os
 from pathlib import Path
 from threading import Thread
 import logging
 import platform
 import time
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 import pandas as pd
 import yfinance as yf
@@ -47,6 +51,8 @@ IB_YF_SUFFIX_MAP = {
 logger = logging.getLogger(__name__)
 STORAGE_TIMEZONE = "America/New_York"
 DATE_ONLY_INTERVALS = {"1d", "1wk", "1mo"}
+FRED_HIGH_YIELD_SERIES = "BAMLH0A0HYM2"
+FRED_INVESTMENT_GRADE_SERIES = "BAMLC0A0CM"
 
 
 def _normalize_index_for_interval(index, interval: str):
@@ -182,6 +188,58 @@ def _cache_dataframe(df: pd.DataFrame, file_path: Path) -> pd.DataFrame:
     return df
 
 
+def get_fred_series_persistent(
+    series_id: str,
+    api_key: str | None = None,
+    force_refresh: bool = False,
+    period: str = "10y",
+) -> pd.DataFrame:
+    """Load a FRED series from a persistent CSV cache, refreshing when stale."""
+    safe_series_id = str(series_id).replace("/", "_").replace("=", "_")
+    file_path = _get_cache_path(f"cache_fred_{safe_series_id}.csv")
+    if file_path.exists() and not force_refresh:
+        cached = _load_cached_csv(file_path, interval="1d")
+        if not cached.empty:
+            last_date = cached.index[-1]
+            if pd.Timestamp.now().normalize() - last_date < pd.Timedelta(hours=12):
+                return cached
+
+    key = api_key or os.getenv("FRED_API_KEY")
+    if not key:
+        if file_path.exists():
+            return _load_cached_csv(file_path, interval="1d")
+        raise ValueError("FRED_API_KEY is required to download FRED data.")
+
+    period_text = str(period).strip().lower()
+    if period_text.endswith("y"):
+        start_date = pd.Timestamp.now() - pd.DateOffset(years=int(period_text[:-1]))
+    elif period_text.endswith("mo"):
+        start_date = pd.Timestamp.now() - pd.DateOffset(months=int(period_text[:-2]))
+    else:
+        start_date = pd.Timestamp.now() - pd.Timedelta(period_text)
+
+    params = urlencode({
+        "series_id": series_id,
+        "api_key": key,
+        "file_type": "json",
+        "observation_start": start_date.strftime("%Y-%m-%d"),
+    })
+    url = f"https://api.stlouisfed.org/fred/series/observations?{params}"
+    with urlopen(url, timeout=25) as response:
+        payload = json.load(response)
+
+    observations = pd.DataFrame(payload.get("observations", []))
+    if observations.empty or not {"date", "value"}.issubset(observations.columns):
+        raise ValueError(f"FRED returned no observations for {series_id}.")
+
+    series = pd.to_numeric(observations["value"], errors="coerce")
+    result = pd.DataFrame({series_id: series.to_numpy()}, index=pd.to_datetime(observations["date"], errors="coerce"))
+    result = result[~result.index.isna()].dropna().sort_index()
+    if result.empty:
+        raise ValueError(f"FRED returned no numeric observations for {series_id}.")
+    return _cache_dataframe(result, file_path)
+
+
 def _refresh_from_yf(ticker: str, start_date, interval: str) -> pd.DataFrame:
     """Refresh data from Yahoo Finance with proper date handling."""
     # Convert timezone-aware Timestamp to string format that yfinance expects
@@ -201,7 +259,7 @@ def _refresh_from_yf(ticker: str, start_date, interval: str) -> pd.DataFrame:
 
 
 def _refresh_local_cache(local_df: pd.DataFrame, ticker: str, interval: str, file_path: Path) -> pd.DataFrame:
-    last_ts = local_df.index[-2] # Use second-to-last index to avoid partial last row TODO
+    last_ts = local_df.index[-2] if len(local_df) > 1 else local_df.index[-1]
     
     daily_like = str(interval).lower() in DATE_ONLY_INTERVALS
 
@@ -464,6 +522,7 @@ def get_data_persistent(ticker, interval="1d", period="2y", force_refresh=False)
     """
     safe_ticker = str(ticker).replace("/", "_").replace("=", "_")
     file_path = _get_cache_path(f"cache_{safe_ticker}_{interval}.csv")
+    initial_period = "2y" if str(interval).lower() in DATE_ONLY_INTERVALS else period
 
     try:
         if file_path.exists() and not force_refresh:
@@ -477,12 +536,12 @@ def get_data_persistent(ticker, interval="1d", period="2y", force_refresh=False)
             return local_df
 
         if IB_FALLBACK_ENABLED:
-            ib_df = get_data_from_ib(ticker, interval=interval, period=period)
+            ib_df = get_data_from_ib(ticker, interval=interval, period=initial_period)
             if not ib_df.empty:
                 ib_df = _normalize_yf_df(ib_df, interval=interval)
                 return _cache_dataframe(ib_df, file_path)
 
-        yf_df = _fetch_yf_initial(ticker, interval, period)
+        yf_df = _fetch_yf_initial(ticker, interval, initial_period)
         if yf_df is None or yf_df.empty:
             return pd.DataFrame()
         yf_df = _normalize_yf_df(yf_df, interval=interval)
@@ -499,6 +558,7 @@ def get_data_persistent(ticker, interval="1d", period="2y", force_refresh=False)
 __all__ = [
     "get_data_from_ib",
     "get_data_persistent",
+    "get_fred_series_persistent",
     "get_daily_returns",
     "get_price_history",
     "get_price_history_with_benchmark",

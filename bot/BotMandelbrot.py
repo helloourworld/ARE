@@ -1,7 +1,7 @@
 """Automated IB trading bot that consumes Streamlit-backed signal recommendations.
 
 This bot uses `risk_modeling.mandelbrot.scan_market()` as its signal engine, which
-mirrors the Streamlit dashboard's hybrid risk signal logic. It fetches 1-minute historical
+mirrors the Streamlit dashboard's risk signal logic. It fetches 1-minute historical
 bars from IB, then uses the scanned suggestion to decide buy/exit actions.
 """
 
@@ -139,8 +139,7 @@ def _get_consolidated_signal_score(signal_result):
     verdict = str(signal_result.get("Verdict", "")).upper()
     fragility = signal_result.get("Fragility Alert", "")
     vpin = float(signal_result.get("VPIN", 0.0) or 0.0)
-    hybrid_signal = str(signal_result.get("Hybrid Signal", "")).upper()
-    hybrid_vpin = float(signal_result.get("Hybrid VPIN", 0.0) or 0.0)
+    stress_score = float(signal_result.get("Stress Score", 0.0) or 0.0)
     regime = str(signal_result.get("Regime", "")).upper()
 
     score = 0
@@ -151,15 +150,14 @@ def _get_consolidated_signal_score(signal_result):
         score += 1
     if "1 - BULLISH PERSISTENCE" in regime:
         score += 1
-    if any(token in hybrid_signal for token in ("BUY", "ACCUMULATE", "BULL")):
-        score += 1
-
     if vpin > 0.72:
         score -= 2
     elif vpin < 0.60:
         score += 1
 
-    if hybrid_vpin > 0.72:
+    if stress_score >= 85.0:
+        score -= 2
+    elif stress_score >= 60.0:
         score -= 1
 
     if fragility == "CRITICAL FRAGILITY":
