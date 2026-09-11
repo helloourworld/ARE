@@ -69,6 +69,9 @@ from alpha_research.Port_stock_watch import plot_market_data_from_cache
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+# Configure the page before creating any Streamlit elements.
+st.set_page_config(page_title="Alpha Risk Engine (ARE)", page_icon="🤖", layout="wide")
+
 # Apply default request headers for all requests sessions so yfinance uses headers
 DEFAULT_REQUEST_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -188,6 +191,10 @@ def get_reference_price(ticker: str, series: pd.Series):
     if series is None or series.empty:
         return None, "Unknown"
 
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    if values.empty:
+        return None, "Unknown"
+
     idx = series.index
     if idx.tz is None:
         idx = idx.tz_localize("UTC")
@@ -199,15 +206,14 @@ def get_reference_price(ticker: str, series: pd.Series):
     current_date = last_ts.date()
     premarket = last_ts.time() < datetime.time(9, 30)
 
-    prev_close_vals = [i for i, d in enumerate(est_index.date) if d < current_date]
-    # prev_close = series.iloc[prev_close_vals[-1]] if prev_close_vals else None
-    _, hist = get_premarket_data(selected_benchmark)
-
-    # 1. Previous Day Close
-    if premarket:
-        prev_close = hist[selected_benchmark].iloc[-1]
+    dated_values = pd.Series(values.to_numpy(), index=est_index[-len(values):])
+    prior_session_values = dated_values[dated_values.index.date < current_date]
+    if not prior_session_values.empty:
+        prev_close = prior_session_values.iloc[-1]
+    elif len(values) >= 2:
+        prev_close = values.iloc[-2]
     else:
-        prev_close = hist[selected_benchmark].iloc[-2]
+        prev_close = values.iloc[-1]
         
     today_open_mask = [d == current_date and t >= datetime.time(9, 30)
                        for d, t in zip(est_index.date, est_index.time)]
@@ -286,29 +292,6 @@ def render_headline_benchmark_alert() -> None:
         )
 
 
-# --- CONFIGURATION & STYLING ---
-st.set_page_config(page_title="Alpha Risk Engine (ARE)", page_icon="🤖", layout="wide")
-
-@st.fragment(run_every="60s")
-def update_browser_tab_title():
-    try:
-        monitor_list = ['SPY']
-        live_data = get_live_intraday(monitor_list, period="1d")
-
-        bench_series = live_data['SPY'].dropna()
-        bench_current = bench_series.iloc[-1]
-        # st.text(f"Current SPY Price: ${bench_current:,.2f}")
-        # JavaScript to dynamically update the browser tab title
-        html_script = f"""
-            10 {bench_current:,.2f}
-        """
-        st.set_page_config(page_title=html_script, page_icon="🤖", layout="wide")
-        # st.title(html_script, height=0, width=0)
-    except Exception:
-        st.error("Error updating browser tab title. Please check your internet connection or data source.")
-# Run browser title updater in background
-update_browser_tab_title()
-
 # --- LOAD CONFIGURATION ---
 def load_config():
     config_path = REPO_ROOT / "config.yaml"
@@ -335,7 +318,8 @@ master_universe = (
 selected_benchmark = st.sidebar.selectbox(
     "Reference Benchmark",
     options=cfg['universe']['benchmarks'],
-    index=cfg['universe']['benchmarks'].index(cfg['defaults']['benchmark'])
+    index=cfg['universe']['benchmarks'].index(cfg['defaults']['benchmark']),
+    key="selected_benchmark",
 )
 
 # --- SIDEBAR: SELECTION PANEL ---
@@ -426,6 +410,36 @@ if returns.empty:
     )
     st.stop()
 
+monitor_options = sorted(set(master_universe + cfg['universe']['benchmarks']))
+monitor_tickers = st.sidebar.multiselect(
+    "Monitor Symbols",
+    options=monitor_options,
+    default=[ticker for ticker in sorted(set(selected_tickers + [selected_benchmark]))
+             if ticker in monitor_options],
+    key="monitor_tickers",
+)
+monitor_list = sorted(set(monitor_tickers + [selected_benchmark]))
+    
+@st.fragment(run_every="60s")
+def update_browser_tab_title():
+    try:
+        benchmark = st.session_state.get("selected_benchmark", "SPY")
+        live_data = get_live_intraday([benchmark], period="1d")
+
+        bench_series = live_data[benchmark].dropna()
+        bench_current = bench_series.iloc[-1]
+        # st.text(f"Current SPY Price: ${bench_current:,.2f}")
+        # JavaScript to dynamically update the browser tab title
+        html_script = f"""
+            10 {bench_current:,.2f}
+        """
+        # st.title(html_script, height=0, width=0)
+    except Exception:
+        st.error("Error updating browser tab title. Please check your internet connection or data source.")
+# Run browser title updater in background
+update_browser_tab_title()
+
+
 # --- DISPLAY METADATA ---
 # st.title(cfg['metadata']['report_title'])
 # st.caption(
@@ -488,7 +502,14 @@ with tab1:
     _color_map = {"green": "normal", "orange": "off", "red": "inverse"}
     c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
     c1.metric("Signal",          mb_signal)
-    c2.metric("Score",           f"{mb_score:+d} / 5")
+    score_color = {"green": "#198754", "orange": "#d97706", "red": "#dc3545"}.get(
+        mb_color, "#6c757d"
+    )
+    c2.markdown(
+        f"<div><strong>Score</strong><br><span style='color:{score_color}; "
+        f"font-size:1.8rem; font-weight:600'>{mb_score:+d} / 6</span></div>",
+        unsafe_allow_html=True,
+    )
     c3.metric("A/D Ratio",       f"{mb_latest['A/D Ratio']:.2f}")
     c4.metric("% > 50DMA",       f"{mb_latest['% Above 50DMA']:.1%}")
     c5.metric("% > 200DMA",      f"{mb_latest['% Above 200DMA']:.1%}")
@@ -648,6 +669,21 @@ with tab1:
     if st.checkbox("Show raw breadth table (last 100 rows)", key="mb_raw"):
         st.dataframe(mb_breadth.tail(100), width="stretch")
 
+    st.subheader("How to Interpret the Breadth Score")
+    st.markdown(
+        """
+        The score combines market participation, advance/decline pressure, new highs versus new lows, and SPY's trend. Each factor contributes positively or negatively; the theoretical range is **-6 to +6** when the SPY trend and recent moving-average cross data are available.
+
+        | Score | Reading | Investment meaning |
+        |---|---|---|
+        | **+3 to +6** | **Healthy** | Broad participation supports a risk-on environment. Existing equity exposure has stronger market confirmation, but the score is not a standalone buy signal. |
+        | **-1 to +2** | **Neutral / Mixed** | Market internals are inconclusive. Favor selectivity, position sizing, valuation, and confirmation from price and risk metrics before adding exposure. |
+        | **-6 to -2** | **Weak / Unstable** | Participation is deteriorating or concentrated. Consider a more defensive posture, tighter risk limits, and avoiding aggressive new positions until breadth improves. |
+
+        A positive score indicates healthier market participation, not a guarantee of rising prices. Use the score as a regime filter alongside trend, volatility, drawdown, and your investment horizon.
+        """
+    )
+
 # =============================================================================
 # TAB 2: LIVE MARKET EXECUTION TERMINAL
 # =============================================================================
@@ -683,8 +719,7 @@ with tab2:
         st.warning("Please select tickers in the sidebar to monitor prices.")
     else:
         # 1. Fetch Data for Selected Universe + Benchmark
-        globals()['all_monitor_tickers'] = list(
-            set(selected_tickers + st.session_state.external_tickers + [selected_benchmark]))
+        globals()['all_monitor_tickers'] = monitor_list
 
         # Fetch live prices (refreshes every 60 seconds)
         try:
@@ -890,21 +925,25 @@ with tab3:
                     except Exception as e:
                         print(f"Failed saving plot for {ticker}: {e}")
 
-        # Display signals table
-        df_signals = pd.DataFrame(all_signals).sort_values(by=["Signal/Regime", "Day % Net"], ascending=False)
-        st.subheader("📊 All Risk Alert Signals")
-        st.dataframe(
-            df_signals,
-            hide_index=True,
-            width='stretch',
-            column_config={"Ticker": st.column_config.TextColumn("Ticker", pinned=True)},
-        )
-        
-        
-        # Summary statistics
-        st.subheader("🎯 Signal Summary")
-        signal_counts = df_signals["Signal/Regime"].value_counts()
-        st.bar_chart(signal_counts)
+        if not all_signals:
+            st.warning("No valid regime signals were returned for the selected monitor symbols.")
+        else:
+            # Display signals table
+            df_signals = pd.DataFrame(all_signals).sort_values(
+                by=["Signal/Regime", "Day % Net"], ascending=False
+            )
+            st.subheader("📊 All Risk Alert Signals")
+            st.dataframe(
+                df_signals,
+                hide_index=True,
+                width='stretch',
+                column_config={"Ticker": st.column_config.TextColumn("Ticker", pinned=True)},
+            )
+
+            # Summary statistics
+            st.subheader("🎯 Signal Summary")
+            signal_counts = df_signals["Signal/Regime"].value_counts()
+            st.bar_chart(signal_counts)
     
     
     st.divider()
@@ -1050,6 +1089,9 @@ with tab4:
     # Fetch 2 years of data for the 52-week SMA
     rs_data = get_price_history_with_benchmark(
         rs_universe + benchmark_tickers, "SPY", period="2y", interval="1d")
+    if rs_data is None or rs_data.empty:
+        st.warning("Relative-strength data is unavailable for the selected universe.")
+        st.stop()
 
     # Always include SPY context, even when user selects another benchmark.
     spy_ref_series = None
@@ -1066,6 +1108,14 @@ with tab4:
             rs_data = rs_data.loc[~rs_index_series.isna()].copy()
             rs_data.index = rs_index_series[~rs_index_series.isna()].values
             spy_ref_series = spy_ref_series.reindex(rs_data.index).ffill().bfill()
+
+    rs_universe = [
+        ticker for ticker in rs_universe
+        if ticker in rs_data.columns and benchmark_for_ticker[ticker] in rs_data.columns
+    ]
+    if not rs_universe:
+        st.warning("No complete relative-strength series are available for the selected universe.")
+        st.stop()
 
     for t in rs_universe:
         ticker_benchmark = benchmark_for_ticker[t]
@@ -1229,8 +1279,11 @@ with tab4:
 
     # 2. Visual Analysis: RS Bollinger Band Panel
     st.subheader("Statistical Reversion Monitor")
-    target_t = st.selectbox("Select Asset to Monitor Bands",
-                            rs_universe, index=rs_universe.index("GOOG"))
+    target_t = st.selectbox(
+        "Select Asset to Monitor Bands",
+        rs_universe,
+        index=rs_universe.index("GOOG") if "GOOG" in rs_universe else 0,
+    )
 
     # Recalculate for specific ticker
     target_benchmark = benchmark_for_ticker[target_t]
@@ -1700,6 +1753,13 @@ with tab10:
              # Allow user to check/override the pre-set shock
              shock_magnitude = st.number_input(
                  f"Shock for {target_asset} (%)", value=scenario_map[scenario_type]["shock"]*100) / 100
+
+         if target_asset not in shrunk_cov.index:
+             st.error(
+                 f"Scenario asset {target_asset} is not available in the selected return universe. "
+                 "Select it for attribution or choose a different scenario."
+             )
+             st.stop()
      
          # 3. CONTAGION MATH: E(Ri | Rj = shock)
          # R_i_impact = Beta_(i,j) * Shock_j

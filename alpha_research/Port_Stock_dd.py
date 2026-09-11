@@ -55,6 +55,20 @@ def plot_multiple_stocks_from_cache(tickers, period="5y"):
         ax_dd.fill_between(drawdown.index, drawdown.values,
                            0, color="crimson", alpha=0.25)
         ax_dd.axhline(0, color="black", linewidth=0.8)
+        max_drawdown_date = drawdown.idxmin()
+        max_drawdown = drawdown.loc[max_drawdown_date]
+        ax_dd.plot(max_drawdown_date, max_drawdown,
+                   marker="v", color="black", markersize=7)
+        ax_dd.annotate(
+            f"Max {max_drawdown:.1%}\n{max_drawdown_date:%Y-%m-%d}",
+            xy=(max_drawdown_date, max_drawdown),
+            xytext=(8, -12),
+            textcoords="offset points",
+            ha="left",
+            va="top",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8),
+            arrowprops=dict(arrowstyle="->", color="black"),
+        )
         ax_dd.set_ylabel("Drawdown")
         ax_dd.grid(True, alpha=0.3)
         ax_dd.set_title(
@@ -458,5 +472,5 @@ def main(tickers=["AAPL", "intc", "GOOG", "nvda", "SPY"]):
 
 
 if __name__ == "__main__":
-    # main()
-    calculate_drawdown()
+    main()
+    # calculate_drawdown()
