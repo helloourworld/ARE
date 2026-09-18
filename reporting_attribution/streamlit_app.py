@@ -414,7 +414,7 @@ monitor_options = sorted(set(master_universe + cfg['universe']['benchmarks']))
 monitor_tickers = st.sidebar.multiselect(
     "Monitor Symbols",
     options=monitor_options,
-    default=[ticker for ticker in sorted(set(selected_tickers + [selected_benchmark]))
+    default=[ticker for ticker in sorted(set(master_universe + [selected_benchmark]))
              if ticker in monitor_options],
     key="monitor_tickers",
 )
@@ -427,15 +427,40 @@ def update_browser_tab_title():
         live_data = get_live_intraday([benchmark], period="1d")
 
         bench_series = live_data[benchmark].dropna()
-        bench_current = bench_series.iloc[-1]
-        # st.text(f"Current SPY Price: ${bench_current:,.2f}")
-        # JavaScript to dynamically update the browser tab title
-        html_script = f"""
-            10 {bench_current:,.2f}
-        """
-        # st.title(html_script, height=0, width=0)
+        if bench_series.empty:
+            return
+
+        bench_current = float(bench_series.iloc[-1])
+        title_text = f"{10} {bench_current:,.2f}"
+        st.iframe(
+            f"""
+            <script>
+                try {{
+                    const title = {title_text!r};
+                    document.title = title;
+                    if (window.parent && window.parent !== window) {{
+                        window.parent.document.title = title;
+                    }}
+                }} catch (e) {{}}
+            </script>
+            """,
+
+        )
     except Exception:
-        st.error("Error updating browser tab title. Please check your internet connection or data source.")
+        st.iframe(
+            """
+            <script>
+                try {
+                    document.title = 'ARE';
+                    if (window.parent && window.parent !== window) {
+                        window.parent.document.title = 'ARE';
+                    }
+                } catch (e) {}
+            </script>
+            """,
+
+        )
+
 # Run browser title updater in background
 update_browser_tab_title()
 
