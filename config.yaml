@@ -6,15 +6,15 @@ metadata:
 
 # The "Master List" for the Select Universe dropdown
 universe:
-  core: [XEQT.TO]
+  core: [ACWI]
   active_growth: [PSI]
   passive_em: [ZEM.TO]
   intl_hedged: [XEF.TO]
   us_tech: [MSFT, GOOG, AMZN, AAPL]
-  cad_value: [XDIV.TO]
+  dividend_value: [CGDV]
 
   benchmarks:
-    - XAW.TO
+    - ACWI
     - SPY
     - QQQ
     - XIU.TO
@@ -22,9 +22,9 @@ universe:
 # Default selections when the app loads
 defaults:
   selected_portfolio:
-    - XEQT.TO
+    - ACWI
     - PSI
-    - XDIV.TO
+    - CGDV
     - AAPL
     - GOOG
     - AMZN
@@ -34,12 +34,12 @@ defaults:
 
 # Strategic Asset Allocation (SAA) with Box Constraints
 constraints:
-  XEQT.TO: {min: 0.15, max: 0.30, target: 0.25}
+  ACWI: {min: 0.15, max: 0.30, target: 0.25}
   PSI:     {min: 0.20, max: 0.30, target: 0.25}
   AAPL:    {min: 0.05, max: 0.20, target: 0.15}
   GOOG:    {min: 0.05, max: 0.20, target: 0.15}
   AMZN:    {min: 0.05, max: 0.20, target: 0.10}
-  XDIV.TO: {min: 0.03, max: 0.10, target: 0.05}
+  CGDV: {min: 0.03, max: 0.10, target: 0.05}
 
 # Hyperparameters for Risk Engines
 parameters:
@@ -59,7 +59,7 @@ external_tickers:
   - INTC
   - MSFT
   - MRVL
-  - QQQM
+  - SPY
   - VRT
   - MRK
   - SOXX

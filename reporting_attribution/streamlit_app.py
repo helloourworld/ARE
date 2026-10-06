@@ -311,7 +311,7 @@ master_universe = (
     cfg['universe']['passive_em'] +
     cfg['universe']['intl_hedged'] +
     cfg['universe']['us_tech'] +
-    cfg['universe']['cad_value']
+    cfg['universe']['dividend_value'] 
 
 )
 
@@ -840,9 +840,27 @@ with tab3:
             f"Scanning all {len(monitor_list)} tickers for regime signals...")
 
         all_signals = []
+        benchmark_change = 0.0
+        benchmark_series = get_live_intraday([selected_benchmark], period="2d").get(selected_benchmark, pd.Series(dtype=float))
+        if not benchmark_series.empty:
+            bench_series = benchmark_series.dropna()
+            bench_current = bench_series.iloc[-1]
+            bench_ref_price, _ = get_reference_price(selected_benchmark, bench_series)
+            if bench_ref_price is not None:
+                benchmark_change = (bench_current / bench_ref_price - 1) * 100 if bench_ref_price else 0.0
         for ticker in sorted(monitor_list):
             try:
-                result = scan_market(ticker)
+                rel_perf = None
+                if ticker != selected_benchmark:
+                    live_data = get_live_intraday([ticker, selected_benchmark], period="2d")
+                    ticker_series = live_data.get(ticker, pd.Series(dtype=float)).dropna()
+                    if not ticker_series.empty:
+                        current_p = ticker_series.iloc[-1]
+                        ref_price, _ = get_reference_price(ticker, ticker_series)
+                        prev_p = ref_price if ref_price is not None else ticker_series.iloc[0]
+                        change_pct = (current_p - prev_p) / prev_p * 100 if prev_p else 0.0
+                        rel_perf = change_pct - benchmark_change
+                result = scan_market(ticker, relative_signal=rel_perf)
             except Exception as e:
                 print(f"Error scanning {ticker}: {e}")
                 continue
@@ -856,9 +874,11 @@ with tab3:
                     
                     # --- PRICE ACTION ---
                     "Price": f"{result.get('Price', 0.0):.2f}",
+                    "20-Min Intraday Mean": f"{result.get('Mean Reversion Average', float('nan')):.2f}",
                     "Open": f"{result.get('Open', 0.0):.2f}",
                     "Day % Net": f"{result.get('Day % Net', 0.0):.2f}%",
                     "Day %": f"{result.get('Day %', 0.0):.2f}%",
+                    "Relative vs Benchmark": f"{result.get('Relative Signal', float('nan')):+.2f}%" if pd.notna(result.get('Relative Signal')) else "N/A",
                     
                     # --- REGIME CLASSIFICATION ---
                     "Signal/Regime": f"{result.get('Regime')} {get_regime_icon(result.get('Regime'))}",
@@ -992,7 +1012,20 @@ with tab3:
             else:
                 st.success(f"Scan Status: {scan_status}. Latest bar: {latest_bar_time}")
 
-            st.write(f"**Price:** {result['Price']:.2f}")
+            current_price = float(result['Price'])
+            mean_reversion_average = result.get('Mean Reversion Average')
+            if isinstance(mean_reversion_average, (float, int)) and np.isfinite(mean_reversion_average):
+                average_distance_pct = (current_price / mean_reversion_average - 1) * 100
+                price_col, average_col = st.columns(2)
+                price_col.metric("Price", f"{current_price:.2f}")
+                average_col.metric(
+                    "20-Min Intraday Mean",
+                    f"{mean_reversion_average:.2f}",
+                    delta=f"{average_distance_pct:+.2f}% vs average",
+                    delta_color="inverse" if average_distance_pct > 0 else "normal",
+                )
+            else:
+                st.write(f"**Price:** {current_price:.2f}")
             st.write(f"**Daily Return (Session Baseline):** {result['Day %']:.2f}%")
             st.write(f"**Daily Return (Net):** {result.get('Day % Net', float('nan')):.2f}%")
             render_metric_with_threshold(
@@ -1084,6 +1117,11 @@ with tab4:
     **Objective:** Identify 'Institutional Footprints'.
     We look for assets with **RS Score > 0** (Outperforming) and **Positive Slope** (Accumulating).
     """)
+    st.caption(
+        f"Bubble Alert: Z >= {BUBBLE_Z_THRESHOLD:.1f}σ and at least "
+        f"{BUBBLE_MIN_DISTANCE_PCT:.0f}% above the 200-day average. "
+        "Either signal alone is shown as Overextended."
+    )
 
     # 1. Setup Universe & Benchmark
     rs_benchmark = st.selectbox("RS Reference Benchmark", [
@@ -1200,10 +1238,14 @@ with tab4:
         hook_status = ""
         if has_hook and mrs_series.ffill().iloc[-1] > 0:
             hook_status = "🪝 BULLISH HOOK (Re-entry)"
+            color = "green"
         elif has_hook and mrs_series.ffill().iloc[-1] <= 0:
             hook_status = "⚓ RECOVERY HOOK (Spec Buy)"
+            color = "green"
+            
         elif mrs_series.ffill().iloc[-1] > upper_t.ffill().iloc[-1]:
             hook_status = "🔥 PARABOLIC"
+            color = "green"
         else:
             hook_status = "Steady"
 
@@ -1237,14 +1279,24 @@ with tab4:
                 and dist_from_200ma >= BUBBLE_MIN_DISTANCE_PCT
             ):
                 bubble_alert = (
-                    f"🚨 BURRY ALERT: Z={extension_z:.2f}σ | Overextended: {dist_from_200ma:.2f}%"
+                    f"🚨 BUBBLE ALERT: Z={extension_z:.2f}σ | Overextended: {dist_from_200ma:.2f}%"
+                )
+            elif extension_z >= BUBBLE_Z_THRESHOLD:
+                bubble_alert = (
+                    f"⚠️ EXTREME EXTENSION: Z={extension_z:.2f}σ | "
+                    f"200MA: {dist_from_200ma:.2f}%"
+                )
+            elif dist_from_200ma >= BUBBLE_MIN_DISTANCE_PCT:
+                bubble_alert = (
+                    f"⚠️ OVEREXTENDED: Z={extension_z:.2f}σ | "
+                    f"200MA: {dist_from_200ma:.2f}%"
                 )
             else:
                 bubble_alert = f"Safe: Z={extension_z:.2f}σ | 200MA: {dist_from_200ma:.2f}%"
-        elif dist_from_200ma > BUBBLE_PCT_FALLBACK:
-            bubble_alert = f"🚨 BURRY ALERT (Fallback): Overextended: {dist_from_200ma:.2f}%"
+        elif dist_from_200ma >= BUBBLE_PCT_FALLBACK:
+            bubble_alert = f"⚠️ OVEREXTENDED: Z=N/A | 200MA: {dist_from_200ma:.2f}%"
         else:
-            bubble_alert = f"Safe: Z=N/A | >200MA: {dist_from_200ma:.2f}%"
+            bubble_alert = f"Safe: Z=N/A | 200MA: {dist_from_200ma:.2f}%"
 
         rs_results.append({
             "Ticker": t,
@@ -1413,6 +1465,9 @@ with tab5:
                 m2.metric("Predicted Session Close", f"{intraday.predicted_close:.2f}", f"{intraday.predicted_return_to_close * 100:.2f}%")
                 m3.metric("Predicted Next Close", f"{daily.predicted_next_close:.2f}", f"Bias {daily.market_context_bias_pct * 100:.2f}%")
                 m4.metric("Terminal Confidence", f"{mc.terminal_confidence * 100:.2f}%")
+                range_low, range_high = st.columns(2)
+                range_low.metric("Predicted Session Low", f"{intraday.predicted_low:.2f}")
+                range_high.metric("Predicted Session High", f"{intraday.predicted_high:.2f}")
 
                 with st.expander("Model Validation Metrics", expanded=True):
                     v1, v2, v3, v4 = st.columns(4)

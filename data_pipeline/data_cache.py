@@ -158,6 +158,19 @@ def _load_cached_csv(path: Path, interval: str) -> pd.DataFrame:
     return df
 
 
+def _invalid_ohlc_dates(df: pd.DataFrame, interval: str) -> pd.DatetimeIndex:
+    """Return dates whose daily OHLC values are incomplete."""
+    if str(interval).lower() not in DATE_ONLY_INTERVALS or df.empty:
+        return pd.DatetimeIndex([])
+
+    required_columns = [column for column in ("Open", "High", "Low", "Close") if column in df]
+    if not required_columns:
+        return pd.DatetimeIndex([])
+
+    invalid = df[required_columns].isna().any(axis=1)
+    return pd.DatetimeIndex(df.index[invalid])
+
+
 def _normalize_tickers(tickers):
     """Normalize ticker input to a list of symbols."""
     if isinstance(tickers, str):
@@ -259,9 +272,14 @@ def _refresh_from_yf(ticker: str, start_date, interval: str) -> pd.DataFrame:
 
 
 def _refresh_local_cache(local_df: pd.DataFrame, ticker: str, interval: str, file_path: Path) -> pd.DataFrame:
-    last_ts = local_df.index[-2] if len(local_df) > 1 else local_df.index[-1]
-    
     daily_like = str(interval).lower() in DATE_ONLY_INTERVALS
+    invalid_dates = _invalid_ohlc_dates(local_df, interval)
+    if not invalid_dates.empty:
+        first_invalid = invalid_dates[0]
+        prior_dates = local_df.index[local_df.index < first_invalid]
+        last_ts = prior_dates[-1] if len(prior_dates) else first_invalid
+    else:
+        last_ts = local_df.index[-2] if len(local_df) > 1 else local_df.index[-1]
 
     # Ensure last_ts is timezone-aware for staleness checks.
     if getattr(last_ts, "tzinfo", None) is None:
@@ -274,7 +292,7 @@ def _refresh_local_cache(local_df: pd.DataFrame, ticker: str, interval: str, fil
     now_local = pd.Timestamp.now(tz=STORAGE_TIMEZONE)
     wait_time = timedelta(minutes=2) if interval == "1m" else timedelta(hours=12)
     
-    if now_local - last_ts < wait_time:
+    if invalid_dates.empty and now_local - last_ts < wait_time:
         return local_df
 
     # Use the Timestamp object directly - _refresh_from_yf will handle conversion
@@ -284,10 +302,13 @@ def _refresh_local_cache(local_df: pd.DataFrame, ticker: str, interval: str, fil
     if new_data.empty:
         return local_df
 
-    new_data = new_data[1:].dropna(how="all")  # Skip the first row to avoid overlap with last cached row
+    new_data = new_data.dropna(how="all")
     new_data = _normalize_yf_df(new_data, interval=interval)
     combined = pd.concat([local_df, new_data])
     combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+    invalid_dates = _invalid_ohlc_dates(combined, interval)
+    if not invalid_dates.empty:
+        combined = combined.drop(index=invalid_dates)
     return _cache_dataframe(combined, file_path)
 
 

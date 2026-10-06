@@ -92,6 +92,8 @@ MARKET_FEATURE_COLUMNS = [
 FRAC_DIFF_D = 0.40
 TIME_DECAY_HALF_LIFE_DAYS = 252.0
 PURGE_WINDOW_DAYS = 2
+DAILY_MODEL_FEATURE_VERSION = 2
+INTRADAY_RANGE_MODEL_VERSION = 1
 
 
 @dataclass
@@ -99,6 +101,8 @@ class IntradayForecastResult:
     ticker: str
     current_price: float
     predicted_close: float
+    predicted_low: float
+    predicted_high: float
     predicted_return_to_close: float
     training_rows: int
     validation_metrics: Dict[str, float]
@@ -341,6 +345,7 @@ def _search_best_hgb_params(
     max_iter_grid: Tuple[int, ...],
     purge_window: int = 0,
     half_life_days: float | None = None,
+    metric_price_ref: pd.Series | None = None,
     verbose: bool = False,
     label: str = "model",
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
@@ -379,6 +384,7 @@ def _search_best_hgb_params(
                     direction_ref=direction_ref,
                     purge_window=purge_window,
                     half_life_days=half_life_days,
+                    metric_price_ref=metric_price_ref,
                 )
                 rank = _rank_candidate(wf_metrics)
                 candidate_elapsed = perf_counter() - candidate_start
@@ -425,6 +431,10 @@ def _load_saved_forecast_bundle(ticker: str, output_dir: Path | None = None) -> 
 
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("daily", {}).get("feature_version") != DAILY_MODEL_FEATURE_VERSION:
+            return None
+        if manifest.get("intraday", {}).get("range_model_version") != INTRADAY_RANGE_MODEL_VERSION:
+            return None
         intraday_path = Path(manifest["intraday_model_path"])
         daily_path = Path(manifest["daily_model_path"])
         if not intraday_path.exists() or not daily_path.exists():
@@ -498,7 +508,10 @@ def train_and_save_best_models(
     if intraday_ohlcv.empty:
         raise ValueError(f"No intraday data returned for {ticker}.")
 
-    X_intra, y_intra = _build_intraday_training_data(intraday_ohlcv)
+    X_intra, intraday_targets = _build_intraday_training_data(intraday_ohlcv)
+    y_intra = intraday_targets["close_to_go_return"]
+    y_low = intraday_targets["low_to_go_return"]
+    y_high = intraday_targets["high_to_go_return"]
     _training_log(
         f"[training] Intraday dataset prepared: rows={len(X_intra)}",
         enabled=verbose,
@@ -529,13 +542,20 @@ def train_and_save_best_models(
 
     intraday_model = HistGradientBoostingRegressor(**intra_params)
     intraday_model.fit(X_intra, y_intra)
+    intraday_low_model = HistGradientBoostingRegressor(**intra_params)
+    intraday_low_model.fit(X_intra, y_low)
+    intraday_high_model = HistGradientBoostingRegressor(**intra_params)
+    intraday_high_model.fit(X_intra, y_high)
     _training_log(
         "[training] Intraday final model fit complete.", enabled=verbose)
 
     intraday_artifact = {
         "model": intraday_model,
+        "low_model": intraday_low_model,
+        "high_model": intraday_high_model,
         "feature_columns": list(X_intra.columns),
         "target": "close_to_go_return",
+        "range_model_version": INTRADAY_RANGE_MODEL_VERSION,
         "interval": intraday_interval,
         "period": intraday_period,
         "params": intra_params,
@@ -595,12 +615,13 @@ def train_and_save_best_models(
         y=y_daily,
         train_min=140,
         step=5,
-        direction_ref=X_daily["Close"],
+        direction_ref=None,
         max_depth_grid=daily_depth_grid,
         learning_rate_grid=daily_lr_grid,
         max_iter_grid=daily_iter_grid,
         purge_window=PURGE_WINDOW_DAYS,
         half_life_days=TIME_DECAY_HALF_LIFE_DAYS,
+        metric_price_ref=daily_dataset["close_price"],
         verbose=verbose,
         label=f"{ticker.upper()} daily",
     )
@@ -624,6 +645,7 @@ def train_and_save_best_models(
         "period": daily_period,
         "params": daily_params,
         "benchmark_ticker": benchmark_ticker,
+        "feature_version": DAILY_MODEL_FEATURE_VERSION,
     }
     daily_path = out_dir / f"{ticker.upper()}_daily_next_close_model.joblib"
     dump(daily_artifact, daily_path)
@@ -640,12 +662,14 @@ def train_and_save_best_models(
             "training_rows": int(len(X_intra)),
             "best_params": intra_params,
             "walk_forward_metrics": _serialize_metrics(intra_wf_metrics),
+            "range_model_version": INTRADAY_RANGE_MODEL_VERSION,
         },
         "daily": {
             "training_rows": int(len(X_daily)),
             "best_params": daily_params,
             "walk_forward_metrics": _serialize_metrics(daily_wf_metrics),
             "benchmark_ticker": benchmark_ticker,
+            "feature_version": DAILY_MODEL_FEATURE_VERSION,
         },
     }
     manifest_path = out_dir / f"{ticker.upper()}_forecast_models_manifest.json"
@@ -675,6 +699,7 @@ def _walk_forward_metrics(
     direction_ref: pd.Series | None = None,
     purge_window: int = 0,
     half_life_days: float | None = None,
+    metric_price_ref: pd.Series | None = None,
 ) -> Dict[str, float]:
     """Rolling train-forward evaluation to reduce optimistic single-split bias."""
     if len(X) <= train_min + 1:
@@ -690,6 +715,8 @@ def _walk_forward_metrics(
     y_pred_all: list[float] = []
     dir_true_all: list[float] = []
     dir_pred_all: list[float] = []
+    metric_true_all: list[float] = []
+    metric_pred_all: list[float] = []
     windows = 0
 
     n = len(X)
@@ -723,6 +750,11 @@ def _walk_forward_metrics(
         y_true_all.extend(y_true_part.tolist())
         y_pred_all.extend(y_pred_part.tolist())
 
+        if metric_price_ref is not None:
+            base_prices = metric_price_ref.iloc[train_end:test_end].to_numpy(dtype=float)
+            metric_true_all.extend((base_prices * (1.0 + y_true_part)).tolist())
+            metric_pred_all.extend((base_prices * (1.0 + y_pred_part)).tolist())
+
         if direction_ref is not None:
             ref_part = direction_ref.iloc[train_end:test_end].to_numpy(
                 dtype=float)
@@ -734,8 +766,10 @@ def _walk_forward_metrics(
 
         windows += 1
 
+    metric_y_true = metric_true_all if metric_price_ref is not None else y_true_all
+    metric_y_pred = metric_pred_all if metric_price_ref is not None else y_pred_all
     metrics = _compute_regression_metrics(np.asarray(
-        y_true_all, dtype=float), np.asarray(y_pred_all, dtype=float))
+        metric_y_true, dtype=float), np.asarray(metric_y_pred, dtype=float))
     if len(dir_true_all):
         metrics["directional_acc"] = float(
             np.mean(np.asarray(dir_true_all, dtype=float) ==
@@ -759,17 +793,19 @@ def _load_current_price_1m(ticker: str, force_refresh: bool = False) -> float | 
     return None
 
 
-def _build_intraday_training_data(intraday_ohlcv: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
-    """Create point-in-time intraday features and close-to-go target."""
+def _build_intraday_training_data(intraday_ohlcv: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Create point-in-time features and remaining-session close/range targets."""
     if intraday_ohlcv.empty:
-        return pd.DataFrame(), pd.Series(dtype=float)
+        return pd.DataFrame(), pd.DataFrame(
+            columns=["close_to_go_return", "low_to_go_return", "high_to_go_return"]
+        )
 
     df = _to_ny_datetime_index(intraday_ohlcv)
     df = df.sort_index()
     df["session"] = df.index.date
 
     feature_rows = []
-    targets = []
+    targets = {"close_to_go_return": [], "low_to_go_return": [], "high_to_go_return": []}
 
     for _, day in df.groupby("session"):
         day = day.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
@@ -811,11 +847,21 @@ def _build_intraday_training_data(intraday_ohlcv: pd.DataFrame) -> Tuple[pd.Data
                     "vol_so_far": running_vol[i],
                 }
             )
-            targets.append((day_final_close / current_close) - 1.0)
+            future_high = max(float(np.max(highs[i + 1:])), current_close)
+            future_low = min(float(np.min(lows[i + 1:])), current_close)
+            targets["close_to_go_return"].append(
+                (day_final_close / current_close) - 1.0
+            )
+            targets["low_to_go_return"].append(
+                (future_low / current_close) - 1.0
+            )
+            targets["high_to_go_return"].append(
+                (future_high / current_close) - 1.0
+            )
 
     X = pd.DataFrame(feature_rows)
-    y = pd.Series(targets, dtype=float)
-    return X, y
+    target_frame = pd.DataFrame(targets, dtype=float)
+    return X, target_frame
 
 
 def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval: str = "5m") -> IntradayForecastResult:
@@ -825,7 +871,10 @@ def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval:
     if ohlcv.empty:
         raise ValueError(f"No intraday data returned for {ticker}.")
 
-    X, y = _build_intraday_training_data(ohlcv)
+    X, targets = _build_intraday_training_data(ohlcv)
+    y = targets["close_to_go_return"]
+    y_low = targets["low_to_go_return"]
+    y_high = targets["high_to_go_return"]
     if len(X) < 200:
         raise ValueError(
             f"Not enough intraday training rows for {ticker}. Need at least 200, got {len(X)}."
@@ -836,6 +885,8 @@ def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval:
         artifact = saved_bundle["intraday_artifact"]
         manifest = saved_bundle["manifest"]
         model = artifact["model"]
+        low_model = artifact["low_model"]
+        high_model = artifact["high_model"]
         feature_columns = list(artifact.get(
             "feature_columns", list(X.columns)))
 
@@ -890,6 +941,14 @@ def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval:
         x_live = x_live.reindex(columns=feature_columns)
         pred_ret = float(model.predict(x_live)[0])
         pred_close = current_close * (1.0 + pred_ret)
+        pred_low_return = float(low_model.predict(x_live)[0])
+        pred_high_return = float(high_model.predict(x_live)[0])
+        pred_low = min(
+            float(np.min(lows)), current_close * (1.0 + pred_low_return), pred_close
+        )
+        pred_high = max(
+            float(np.max(highs)), current_close * (1.0 + pred_high_return), pred_close
+        )
 
         metrics = manifest.get("intraday", {}).get(
             "walk_forward_metrics", {}) if isinstance(manifest, dict) else {}
@@ -898,6 +957,8 @@ def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval:
             ticker=ticker,
             current_price=current_close,
             predicted_close=pred_close,
+            predicted_low=pred_low,
+            predicted_high=pred_high,
             predicted_return_to_close=pred_ret,
             training_rows=int(manifest.get("intraday", {}).get(
                 "training_rows", len(X))) if isinstance(manifest, dict) else len(X),
@@ -909,6 +970,8 @@ def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval:
     split = min(max(split, 120), len(X) - 40)
     X_train, X_test = X.iloc[:split], X.iloc[split:]
     y_train, y_test = y.iloc[:split], y.iloc[split:]
+    y_low_train, y_low_test = y_low.iloc[:split], y_low.iloc[split:]
+    y_high_train, y_high_test = y_high.iloc[:split], y_high.iloc[split:]
 
     model_eval = HistGradientBoostingRegressor(
         max_depth=4, learning_rate=0.05, max_iter=400, random_state=42)
@@ -921,6 +984,18 @@ def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval:
     pred_test_arr = np.asarray(pred_test, dtype=float)
     metrics["directional_acc"] = float(
         np.mean(np.sign(y_test_arr) == np.sign(pred_test_arr)))
+
+    low_eval_model = HistGradientBoostingRegressor(
+        max_depth=4, learning_rate=0.05, max_iter=400, random_state=42)
+    low_eval_model.fit(X_train, y_low_train)
+    metrics["low_mae"] = float(mean_absolute_error(
+        y_low_test, low_eval_model.predict(X_test)))
+
+    high_eval_model = HistGradientBoostingRegressor(
+        max_depth=4, learning_rate=0.05, max_iter=400, random_state=42)
+    high_eval_model.fit(X_train, y_high_train)
+    metrics["high_mae"] = float(mean_absolute_error(
+        y_high_test, high_eval_model.predict(X_test)))
 
     wf_metrics = _walk_forward_metrics(
         X=X,
@@ -940,6 +1015,12 @@ def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval:
     model = HistGradientBoostingRegressor(
         max_depth=4, learning_rate=0.05, max_iter=450, random_state=42)
     model.fit(X, y)
+    low_model = HistGradientBoostingRegressor(
+        max_depth=4, learning_rate=0.05, max_iter=450, random_state=42)
+    low_model.fit(X, y_low)
+    high_model = HistGradientBoostingRegressor(
+        max_depth=4, learning_rate=0.05, max_iter=450, random_state=42)
+    high_model.fit(X, y_high)
 
     live = _to_ny_datetime_index(ohlcv).sort_index()
     live["session"] = live.index.date
@@ -989,11 +1070,21 @@ def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval:
 
     pred_ret = float(model.predict(x_live)[0])
     pred_close = current_close * (1.0 + pred_ret)
+    pred_low_return = float(low_model.predict(x_live)[0])
+    pred_high_return = float(high_model.predict(x_live)[0])
+    pred_low = min(
+        float(np.min(lows)), current_close * (1.0 + pred_low_return), pred_close
+    )
+    pred_high = max(
+        float(np.max(highs)), current_close * (1.0 + pred_high_return), pred_close
+    )
 
     return IntradayForecastResult(
         ticker=ticker,
         current_price=current_close,
         predicted_close=pred_close,
+        predicted_low=pred_low,
+        predicted_high=pred_high,
         predicted_return_to_close=pred_ret,
         training_rows=len(X),
         validation_metrics=metrics,
@@ -1121,7 +1212,7 @@ def _build_daily_features(daily_ohlcv: pd.DataFrame, benchmark_ohlcv: pd.DataFra
             subset=["Open", "High", "Low", "Close", "Volume"])
         bm = _to_ny_datetime_index(bm).sort_index()
         bm_close = bm["Close"].astype(float).reindex(
-            df_feat.index).ffill().bfill()
+            df_feat.index).ffill()
         bm_sma20 = bm_close.rolling(20).mean()
 
         df_feat["Benchmark_Return_1D"] = bm_close.pct_change(1)
@@ -1174,6 +1265,11 @@ def forecast_next_close_ml(ticker: str, period: str = "3y") -> DailyForecastResu
     X = dataset[features.columns]
     y = dataset["target_return"]
     price_ref = dataset["close_price"]
+    live_features = features.dropna()
+    if live_features.empty:
+        raise ValueError(f"No complete daily features available for {ticker}.")
+    latest_x = live_features.iloc[[-1]]
+    latest_close = float(close_prices.loc[latest_x.index[-1]])
 
     # Load saved model or train expanding walk-forward model
     saved_bundle = _load_saved_forecast_bundle(ticker)
@@ -1185,8 +1281,7 @@ def forecast_next_close_ml(ticker: str, period: str = "3y") -> DailyForecastResu
             "feature_columns", list(features.columns)))
         target_kind = str(artifact.get("target", "next_close")).strip().lower()
 
-        latest_x = X.iloc[[-1]].reindex(columns=feature_columns)
-        latest_close = float(close_prices.iloc[-1])
+        latest_x = latest_x.reindex(columns=feature_columns)
 
         raw_pred = float(model.predict(latest_x)[0])
         if target_kind in {"next_close_return", "target_return", "return"}:
@@ -1280,10 +1375,9 @@ def forecast_next_close_ml(ticker: str, period: str = "3y") -> DailyForecastResu
         direction_ref=None,  # Return direction reference is 0.0
         purge_window=PURGE_WINDOW_DAYS,
         half_life_days=TIME_DECAY_HALF_LIFE_DAYS,
+        metric_price_ref=price_ref,
     )
 
-    latest_x = X.iloc[[-1]]
-    latest_close = float(close_prices.iloc[-1])
     pred_next_return = float(model_live.predict(latest_x)[0])
     pred_next_close = latest_close * (1.0 + pred_next_return)
 
@@ -1536,6 +1630,8 @@ def _print_summary(results: Dict[str, object]) -> None:
     print(f"Ticker: {intraday.ticker}")
     print(f"Current price: {intraday.current_price:.2f}")
     print(f"Predicted session close: {intraday.predicted_close:.2f}")
+    print(f"Predicted session low: {intraday.predicted_low:.2f}")
+    print(f"Predicted session high: {intraday.predicted_high:.2f}")
     print(
         f"Predicted return to close: {intraday.predicted_return_to_close * 100:.2f}%")
     print(f"Intraday training rows: {intraday.training_rows}")

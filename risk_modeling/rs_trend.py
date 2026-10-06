@@ -36,11 +36,15 @@ def calculate_professional_rs(ticker_data, benchmark_data, window=52):
 
 # --- Integrated Execution ---
 def get_rs_signals(tickers, benchmark='SPY'):
-    data = get_price_history_with_benchmark(tickers, benchmark, period="2y", interval="1d")
+    normalized_tickers = [t for t in tickers if t != benchmark]
+    if not normalized_tickers:
+        return pd.DataFrame(columns=["Ticker", "RS_Score", "RS_Trend", "Institutional_Signal"])
+
+    data = get_price_history_with_benchmark(normalized_tickers, benchmark, period="2y", interval="1d")
     results = []
-    
-    for t in tickers:
-        if t in data.columns:
+
+    for t in normalized_tickers:
+        if t in data.columns and benchmark in data.columns:
             mrs, slope = calculate_professional_rs(data[t], data[benchmark])
             results.append({
                 "Ticker": t,
@@ -48,7 +52,7 @@ def get_rs_signals(tickers, benchmark='SPY'):
                 "RS_Trend": "Improving" if slope.iloc[-1] > 0 else "Decaying",
                 "Institutional_Signal": "Accumulate" if mrs.iloc[-1] > 0 and slope.iloc[-1] > 0 else "Avoid"
             })
-    
+
     return pd.DataFrame(results)
 
 def calculate_mansfield_rs(ticker_data, benchmark_data, window=252):

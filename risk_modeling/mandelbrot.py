@@ -118,6 +118,7 @@ TAIL_SAFE = 1.70              # Required for Regime 1/2 stability
 
 # Volatility: For Active vs. Dormant Risk
 VOL_LOOKBACK = 30             # 30-minute window for "Current Vol"
+MEAN_REVERSION_AVERAGE_WINDOW = 20  # one-minute bars: 20-minute intraday mean
 VOL_THRESHOLD = 0.0015        # Threshold to define "Active" movement
 
 # Others
@@ -126,6 +127,29 @@ BROAD_ETF_TICKERS = {"XDIV.TO", "XEQT.TO", "XIU.TO"}
 # ============================================================================
 # 2. FRACTAL MATHEMATICS
 # ============================================================================
+
+
+def calculate_hurst(prices, window: int = 300):
+    """Compatibility wrapper for the legacy Hurst API used by the project."""
+    prices = np.asarray(prices, dtype=float)
+    if prices.size == 0 or prices.size < 2:
+        return 0.5
+
+    if prices.size < window:
+        window = prices.size
+    if window < 2:
+        return 0.5
+
+    volumes = np.ones_like(prices, dtype=float)
+    return float(calculate_hurst_vw(prices, volumes, window=window))
+
+
+def calculate_tail_index(returns, lookback: int = 500):
+    """Compatibility wrapper for the legacy tail-index API used by the project."""
+    returns = np.asarray(returns, dtype=float)
+    if returns.size == 0:
+        return 3.0
+    return float(calculate_tail_index_robust(returns, lookback=lookback))
 
 
 def calculate_hurst_vw(prices: np.ndarray, volumes: np.ndarray, window: int = 300):
@@ -493,55 +517,97 @@ def scan_with_judgment(ticker):
 # 4. MAIN SCANNER
 # ============================================================================
 
-def generate_suggestion(regime, judgment, entropy, alpha, h_val, vpin, cvd_slope):
+def generate_suggestion(regime, judgment, entropy, alpha, h_val, vpin, cvd_slope, relative_signal=None):
     """
     Synthesizes fractal metrics into actionable institutional-grade advice.
+    Combines regime quality with relative benchmark performance so entry/exit calls
+    are better grounded in actual leadership or laggard behavior.
     """
-    
+    relative_signal = float(relative_signal) if relative_signal is not None else None
+
+    def add_relative_context(reason):
+        if relative_signal is None or abs(relative_signal) < 0.5:
+            return reason
+        if relative_signal > 0:
+            return (
+                f"{reason} Relative strength is +{relative_signal:.2f}% versus the benchmark, "
+                "which supports an entry/hold decision only if price and flow remain aligned."
+            )
+        return (
+            f"{reason} Relative weakness is {relative_signal:.2f}% versus the benchmark, "
+            "which argues against fresh long entry and favors reducing or exiting risk."
+        )
+
     # --- 1. THE KILL SWITCH: TOXIC FLOW & STRUCTURAL JUMP RISK ---
     # Toxicity overrides all other "Bullish" regimes because liquidity is failing.
     if "TOXIC" in judgment or vpin > 0.80:
         if "DISTRIBUTION" in judgment:
-            return "🚨 EXIT / AGGRESSIVE SELL", "Structural Jump Risk: Smart money is exiting into a hollow rally. Rug-pull imminent."
+            return "🚨 EXIT / AGGRESSIVE SELL", add_relative_context(
+                "Structural Jump Risk: Smart money is exiting into a hollow rally. Rug-pull imminent."
+            )
         if "ACCUMULATE" in judgment or "ACCUMULATION" in judgment or "ABSORPTION" in judgment:
-            return "🛡️ HEDGE / PROTECT", "Toxic flow detected during accumulation. High volatility ahead; use protective puts."
-        return "🚫 AVOID / STAY CASH", "Order flow is predatory (VPIN > 0.8). Market makers are withdrawing liquidity."
+            return "🛡️ HEDGE / PROTECT", add_relative_context(
+                "Toxic flow detected during accumulation. High volatility ahead; use protective puts."
+            )
+        return "🚫 AVOID / STAY CASH", add_relative_context(
+            "Order flow is predatory (VPIN > 0.8). Market makers are withdrawing liquidity."
+        )
 
     # --- 2. TAIL RISK & EXTREME INSTABILITY (Regime 5) ---
     if "5 - TAIL RISK" in regime:
         if "BULLISH ABSORPTION" in judgment:
-            return "🔥 SPECULATIVE BUY", "Tail Risk is high but Institutions are catching the knife. High risk/reward."
-        return "⚠️ CAUTION", "Non-Normal return distribution. Probability of an extreme 'fat-tail' move is high."
+            return "🔥 SPECULATIVE BUY", add_relative_context(
+                "Tail Risk is high but Institutions are catching the knife. High risk/reward."
+            )
+        return "⚠️ CAUTION", add_relative_context(
+            "Non-Normal return distribution. Probability of an extreme 'fat-tail' move is high."
+        )
 
     # --- 3. TREND PERSISTENCE (Regime 1 & 2) ---
     if "1 - BULLISH PERSISTENCE" in regime:
         if "BEARISH DIVERGENCE" in judgment or "DISTRIBUTION" in judgment:
-            return "📉 REDUCE / TAKE PROFIT", "In Trend (Hurst > 0.6) but aggressive sellers are dominating the tape."
+            return "📉 REDUCE / TAKE PROFIT", add_relative_context(
+                "In Trend (Hurst > 0.6) but aggressive sellers are dominating the tape."
+            )
         if "HEALTHY MOMENTUM" in judgment:
-            return "🚀 STRONG BUY / HOLD", "Price and Order Flow are in sync. High conviction uptrend."
-        return "✅ HOLD / BUY DIPS", "Healthy persistent uptrend."
+            return "🚀 STRONG BUY / HOLD", add_relative_context(
+                "Price and Order Flow are in sync. High conviction uptrend."
+            )
+        return "✅ HOLD / BUY DIPS", add_relative_context("Healthy persistent uptrend.")
 
     if "2 - BEARISH PERSISTENCE" in regime:
         if "BULLISH ABSORPTION" in judgment:
-            return "⏳ WATCH FOR REVERSAL", "Downtrend is persistent but smart money is building a floor. Look for Hurst to drop."
+            return "⏳ WATCH FOR REVERSAL", add_relative_context(
+                "Downtrend is persistent but smart money is building a floor. Look for Hurst to drop."
+            )
         if "AGGRESSIVE SELLING" in judgment:
-            return "🛑 SELL / SHORT", "Downward momentum is backed by aggressive market orders. No bottom in sight."
-        return "🛑 STAY SHORT", "Persistent bearish memory."
+            return "🛑 SELL / SHORT", add_relative_context(
+                "Downward momentum is backed by aggressive market orders. No bottom in sight."
+            )
+        return "🛑 STAY SHORT", add_relative_context("Persistent bearish memory.")
 
     # --- 4. QUALITY OF TREND (Entropy Check) ---
     if "NOISY" in judgment or entropy > 2.8:
-        return "🔄 REDUCE POSITION SIZE", "Trend exists but is highly chaotic. Expect frequent stop-outs."
+        return "🔄 REDUCE POSITION SIZE", add_relative_context(
+            "Trend exists but is highly chaotic. Expect frequent stop-outs."
+        )
 
     # --- 5. EQUILIBRIUM & MEAN REVERSION (Regime 3 & 4) ---
     if "4 - UNSTABLE" in regime or "MEAN REVERSION" in judgment:
-        return "↕️ SCALP RANGE", "Market is mean-reverting. Sell resistance, buy support. Avoid trend-following."
+        return "↕️ SCALP RANGE", add_relative_context(
+            "Market is mean-reverting. Sell resistance, buy support. Avoid trend-following."
+        )
 
     if "3 - NEUTRAL" in regime:
         if "BULLISH ABSORPTION" in judgment:
-            return "➕ ACCUMULATE", "Price is sideways but aggressive buyers are soaking up supply."
-        return "💤 NEUTRAL", "Fractal noise. Wait for Hurst to break above 0.55 or below 0.45."
+            return "➕ ACCUMULATE", add_relative_context(
+                "Price is sideways but aggressive buyers are soaking up supply."
+            )
+        return "💤 NEUTRAL", add_relative_context(
+            "Fractal noise. Wait for Hurst to break above 0.55 or below 0.45."
+        )
 
-    return "🔎 MONITOR", "Metrics are inconclusive. Wait for fractal alignment."
+    return "🔎 MONITOR", add_relative_context("Metrics are inconclusive. Wait for fractal alignment.")
 
 
 def _get_session_open(data_1m, data_1d, session_date):
@@ -576,7 +642,7 @@ def _resolve_day_baseline(prev_close, session_open, market_ts_et):
     return float(prev_close)
 
 
-def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_new_data=True):
+def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_new_data=True, relative_signal=None):
     """
     Scan one ticker and return regime metrics + actionable fields.
 
@@ -740,6 +806,12 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
     else:
         prev_close = float(data_1d['Close'].iloc[-1])
     current_price = float(prices[-1])
+    mean_reversion_average = float(
+        pd.Series(prices, dtype=float)
+        .rolling(window=MEAN_REVERSION_AVERAGE_WINDOW, min_periods=1)
+        .mean()
+        .iloc[-1]
+    )
 
     # data_1m can include multiple days; isolate bars from the current ET date.
     idx_1m = pd.DatetimeIndex(pd.to_datetime(data_1m.index, errors="coerce"))
@@ -856,6 +928,7 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
         
         # --- PRICE ACTION ---
         "Price": float(prices[-1]),
+        "Mean Reversion Average": mean_reversion_average,
         "Open": float(session_open) if latest_daily_date == current_session_date else float(prev_close),
         "Day %": float(day_pct),
         "Day % Net": float(net_pct),
@@ -904,8 +977,9 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
 
         # 6. ADD SUGGESTION
         action, reason = generate_suggestion(
-            regime, judgment, entropy, alpha_eff, h_val, vpin, cvd_slope)
-        logger.info("StockTs=%s | Suggestion=%s | Reason=%s", market_ts, action, reason)
+            regime, judgment, entropy, alpha_eff, h_val, vpin, cvd_slope, relative_signal=relative_signal
+        )
+        logger.info("StockTs=%s | Suggestion=%s | Reason=%s | RelativeSignal=%s", market_ts, action, reason, relative_signal)
 
         # Update flow and action sections with judgment-derived data
         result.update({
@@ -913,6 +987,7 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
             "VPIN": float(vpin),
             "CVD Trend": f"{cvd_slope:.2f}",
             "CVD Threshold": float(cvd_threshold),
+            "Relative Signal": float(relative_signal) if relative_signal is not None else float('nan'),
             # Action section updates
             "Verdict": judgment,
             "Suggestion": action,
@@ -934,7 +1009,7 @@ if __name__ == "__main__":
     # Test on your Core Universe
     log_path = configure_scan_file_logging()
     logger.info("Mandelbrot scan logging enabled | file=%s", log_path)
-    tickers = ["MSFT"]
+    tickers = ["AMD"]
     while True:
         for t in tickers:
             scan_market(t)     

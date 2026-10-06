@@ -2,7 +2,7 @@ import datetime
 
 import pandas as pd
 
-from risk_modeling.mandelbrot import _get_session_open, _resolve_day_baseline
+from risk_modeling.mandelbrot import _get_session_open, _resolve_day_baseline, scan_market
 
 
 def test_session_open_prefers_official_daily_open_over_premarket_bar():
@@ -34,3 +34,52 @@ def test_day_baseline_uses_session_open_when_market_is_open():
     baseline = _resolve_day_baseline(100.0, 101.5, ts)
 
     assert baseline == 101.5
+
+
+def test_scan_market_returns_intraday_mean_reversion_average(monkeypatch):
+    intraday_index = pd.date_range("2026-07-15 13:30", periods=60, freq="min", tz="America/New_York")
+    intraday_prices = [100.0, 101.0, 102.0, 103.0] + [101.5] * 56
+    intraday_data = pd.DataFrame(
+        {
+            "Open": intraday_prices,
+            "Close": intraday_prices,
+            "Volume": [1000] * 60,
+        },
+        index=intraday_index,
+    )
+    daily_data = pd.DataFrame(
+        {
+            "Open": [99.0] * 129 + [100.0],
+            "High": [99.5] * 129 + [100.5],
+            "Low": [97.5] * 129 + [98.5],
+            "Close": [98.0] * 129 + [99.0],
+            "Volume": [10000] * 130,
+        },
+        index=pd.date_range("2026-03-08", periods=130, freq="D", tz="UTC"),
+    )
+
+    monkeypatch.setattr(
+        "risk_modeling.mandelbrot.calculate_hurst_vw",
+        lambda prices, volumes, window: 0.50,
+    )
+    monkeypatch.setattr(
+        "risk_modeling.mandelbrot.calculate_tail_index_robust",
+        lambda returns, lookback: 2.0,
+    )
+    monkeypatch.setattr(
+        "risk_modeling.mandelbrot.calculate_liquidity_signals",
+        lambda data, benchmark: {"cmf": 0.0, "breadth_ratio": 1.0, "breadth_slope": 0.0, "rsi": 50.0},
+    )
+    monkeypatch.setattr(
+        "risk_modeling.mandelbrot.get_data_persistent",
+        lambda ticker, interval="1d", period=None: pd.DataFrame(),
+    )
+
+    result = scan_market(
+        "TEST.TO",
+        data_1m=intraday_data,
+        data_1d=daily_data,
+        check_new_data=False,
+    )
+
+    assert result["Mean Reversion Average"] == 101.5

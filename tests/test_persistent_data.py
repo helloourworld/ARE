@@ -74,6 +74,46 @@ def test_get_data_persistent_initial_daily_download_uses_two_years(tmp_path, mon
     }]
 
 
+def test_get_data_persistent_redownloads_daily_row_with_missing_ohlc(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "data"
+    cache_dir.mkdir()
+    existing = pd.DataFrame(
+        {
+            "Open": [100.0, None],
+            "High": [101.0, None],
+            "Low": [99.0, None],
+            "Close": [100.5, None],
+            "Volume": [1000, 1200],
+        },
+        index=pd.to_datetime(["2026-09-21", "2026-09-22"]),
+    )
+    existing.to_csv(cache_dir / "cache_AAPL_1d.csv")
+    yahoo = DummyYF(pd.DataFrame(
+        {
+            "Open": [100.0, 102.0],
+            "High": [101.0, 103.0],
+            "Low": [99.0, 101.0],
+            "Close": [100.5, 102.5],
+            "Volume": [1000, 1200],
+        },
+        index=pd.to_datetime(["2026-09-21", "2026-09-22"]),
+    ))
+
+    monkeypatch.setattr(data_cache, "DATA_DIR", cache_dir)
+    monkeypatch.setattr(data_cache, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(data_cache, "yf", yahoo)
+
+    result = data_cache.get_data_persistent("AAPL", interval="1d", period="2y")
+
+    assert result.loc[pd.Timestamp("2026-09-22"), "Close"] == 102.5
+    assert yahoo.calls == [{
+        "ticker": "AAPL",
+        "period": None,
+        "interval": "1d",
+        "start": "2026-09-21",
+    }]
+
+
 def test_get_daily_returns_includes_start_date_return_and_excludes_today(monkeypatch):
     dates = pd.date_range("2024-01-02", periods=4, freq="D")
     prices = pd.DataFrame(

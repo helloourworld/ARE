@@ -6,8 +6,11 @@ All functions route through persistent cache in data_cache.py for automatic upda
 import csv
 from io import StringIO
 import json
+
+import pandas as pd
 import streamlit as st
 import requests
+import yfinance as yf
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from .data_cache import (
@@ -80,47 +83,71 @@ def _fetch_10y_yield_from_fred(timeout_seconds: int = 25, retries: int = 3, back
     }
 
 
+def _fetch_10y_yield_from_yfinance():
+    """Fallback source for 10Y Treasury yield when FRED is unavailable."""
+    raw = yf.download(
+        "^TNX",
+        period="10d",
+        interval="1d",
+        progress=False,
+        auto_adjust=False,
+        actions=False,
+    )
+    if raw is None or raw.empty:
+        raise ValueError("Yahoo Finance returned no 10Y Treasury data")
+
+    if "Close" in raw.columns:
+        series = pd.to_numeric(raw["Close"], errors="coerce").dropna()
+    elif len(raw.columns) > 0:
+        series = pd.to_numeric(raw.iloc[:, 0], errors="coerce").dropna()
+    else:
+        raise ValueError("Yahoo Finance 10Y Treasury series is empty")
+
+    if series.empty:
+        raise ValueError("Yahoo Finance 10Y Treasury series is empty")
+
+    latest = float(series.iloc[-1])
+    prev_close = float(series.iloc[-2]) if len(series) >= 2 else latest
+    delta = latest - prev_close
+    delta_pct = (delta / prev_close * 100) if prev_close != 0 else 0.0
+
+    return {"val": latest, "delta": delta, "delta_pct": delta_pct}
+
 
 @st.cache_data(ttl=900)
 def get_10y_yield():
-    """Fetch the 10-year U.S. Treasury yield from FRED.
-
-    Resilient behavior:
-    - retries with longer timeout
-    - if still failing, falls back to last persisted local value
-    """
+    """Fetch the 10-year U.S. Treasury yield with resilient fallbacks."""
     from pathlib import Path
 
     fred_cache_path = Path(__file__).resolve().parents[1] / "data" / "fred_dgs10_last.json"
 
     try:
         val = _fetch_10y_yield_from_fred(timeout_seconds=25, retries=3)
-
-        # Persist last success for offline/timeout fallback
-        import json
-
         fred_cache_path.parent.mkdir(parents=True, exist_ok=True)
         with open(fred_cache_path, "w", encoding="utf-8") as f:
             json.dump(val, f)
-
         return val
     except Exception as exc:
-        # Fallback: read last successful value
         try:
             if fred_cache_path.exists():
-                import json
-
                 with open(fred_cache_path, "r", encoding="utf-8") as f:
                     cached = json.load(f) or None
-
                 if cached and all(k in cached for k in ("val", "delta", "delta_pct")):
                     return cached
         except Exception:
             pass
 
-        raise RuntimeError(
-            f"Unable to fetch 10-year yield from FRED (and no valid fallback found): {exc}"
-        ) from exc
+        try:
+            yf_value = _fetch_10y_yield_from_yfinance()
+            fred_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(fred_cache_path, "w", encoding="utf-8") as f:
+                json.dump(yf_value, f)
+            return yf_value
+        except Exception as yf_exc:
+            raise RuntimeError(
+                "Unable to fetch 10-year yield from FRED or Yahoo Finance, and no valid fallback found: "
+                f"FRED={exc}; YF={yf_exc}"
+            ) from exc
 
 
 
