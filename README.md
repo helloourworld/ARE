@@ -44,6 +44,8 @@ ARE utilizes institutional-grade Python libraries to execute the following model
 
 * Black-Litterman Allocation: Blending market equilibrium weights with analyst-specific views on GIL (Post-Merger Value) and SNDK (Infrastructure Peak).
 
+* Market News Sentiment: Yahoo Finance headlines are scored with pretrained FinBERT. The headline score is positive-class probability minus negative-class probability; a 24-hour half-life weights recent headlines more heavily when aggregating sentiment. The dashboard also reports sentiment breadth, model confidence, and effective news count. Google News RSS is used only if Yahoo Finance returns no headlines and is restricted to personal, non-commercial feed-reader use. These are language indicators, not return forecasts or standalone trade signals.
+
 Current Strategic Views (2026 Q2)
 ---------------------------------
 

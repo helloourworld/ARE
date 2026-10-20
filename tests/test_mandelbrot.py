@@ -1,6 +1,7 @@
 import datetime
 
 import pandas as pd
+import pytest
 
 from risk_modeling.mandelbrot import _get_session_open, _resolve_day_baseline, scan_market
 
@@ -66,13 +67,37 @@ def test_scan_market_returns_intraday_mean_reversion_average(monkeypatch):
         "risk_modeling.mandelbrot.calculate_tail_index_robust",
         lambda returns, lookback: 2.0,
     )
+    liquidity_benchmarks = []
+
+    def capture_liquidity_benchmark(data, benchmark):
+        liquidity_benchmarks.append(benchmark)
+        return {"cmf": 0.0, "breadth_ratio": 1.0, "breadth_slope": 0.0, "rsi": 50.0}
+
+    def unexpected_data_load(*args, **kwargs):
+        raise AssertionError("scan should use the supplied benchmark data")
+
+    stress_inputs = {
+        "vix": pd.DataFrame({"Close": [20.0]}),
+        "high_yield": pd.DataFrame({"BAMLH0A0HYM2": [3.0]}),
+        "investment_grade": pd.DataFrame({"BAMLC0A0CM": [1.0]}),
+    }
+    stress_arguments = {}
+
+    def capture_stress_inputs(data, benchmark, **kwargs):
+        stress_arguments.update(kwargs)
+        return None
+
     monkeypatch.setattr(
         "risk_modeling.mandelbrot.calculate_liquidity_signals",
-        lambda data, benchmark: {"cmf": 0.0, "breadth_ratio": 1.0, "breadth_slope": 0.0, "rsi": 50.0},
+        capture_liquidity_benchmark,
     )
     monkeypatch.setattr(
         "risk_modeling.mandelbrot.get_data_persistent",
-        lambda ticker, interval="1d", period=None: pd.DataFrame(),
+        unexpected_data_load,
+    )
+    monkeypatch.setattr(
+        "risk_modeling.mandelbrot.calculate_stress_score",
+        capture_stress_inputs,
     )
 
     result = scan_market(
@@ -80,6 +105,14 @@ def test_scan_market_returns_intraday_mean_reversion_average(monkeypatch):
         data_1m=intraday_data,
         data_1d=daily_data,
         check_new_data=False,
+        benchmark_data=daily_data,
+        stress_data=stress_inputs,
     )
 
     assert result["Mean Reversion Average"] == 101.5
+    assert result["Support (S1)"] == pytest.approx(97.16666666666667)
+    assert result["Resistance (R1)"] == pytest.approx(99.16666666666667)
+    assert liquidity_benchmarks == [daily_data]
+    assert stress_arguments["vix_df"] is stress_inputs["vix"]
+    assert stress_arguments["credit_spread_df"] is stress_inputs["high_yield"]
+    assert stress_arguments["ig_spread_df"] is stress_inputs["investment_grade"]

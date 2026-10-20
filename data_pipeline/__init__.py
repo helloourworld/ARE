@@ -16,6 +16,7 @@ from .data_cache import (
     get_fred_series_persistent,
     get_data_persistent,
     get_ohlcv_history,
+    get_ohlcv_history_batch,
     force_refresh_ticker,
     get_official_session_open,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "get_data_persistent",
     "get_fred_series_persistent",
     "get_ohlcv_history",
+    "get_ohlcv_history_batch",
     "force_refresh_ticker",
     "get_10y_yield"
 ]

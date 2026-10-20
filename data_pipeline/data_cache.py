@@ -572,6 +572,50 @@ def get_data_persistent(ticker, interval="1d", period="2y", force_refresh=False)
         return pd.DataFrame()
 
 
+def get_ohlcv_history_batch(tickers, period="7d", interval="1m"):
+    """Download and persist OHLCV histories for multiple tickers in one request."""
+    normalized_tickers = list(dict.fromkeys(_normalize_tickers(tickers)))
+    if not normalized_tickers:
+        return {}
+
+    downloaded = yf.download(
+        tickers=normalized_tickers,
+        period=period,
+        interval=interval,
+        prepost=True,
+        progress=False,
+        threads=True,
+        group_by="ticker",
+    )
+    results = {}
+
+    for ticker in normalized_tickers:
+        ticker_data = pd.DataFrame()
+        if downloaded is not None and not downloaded.empty:
+            if isinstance(downloaded.columns, pd.MultiIndex):
+                for level in range(downloaded.columns.nlevels):
+                    if ticker in downloaded.columns.get_level_values(level):
+                        ticker_data = downloaded.xs(
+                            ticker, axis=1, level=level, drop_level=True
+                        )
+                        break
+            elif len(normalized_tickers) == 1:
+                ticker_data = downloaded
+
+        if isinstance(ticker_data.columns, pd.MultiIndex):
+            ticker_data.columns = ticker_data.columns.get_level_values(0)
+        ticker_data = _normalize_yf_df(
+            ticker_data.dropna(how="all"), interval=interval
+        )
+        if not ticker_data.empty:
+            safe_ticker = str(ticker).replace("/", "_").replace("=", "_")
+            file_path = _get_cache_path(f"cache_{safe_ticker}_{interval}.csv")
+            ticker_data = _cache_dataframe(ticker_data, file_path)
+        results[ticker] = ticker_data
+
+    return results
+
+
 # ============================================================================
 # CONSOLIDATED DATA FETCHING INTERFACE - All methods route through cache
 # ============================================================================
@@ -579,6 +623,7 @@ def get_data_persistent(ticker, interval="1d", period="2y", force_refresh=False)
 __all__ = [
     "get_data_from_ib",
     "get_data_persistent",
+    "get_ohlcv_history_batch",
     "get_fred_series_persistent",
     "get_daily_returns",
     "get_price_history",

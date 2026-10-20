@@ -4,6 +4,8 @@ import logging
 import os
 from pathlib import Path
 import sys
+from time import perf_counter
+from concurrent.futures import ThreadPoolExecutor
 
 # Avoid loky physical-core detection warning on some Windows setups.
 os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(os.cpu_count() or 1))
@@ -48,9 +50,18 @@ from pypfopt import (
 
 # Local application modules
 from frontier_plots import plot_institutional_frontier
-from data_pipeline import get_daily_returns, get_price_history, get_price_history_with_benchmark, get_premarket_data, get_live_intraday, get_data_persistent, get_official_session_open
+from data_pipeline import get_daily_returns, get_price_history, get_price_history_with_benchmark, get_premarket_data, get_live_intraday, get_data_persistent, get_ohlcv_history_batch, get_fred_series_persistent, get_official_session_open
+from alpha_research.market_news import (
+    DEFAULT_FINBERT_MODEL,
+    MarketNewsError,
+    analyze_market_news,
+)
 from risk_modeling import AlphaRiskEngine, calculate_mansfield_rs, monitor_mean_reversion, calculate_rs_bollinger_bands, get_rs_signals, detect_rs_hook
-from risk_modeling.mandelbrot import scan_market
+from risk_modeling.mandelbrot import (
+    FRED_HIGH_YIELD_SERIES,
+    FRED_INVESTMENT_GRADE_SERIES,
+    scan_market,
+)
 from risk_modeling.market_breadth import (
     get_sp500_tickers, download_prices, download_etfs,
     calculate_breadth, calculate_sector_breadth, breadth_signal, append_current_prices,
@@ -71,6 +82,226 @@ from plotly.subplots import make_subplots
 
 # Configure the page before creating any Streamlit elements.
 st.set_page_config(page_title="Alpha Risk Engine (ARE)", page_icon="🤖", layout="wide")
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_scan_intraday_batch(tickers):
+    return get_ohlcv_history_batch(
+        tickers, interval="1m", period="7d"
+    )
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_scan_intraday_data(ticker):
+    return get_data_persistent(
+        ticker, interval="1m", period="7d", force_refresh=True
+    )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_scan_daily_data(ticker):
+    return get_data_persistent(ticker, interval="1d", period="2y")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_scan_vix_data():
+    return get_data_persistent("^VIX", interval="1d", period="10y")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_scan_credit_data(series_id):
+    return get_fred_series_persistent(series_id, period="10y")
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_market_news_analysis(ticker, lookback_hours, model_name):
+    return analyze_market_news(
+        ticker,
+        lookback_hours=lookback_hours,
+        model_name=model_name,
+    )
+
+
+def build_mean_reversion_chart(ticker, intraday_data, support, resistance):
+    """Build a current-session chart with daily pivots and intraday context."""
+    required_columns = {"Close", "Volume"}
+    if intraday_data is None or intraday_data.empty:
+        raise ValueError(f"No intraday data is available for {ticker}.")
+    if not required_columns.issubset(intraday_data.columns):
+        missing = ", ".join(sorted(required_columns - set(intraday_data.columns)))
+        raise ValueError(f"Intraday chart data for {ticker} is missing: {missing}.")
+
+    chart_data = intraday_data.copy()
+    chart_index = pd.DatetimeIndex(pd.to_datetime(chart_data.index, errors="coerce"))
+    valid_index = ~chart_index.isna()
+    chart_data = chart_data.loc[valid_index].copy()
+    chart_index = chart_index[valid_index]
+    if chart_index.tz is not None:
+        chart_index = chart_index.tz_convert("America/New_York")
+    chart_data.index = chart_index
+    chart_data = chart_data.sort_index()
+    chart_data = chart_data[~chart_data.index.duplicated(keep="last")]
+    if chart_data.empty:
+        raise ValueError(f"No valid timestamps are available for {ticker}'s intraday chart.")
+
+    session_date = chart_data.index[-1].date()
+    session_data = chart_data.loc[chart_data.index.date == session_date].copy()
+    session_data["Close"] = pd.to_numeric(session_data["Close"], errors="coerce")
+    session_data["Volume"] = pd.to_numeric(session_data["Volume"], errors="coerce").clip(lower=0)
+    session_data = session_data.dropna(subset=["Close", "Volume"])
+    if session_data.empty:
+        raise ValueError(f"No valid price and volume bars are available for {ticker}'s session.")
+
+    close = session_data["Close"]
+    typical_price = close
+    if {"High", "Low"}.issubset(session_data.columns):
+        high = pd.to_numeric(session_data["High"], errors="coerce")
+        low = pd.to_numeric(session_data["Low"], errors="coerce")
+        typical_price = (high + low + close) / 3.0
+
+    volume_sum = session_data["Volume"].cumsum().replace(0, np.nan)
+    session_data["VWAP"] = (typical_price * session_data["Volume"]).cumsum() / volume_sum
+    session_data["Mean"] = close.rolling(window=20, min_periods=1).mean()
+    rolling_mean = close.rolling(window=20, min_periods=20).mean()
+    rolling_std = close.rolling(window=20, min_periods=20).std(ddof=0)
+    session_data["BB Upper"] = rolling_mean + 2 * rolling_std
+    session_data["BB Lower"] = rolling_mean - 2 * rolling_std
+
+    change = close.diff()
+    average_gain = change.clip(lower=0).rolling(window=14, min_periods=14).mean()
+    average_loss = -change.clip(upper=0).rolling(window=14, min_periods=14).mean()
+    relative_strength = average_gain / average_loss.replace(0, np.nan)
+    session_data["RSI"] = 100 - (100 / (1 + relative_strength))
+    session_data.loc[(average_loss == 0) & (average_gain > 0), "RSI"] = 100
+    session_data.loc[(average_loss == 0) & (average_gain == 0), "RSI"] = 50
+
+    figure = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.04,
+        row_heights=[0.62, 0.16, 0.22],
+        subplot_titles=("Price, VWAP & daily pivots", "Volume", "RSI (14)"),
+    )
+    ohlc_columns = {"Open", "High", "Low", "Close"}
+    if ohlc_columns.issubset(session_data.columns):
+        figure.add_trace(
+            go.Candlestick(
+                x=session_data.index,
+                open=pd.to_numeric(session_data["Open"], errors="coerce"),
+                high=pd.to_numeric(session_data["High"], errors="coerce"),
+                low=pd.to_numeric(session_data["Low"], errors="coerce"),
+                close=close,
+                name="Price",
+            ),
+            row=1,
+            col=1,
+        )
+    else:
+        figure.add_trace(
+            go.Scatter(x=session_data.index, y=close, name="Price", line={"color": "#4c78a8"}),
+            row=1,
+            col=1,
+        )
+
+    figure.add_trace(
+        go.Scatter(x=session_data.index, y=session_data["VWAP"], name="Session VWAP"),
+        row=1,
+        col=1,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=session_data.index,
+            y=session_data["Mean"],
+            name="20-bar mean",
+            line={"color": "#f2a541", "dash": "dot"},
+        ),
+        row=1,
+        col=1,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=session_data.index,
+            y=session_data["BB Upper"],
+            name="Bollinger upper",
+            line={"color": "#8c72b2", "width": 1},
+        ),
+        row=1,
+        col=1,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=session_data.index,
+            y=session_data["BB Lower"],
+            name="Bollinger lower",
+            line={"color": "#8c72b2", "width": 1, "dash": "dot"},
+            fill="tonexty",
+            fillcolor="rgba(140, 114, 178, 0.10)",
+        ),
+        row=1,
+        col=1,
+    )
+    for label, level, color in (
+        ("S1 support", support, "#2ca02c"),
+        ("R1 resistance", resistance, "#d62728"),
+    ):
+        if level is not None and pd.notna(level) and np.isfinite(level):
+            figure.add_hline(
+                y=float(level),
+                line_dash="dash",
+                line_color=color,
+                annotation_text=f"{label} {float(level):.2f}",
+                row=1,
+                col=1,
+            )
+
+    if {"Open", "Close"}.issubset(session_data.columns):
+        bar_colors = np.where(
+            pd.to_numeric(session_data["Close"], errors="coerce")
+            >= pd.to_numeric(session_data["Open"], errors="coerce"),
+            "#2ca02c",
+            "#d62728",
+        )
+    else:
+        bar_colors = "#7f8c8d"
+    figure.add_trace(
+        go.Bar(
+            x=session_data.index,
+            y=session_data["Volume"],
+            marker_color=bar_colors,
+            name="Volume",
+            showlegend=False,
+        ),
+        row=2,
+        col=1,
+    )
+    figure.add_trace(
+        go.Scatter(x=session_data.index, y=session_data["RSI"], name="RSI (14)"),
+        row=3,
+        col=1,
+    )
+    for level in (30, 70):
+        figure.add_hline(
+            y=level,
+            line_dash="dash",
+            line_color="#888888",
+            row=3,
+            col=1,
+        )
+
+    figure.update_layout(
+        title=f"{ticker} intraday mean-reversion chart — {session_date}",
+        height=800,
+        hovermode="x unified",
+        xaxis_rangeslider_visible=False,
+        legend={"orientation": "h", "y": 1.02, "x": 0},
+    )
+    figure.update_yaxes(title_text="Price", row=1, col=1)
+    figure.update_yaxes(title_text="Volume", row=2, col=1)
+    figure.update_yaxes(title_text="RSI", range=[0, 100], row=3, col=1)
+    figure.update_xaxes(title_text="Time (ET)", row=3, col=1)
+    return figure
+
 
 # Apply default request headers for all requests sessions so yfinance uses headers
 DEFAULT_REQUEST_HEADERS = {
@@ -187,7 +418,7 @@ def normalize_timestamp_for_index(value, index):
     return ts
 
 
-def get_reference_price(ticker: str, series: pd.Series):
+def get_reference_price(ticker: str, series: pd.Series, daily_data=None):
     if series is None or series.empty:
         return None, "Unknown"
 
@@ -217,7 +448,14 @@ def get_reference_price(ticker: str, series: pd.Series):
         
     today_open_mask = [d == current_date and t >= datetime.time(9, 30)
                        for d, t in zip(est_index.date, est_index.time)]
-    today_open = get_official_session_open(ticker, current_date) if any(today_open_mask) else None
+    today_open = None
+    if any(today_open_mask):
+        if daily_data is not None and "Open" in daily_data:
+            daily_index = pd.DatetimeIndex(pd.to_datetime(daily_data.index, errors="coerce"))
+            daily_open = daily_data.loc[daily_index.date == current_date, "Open"].dropna()
+            today_open = float(daily_open.iloc[-1]) if not daily_open.empty else None
+        if today_open is None:
+            today_open = get_official_session_open(ticker, current_date)
 
     if premarket or today_open is None:
         return prev_close, "Previous Close"
@@ -487,10 +725,10 @@ market_caps = {ticker: yf.Ticker(ticker).info.get(
 
 
 # --- APP TABS ---
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab_dd, tab_watch, *rest = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab_dd, tab_watch, tab_news, *rest = st.tabs(
     ["📈 MARKET BREADTH", "⚖️LIVE MARKET", "📊 MARKET RISK", "📡 ALPHA PERSISTENCE", "🔮 FORECAST PORTAL",
     "🧠 FACTOR ATTRIBUTION", "🛡️ RISK REPORT", "📶 REBALANCING (BL)", "🧭 EFFICIENT FRONTIER", "🧪 SCENARIO STRESS TEST",
-    "📉 DrawDown", "👀 Watch List"])
+    "📉 DrawDown", "👀 Watch List", "📰 News Sentiment"])
 
 # =============================================================================
 # TAB 1: MARKET BREADTH PORTAL
@@ -836,35 +1074,182 @@ with tab3:
         import io
         from contextlib import redirect_stdout
 
+        scan_started = perf_counter()
         st.info(
             f"Scanning all {len(monitor_list)} tickers for regime signals...")
 
         all_signals = []
+        scan_tickers = sorted(monitor_list)
+        intraday_started = perf_counter()
+        try:
+            intraday_by_ticker = get_scan_intraday_batch(tuple(scan_tickers))
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Batched intraday download failed; using per-ticker fallback | error_type=%s",
+                type(exc).__name__,
+            )
+            st.warning(
+                "Batched intraday download failed; falling back to parallel "
+                f"per-ticker requests ({type(exc).__name__})."
+            )
+            with ThreadPoolExecutor(max_workers=min(8, len(scan_tickers) or 1)) as executor:
+                fallback_data = executor.map(get_scan_intraday_data, scan_tickers)
+                intraday_by_ticker = dict(zip(scan_tickers, fallback_data))
+
+        missing_intraday = [
+            ticker for ticker in scan_tickers
+            if ticker not in intraday_by_ticker
+            or intraday_by_ticker[ticker] is None
+            or intraday_by_ticker[ticker].empty
+        ]
+        if missing_intraday:
+            logging.getLogger(__name__).warning(
+                "Batched intraday download missing symbols; retrying individually | count=%s",
+                len(missing_intraday),
+            )
+            st.warning(
+                "Retrying missing intraday data individually for: "
+                + ", ".join(missing_intraday)
+            )
+            with ThreadPoolExecutor(max_workers=min(8, len(missing_intraday))) as executor:
+                fallback_data = executor.map(
+                    get_scan_intraday_data, missing_intraday
+                )
+                intraday_by_ticker.update(zip(missing_intraday, fallback_data))
+        intraday_finished = perf_counter()
+        benchmark_tickers = tuple(
+            sorted({"XIU.TO" if ticker.upper().endswith(".TO") else "RSP" for ticker in scan_tickers})
+        )
+        shared_loaders = {
+            "selected_daily": lambda: get_scan_daily_data(selected_benchmark),
+        }
+        shared_loaders.update({
+            f"benchmark:{benchmark}": lambda benchmark=benchmark: get_scan_daily_data(
+                benchmark
+            )
+            for benchmark in benchmark_tickers
+            if benchmark != selected_benchmark
+        })
+        shared_loaders.update({
+            "vix": get_scan_vix_data,
+            "high_yield": lambda: get_scan_credit_data(FRED_HIGH_YIELD_SERIES),
+            "investment_grade": lambda: get_scan_credit_data(
+                FRED_INVESTMENT_GRADE_SERIES
+            ),
+        })
+
+        def load_shared_input(item):
+            key, loader = item
+            try:
+                return key, loader(), None
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "Shared market-risk input unavailable | input=%s | error_type=%s",
+                    key,
+                    type(exc).__name__,
+                )
+                return key, pd.DataFrame(), exc
+
+        with ThreadPoolExecutor(max_workers=min(8, len(shared_loaders))) as executor:
+            loaded_inputs = list(executor.map(load_shared_input, shared_loaders.items()))
+        shared_inputs = {key: value for key, value, _ in loaded_inputs}
+        benchmark_intraday = intraday_by_ticker.get(
+            selected_benchmark, pd.DataFrame()
+        )
+        benchmark_daily = shared_inputs["selected_daily"]
         benchmark_change = 0.0
-        benchmark_series = get_live_intraday([selected_benchmark], period="2d").get(selected_benchmark, pd.Series(dtype=float))
+        benchmark_series = (
+            benchmark_intraday["Close"].dropna()
+            if not benchmark_intraday.empty and "Close" in benchmark_intraday
+            else pd.Series(dtype=float)
+        )
         if not benchmark_series.empty:
-            bench_series = benchmark_series.dropna()
-            bench_current = bench_series.iloc[-1]
-            bench_ref_price, _ = get_reference_price(selected_benchmark, bench_series)
+            bench_current = benchmark_series.iloc[-1]
+            bench_ref_price, _ = get_reference_price(
+                selected_benchmark, benchmark_series, daily_data=benchmark_daily
+            )
             if bench_ref_price is not None:
                 benchmark_change = (bench_current / bench_ref_price - 1) * 100 if bench_ref_price else 0.0
-        for ticker in sorted(monitor_list):
+
+        benchmark_history = {
+            benchmark: (
+                benchmark_daily
+                if benchmark == selected_benchmark
+                else shared_inputs[f"benchmark:{benchmark}"]
+            )
+            for benchmark in benchmark_tickers
+        }
+        stress_data = {
+            key: shared_inputs[key]
+            for key in ("vix", "high_yield", "investment_grade")
+        }
+        failed_shared_inputs = [
+            f"{key} ({type(error).__name__})"
+            for key, _, error in loaded_inputs
+            if error is not None
+        ]
+        if failed_shared_inputs:
+            st.warning(
+                "Some shared market-risk data could not be loaded; affected indicators "
+                f"may be unavailable. {'; '.join(failed_shared_inputs)}"
+            )
+        shared_data_ready = perf_counter()
+
+        def scan_ticker(ticker):
             try:
+                data_1m = intraday_by_ticker.get(ticker, pd.DataFrame())
+                if ticker == selected_benchmark:
+                    data_1d = benchmark_daily
+                else:
+                    data_1d = get_scan_daily_data(ticker)
                 rel_perf = None
                 if ticker != selected_benchmark:
-                    live_data = get_live_intraday([ticker, selected_benchmark], period="2d")
-                    ticker_series = live_data.get(ticker, pd.Series(dtype=float)).dropna()
+                    ticker_series = (
+                        data_1m["Close"].dropna()
+                        if not data_1m.empty and "Close" in data_1m
+                        else pd.Series(dtype=float)
+                    )
                     if not ticker_series.empty:
                         current_p = ticker_series.iloc[-1]
-                        ref_price, _ = get_reference_price(ticker, ticker_series)
+                        ref_price, _ = get_reference_price(
+                            ticker, ticker_series, daily_data=data_1d
+                        )
                         prev_p = ref_price if ref_price is not None else ticker_series.iloc[0]
                         change_pct = (current_p - prev_p) / prev_p * 100 if prev_p else 0.0
                         rel_perf = change_pct - benchmark_change
-                result = scan_market(ticker, relative_signal=rel_perf)
+                benchmark_ticker = "XIU.TO" if ticker.upper().endswith(".TO") else "RSP"
+                result = scan_market(
+                    ticker,
+                    data_1m=data_1m,
+                    data_1d=data_1d,
+                    relative_signal=rel_perf,
+                    benchmark_data=benchmark_history[benchmark_ticker],
+                    stress_data=stress_data,
+                )
+                return ticker, result, data_1m
             except Exception as e:
                 print(f"Error scanning {ticker}: {e}")
-                continue
+                return ticker, None, pd.DataFrame()
 
+        with ThreadPoolExecutor(max_workers=min(8, len(scan_tickers) or 1)) as executor:
+            scan_results = list(executor.map(scan_ticker, scan_tickers))
+        scans_finished = perf_counter()
+        st.caption(
+            f"Batch 1m download: {intraday_finished - intraday_started:.1f}s · "
+            f"Shared daily/risk data: {shared_data_ready - intraday_finished:.1f}s · "
+            f"Parallel ticker scans: {scans_finished - shared_data_ready:.1f}s"
+        )
+        missing_intraday = [
+            ticker for ticker, data in intraday_by_ticker.items()
+            if data is None or data.empty
+        ]
+        if missing_intraday:
+            st.warning(
+                "No intraday bars were loaded for: "
+                + ", ".join(missing_intraday)
+            )
+
+        for ticker, result, data_1m in scan_results:
             if isinstance(result, dict) and result.get("Regime"):
                 cvd_icon = get_cvd_icon(result.get("CVD Trend", "N/A"))
                 all_signals.append({
@@ -875,6 +1260,14 @@ with tab3:
                     # --- PRICE ACTION ---
                     "Price": f"{result.get('Price', 0.0):.2f}",
                     "20-Min Intraday Mean": f"{result.get('Mean Reversion Average', float('nan')):.2f}",
+                    "Support (S1)": (
+                        f"{result['Support (S1)']:.2f}"
+                        if pd.notna(result.get("Support (S1)")) else "N/A"
+                    ),
+                    "Resistance (R1)": (
+                        f"{result['Resistance (R1)']:.2f}"
+                        if pd.notna(result.get("Resistance (R1)")) else "N/A"
+                    ),
                     "Open": f"{result.get('Open', 0.0):.2f}",
                     "Day % Net": f"{result.get('Day % Net', 0.0):.2f}%",
                     "Day %": f"{result.get('Day %', 0.0):.2f}%",
@@ -909,7 +1302,7 @@ with tab3:
                 # Optionally save plots per ticker
                 if save_plots:
                     try:
-                        intraday = get_data_persistent(ticker, interval="1m", period="7d", force_refresh=True)
+                        intraday = data_1m
                         if intraday is not None and not intraday.empty:
                             # Get last 2 consecutive days of data
                             intraday = intraday.sort_index().tail(2880)  # 1440 minutes per day * 2
@@ -978,6 +1371,9 @@ with tab3:
                 by=["Signal/Regime", "Day % Net"], ascending=False
             )
             st.subheader("📊 All Risk Alert Signals")
+            st.caption(
+                "S1/R1 use classic daily pivot formulas based on the last completed daily candle."
+            )
             st.dataframe(
                 df_signals,
                 hide_index=True,
@@ -1000,7 +1396,13 @@ with tab3:
     )
     
     if st.button("Run"):
-        result = scan_market(alert_ticker)
+        chart_intraday_data = get_scan_intraday_data(alert_ticker)
+        chart_daily_data = get_scan_daily_data(alert_ticker)
+        result = scan_market(
+            alert_ticker,
+            data_1m=chart_intraday_data,
+            data_1d=chart_daily_data,
+        )
 
         if not isinstance(result, dict):
             st.error(f"Scan failed: {result}")
@@ -1014,18 +1416,46 @@ with tab3:
 
             current_price = float(result['Price'])
             mean_reversion_average = result.get('Mean Reversion Average')
+            support_level = result.get("Support (S1)")
+            resistance_level = result.get("Resistance (R1)")
             if isinstance(mean_reversion_average, (float, int)) and np.isfinite(mean_reversion_average):
                 average_distance_pct = (current_price / mean_reversion_average - 1) * 100
-                price_col, average_col = st.columns(2)
-                price_col.metric("Price", f"{current_price:.2f}")
-                average_col.metric(
-                    "20-Min Intraday Mean",
-                    f"{mean_reversion_average:.2f}",
-                    delta=f"{average_distance_pct:+.2f}% vs average",
-                    delta_color="inverse" if average_distance_pct > 0 else "normal",
-                )
             else:
-                st.write(f"**Price:** {current_price:.2f}")
+                average_distance_pct = None
+            price_col, average_col, support_col, resistance_col = st.columns(4)
+            price_col.metric("Price", f"{current_price:.2f}")
+            average_col.metric(
+                "20-Min Intraday Mean",
+                f"{mean_reversion_average:.2f}" if average_distance_pct is not None else "N/A",
+                delta=f"{average_distance_pct:+.2f}% vs average" if average_distance_pct is not None else None,
+                delta_color="inverse" if average_distance_pct is not None and average_distance_pct > 0 else "normal",
+            )
+            support_col.metric(
+                "Pivot Support (S1)",
+                f"{support_level:.2f}" if pd.notna(support_level) else "N/A",
+            )
+            resistance_col.metric(
+                "Pivot Resistance (R1)",
+                f"{resistance_level:.2f}" if pd.notna(resistance_level) else "N/A",
+            )
+            st.caption(
+                "S1/R1 are classic daily pivot levels calculated from the last completed daily candle."
+            )
+            try:
+                mean_reversion_figure = build_mean_reversion_chart(
+                    alert_ticker,
+                    chart_intraday_data,
+                    support_level,
+                    resistance_level,
+                )
+            except ValueError as exc:
+                st.warning(f"Chart unavailable: {exc}")
+            else:
+                st.plotly_chart(mean_reversion_figure, width="stretch")
+                st.caption(
+                    "VWAP resets each session; Bollinger Bands use 20 bars and 2 standard deviations; "
+                    "RSI uses 14 bars. These are context indicators, not standalone trade signals."
+                )
             st.write(f"**Daily Return (Session Baseline):** {result['Day %']:.2f}%")
             st.write(f"**Daily Return (Net):** {result.get('Day % Net', float('nan')):.2f}%")
             render_metric_with_threshold(
@@ -1990,6 +2420,212 @@ with tab_watch:
             plt.close(watch_fig)
     else:
         st.info("Select at least one ticker to display the market watch.")
+
+# =============================================================================
+# TAB: QUANTITATIVE MARKET NEWS
+# =============================================================================
+with tab_news:
+    st.header("Quantitative Market News")
+    st.caption(
+        "Recent Yahoo Finance headlines scored with the pretrained FinBERT "
+        "financial-language model (Google News RSS fallback). "
+        "This is for personal, non-commercial research and is not a return forecast."
+    )
+
+    news_controls = st.columns([1, 1, 2])
+    news_ticker = news_controls[0].text_input(
+        "Ticker",
+        value=selected_benchmark,
+        key="market_news_ticker",
+    ).strip().upper()
+    lookback_choice = news_controls[1].selectbox(
+        "News lookback",
+        options=[("24 hours", 24), ("3 days", 72), ("7 days", 168)],
+        format_func=lambda choice: choice[0],
+        index=1,
+        key="market_news_lookback",
+    )
+    news_model = news_controls[2].text_input(
+        "FinBERT model",
+        value=DEFAULT_FINBERT_MODEL,
+        help="The model is downloaded and cached locally on first analysis if it is not already installed.",
+        key="market_news_model",
+    ).strip()
+    analyze_clicked = st.button("Analyze news", key="market_news_analyze")
+    refresh_clicked = st.button("Refresh headlines and analyze", key="market_news_refresh")
+
+    if refresh_clicked:
+        get_market_news_analysis.clear()
+    if analyze_clicked or refresh_clicked:
+        if not news_ticker or not news_model:
+            st.error("Enter a ticker and a FinBERT model name.")
+        else:
+            try:
+                with st.spinner(
+                    "Fetching recent headlines and scoring them with FinBERT. "
+                    "The first run may download the model."
+                ):
+                    scored_news, news_indicators = get_market_news_analysis(
+                        news_ticker,
+                        lookback_choice[1],
+                        news_model,
+                    )
+            except (ImportError, MarketNewsError, OSError, RuntimeError, ValueError) as exc:
+                logging.getLogger(__name__).exception(
+                    "Market news analysis failed | ticker=%s", news_ticker
+                )
+                st.error(
+                    f"Market news analysis failed ({type(exc).__name__}): {exc}"
+                )
+            else:
+                if scored_news.empty:
+                    st.info(
+                        f"No relevant headlines were found for {news_ticker} "
+                        f"in the selected {lookback_choice[0].lower()} window."
+                    )
+
+                score = news_indicators["news_sentiment"]
+                breadth = news_indicators["sentiment_breadth"]
+                confidence = news_indicators["sentiment_confidence"]
+                metric_columns = st.columns(5)
+                metric_columns[0].metric("Sentiment context", news_indicators["signal"])
+                metric_columns[1].metric(
+                    "News sentiment",
+                    f"{score:+.2f}" if pd.notna(score) else "N/A",
+                    help="Recency-weighted FinBERT positive probability minus negative probability (range -1 to +1).",
+                )
+                metric_columns[2].metric(
+                    "Sentiment breadth",
+                    f"{breadth:+.2f}" if pd.notna(breadth) else "N/A",
+                    help="Positive headline share minus negative headline share (range -1 to +1).",
+                )
+                metric_columns[3].metric(
+                    "Model confidence",
+                    f"{confidence:.0%}" if pd.notna(confidence) else "N/A",
+                    help="Recency-weighted highest FinBERT class probability; not the probability of a profitable trade.",
+                )
+                metric_columns[4].metric(
+                    "Headlines / effective",
+                    f"{news_indicators['news_count']} / "
+                    f"{news_indicators['effective_news_count']:.1f}",
+                    help="Effective count discounts older news using a 24-hour half-life.",
+                )
+                st.caption(
+                    f"Signal strength (sample-adjusted): "
+                    f"{news_indicators['signal_strength']:+.2f}"
+                    if pd.notna(news_indicators["signal_strength"])
+                    else "Signal strength unavailable: no usable scored headlines."
+                )
+
+                if not scored_news.empty:
+                    chart_news = scored_news.sort_values("published_at")
+                    colors = chart_news["sentiment_label"].map({
+                        "Positive": "#2ca02c",
+                        "Neutral": "#7f7f7f",
+                        "Negative": "#d62728",
+                    }).fillna("#1f77b4")
+                    news_figure = make_subplots(
+                        rows=2,
+                        cols=1,
+                        shared_xaxes=True,
+                        vertical_spacing=0.08,
+                        subplot_titles=(
+                            "Headline sentiment and recency-weighted trend",
+                            "FinBERT classification confidence",
+                        ),
+                    )
+                    news_figure.add_trace(
+                        go.Scatter(
+                            x=chart_news["published_at"],
+                            y=chart_news["sentiment_score"],
+                            mode="markers",
+                            marker={"color": colors, "size": 9},
+                            customdata=chart_news["title"],
+                            name="Headline sentiment",
+                            hovertemplate="%{x}<br>%{customdata}<br>Score: %{y:.2f}<extra></extra>",
+                        ),
+                        row=1,
+                        col=1,
+                    )
+                    news_figure.add_trace(
+                        go.Scatter(
+                            x=chart_news["published_at"],
+                            y=chart_news["sentiment_trend"],
+                            mode="lines",
+                            line={"color": "#1f77b4", "width": 2},
+                            name="24-hour decayed trend",
+                        ),
+                        row=1,
+                        col=1,
+                    )
+                    for threshold in (-0.15, 0, 0.15):
+                        news_figure.add_hline(
+                            y=threshold,
+                            line_dash="dash",
+                            line_color="#888888",
+                            row=1,
+                            col=1,
+                        )
+                    news_figure.add_trace(
+                        go.Scatter(
+                            x=chart_news["published_at"],
+                            y=chart_news["sentiment_confidence"],
+                            mode="markers",
+                            marker={"color": colors, "size": 8},
+                            customdata=chart_news["title"],
+                            name="Classification confidence",
+                            hovertemplate="%{x}<br>%{customdata}<br>Confidence: %{y:.0%}<extra></extra>",
+                        ),
+                        row=2,
+                        col=1,
+                    )
+                    news_figure.update_yaxes(
+                        title_text="Positive − negative probability",
+                        range=[-1, 1],
+                        row=1,
+                        col=1,
+                    )
+                    news_figure.update_yaxes(
+                        title_text="Class confidence",
+                        range=[0, 1],
+                        row=2,
+                        col=1,
+                    )
+                    news_figure.update_xaxes(title_text="Publication time (UTC)", row=2, col=1)
+                    news_figure.update_layout(
+                        height=650,
+                        hovermode="closest",
+                        title=f"{news_ticker} news sentiment — {lookback_choice[0]}",
+                    )
+                    st.plotly_chart(news_figure, width="stretch")
+
+                    display_news = scored_news.copy()
+                    display_news["published_at"] = display_news["published_at"].dt.tz_convert(
+                        "America/New_York"
+                    )
+                    st.dataframe(
+                        display_news[
+                            [
+                                "published_at",
+                                "provider",
+                                "sentiment_label",
+                                "sentiment_score",
+                                "sentiment_confidence",
+                                "title",
+                                "summary",
+                                "url",
+                            ]
+                        ],
+                        hide_index=True,
+                        width="stretch",
+                    )
+
+                st.warning(
+                    "FinBERT classifies headline language; it is not trained here to predict "
+                    "future returns. News coverage can be sparse, delayed, duplicated, or "
+                    "unrelated to the next price move. Validate any research signal with "
+                    "time-aligned historical backtests and transaction costs before trading."
+                )
 
 
 # --- FOOTER: DECISION LOG ---

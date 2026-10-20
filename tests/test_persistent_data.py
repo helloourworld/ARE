@@ -74,6 +74,56 @@ def test_get_data_persistent_initial_daily_download_uses_two_years(tmp_path, mon
     }]
 
 
+def test_get_ohlcv_history_batch_splits_and_persists_each_ticker(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "data"
+    cache_dir.mkdir()
+    dates = pd.date_range("2026-10-14 09:30", periods=2, freq="min")
+    fields = ["Open", "High", "Low", "Close", "Volume"]
+    columns = pd.MultiIndex.from_product(
+        [["AAPL", "MSFT"], fields], names=["Ticker", "Price"]
+    )
+    payload = pd.DataFrame(
+        [
+            [100, 101, 99, 100.5, 1000, 200, 201, 199, 200.5, 2000],
+            [101, 102, 100, 101.5, 1100, 201, 202, 200, 201.5, 2100],
+        ],
+        index=dates,
+        columns=columns,
+    )
+
+    class BatchYF:
+        def __init__(self):
+            self.calls = []
+
+        def download(self, **kwargs):
+            self.calls.append(kwargs)
+            return payload
+
+    yahoo = BatchYF()
+    monkeypatch.setattr(data_cache, "DATA_DIR", cache_dir)
+    monkeypatch.setattr(data_cache, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(data_cache, "yf", yahoo)
+
+    result = data_cache.get_ohlcv_history_batch(
+        ["AAPL", "MSFT"], period="7d", interval="1m"
+    )
+
+    assert yahoo.calls == [{
+        "tickers": ["AAPL", "MSFT"],
+        "period": "7d",
+        "interval": "1m",
+        "prepost": True,
+        "progress": False,
+        "threads": True,
+        "group_by": "ticker",
+    }]
+    assert result["AAPL"]["Close"].tolist() == [100.5, 101.5]
+    assert result["MSFT"]["Close"].tolist() == [200.5, 201.5]
+    assert str(result["AAPL"].index.tz) == data_cache.STORAGE_TIMEZONE
+    assert (cache_dir / "cache_AAPL_1m.csv").exists()
+    assert (cache_dir / "cache_MSFT_1m.csv").exists()
+
+
 def test_get_data_persistent_redownloads_daily_row_with_missing_ohlc(tmp_path, monkeypatch):
     cache_dir = tmp_path / "data"
     cache_dir.mkdir()

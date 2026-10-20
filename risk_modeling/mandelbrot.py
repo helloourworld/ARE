@@ -513,6 +513,53 @@ def compute_judgment(prices, volumes, data_1m, h_val, alpha, cmf=0.0, breadth_sl
 def scan_with_judgment(ticker):
     return scan_market(ticker, show_judgment=True)
 
+
+def _calculate_daily_pivot_levels(data_1d, current_session_date):
+    """Return classic S1/R1 levels from the last completed daily candle."""
+    required_columns = {"High", "Low", "Close"}
+    if not required_columns.issubset(data_1d.columns):
+        logger.warning(
+            "Cannot calculate daily pivots; missing columns: %s",
+            ", ".join(sorted(required_columns - set(data_1d.columns))),
+        )
+        return {"Support (S1)": float("nan"), "Resistance (R1)": float("nan")}
+
+    daily = data_1d.copy()
+    daily_index = pd.to_datetime(daily.index, errors="coerce")
+    valid_index = ~daily_index.isna()
+    daily = daily.loc[valid_index]
+    daily_index = daily_index[valid_index]
+    if daily.empty:
+        logger.warning("Cannot calculate daily pivots; no valid daily bars")
+        return {"Support (S1)": float("nan"), "Resistance (R1)": float("nan")}
+
+    if daily_index[-1].date() == current_session_date:
+        daily = daily.iloc[:-1]
+    if daily.empty:
+        logger.warning("Cannot calculate daily pivots; no completed daily bar available")
+        return {"Support (S1)": float("nan"), "Resistance (R1)": float("nan")}
+
+    previous_day = daily.iloc[-1]
+    ohlc_values = [
+        pd.to_numeric(previous_day[column], errors="coerce")
+        for column in ("High", "Low", "Close")
+    ]
+    if any(pd.isna(value) for value in ohlc_values):
+        logger.warning("Cannot calculate daily pivots; prior daily OHLC is invalid")
+        return {"Support (S1)": float("nan"), "Resistance (R1)": float("nan")}
+
+    high, low, close = (float(value) for value in ohlc_values)
+    if not np.isfinite([high, low, close]).all() or high < low:
+        logger.warning("Cannot calculate daily pivots; prior daily OHLC is invalid")
+        return {"Support (S1)": float("nan"), "Resistance (R1)": float("nan")}
+
+    pivot = (high + low + close) / 3.0
+    return {
+        "Support (S1)": float(2.0 * pivot - high),
+        "Resistance (R1)": float(2.0 * pivot - low),
+    }
+
+
 # ============================================================================
 # 4. MAIN SCANNER
 # ============================================================================
@@ -642,7 +689,16 @@ def _resolve_day_baseline(prev_close, session_open, market_ts_et):
     return float(prev_close)
 
 
-def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_new_data=True, relative_signal=None):
+def scan_market(
+    ticker,
+    show_judgment=True,
+    data_1m=None,
+    data_1d=None,
+    check_new_data=True,
+    relative_signal=None,
+    benchmark_data=None,
+    stress_data=None,
+):
     """
     Scan one ticker and return regime metrics + actionable fields.
 
@@ -719,7 +775,11 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
 
     # **Fragility: negative money flow during low volatility**
     benchmark_ticker = "XIU.TO" if ticker_key.endswith(".TO") else "RSP"
-    benchmark_df = get_data_persistent(benchmark_ticker, "1d")
+    benchmark_df = (
+        benchmark_data
+        if benchmark_data is not None
+        else get_data_persistent(benchmark_ticker, "1d")
+    )
     if benchmark_df.empty:
         liquidity_signals = {'cmf': 0.0, 'breadth_ratio': 1.0, 'breadth_slope': 0.0, 'rsi': 50.0}
     else:
@@ -769,7 +829,14 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
 
     stress_result = None
     try:
-        stress_result = calculate_stress_score(data_1d, benchmark_df)
+        shared_stress_data = stress_data or {}
+        stress_result = calculate_stress_score(
+            data_1d,
+            benchmark_df,
+            vix_df=shared_stress_data.get("vix"),
+            credit_spread_df=shared_stress_data.get("high_yield"),
+            ig_spread_df=shared_stress_data.get("investment_grade"),
+        )
     except (KeyError, ValueError, OSError) as exc:
         logger.warning("%s Stress score unavailable | error=%s", ticker, exc)
     stress_score = float(stress_result["score"]) if stress_result else float("nan")
@@ -806,6 +873,7 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
     else:
         prev_close = float(data_1d['Close'].iloc[-1])
     current_price = float(prices[-1])
+    pivot_levels = _calculate_daily_pivot_levels(data_1d, current_session_date)
     mean_reversion_average = float(
         pd.Series(prices, dtype=float)
         .rolling(window=MEAN_REVERSION_AVERAGE_WINDOW, min_periods=1)
@@ -929,6 +997,7 @@ def scan_market(ticker, show_judgment=True, data_1m=None, data_1d=None, check_ne
         # --- PRICE ACTION ---
         "Price": float(prices[-1]),
         "Mean Reversion Average": mean_reversion_average,
+        **pivot_levels,
         "Open": float(session_open) if latest_daily_date == current_session_date else float(prev_close),
         "Day %": float(day_pct),
         "Day % Net": float(net_pct),

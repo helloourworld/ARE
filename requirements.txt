@@ -12,5 +12,6 @@ pyyaml
 appdirs
 pandas_ta
 torch
+transformers>=4.45
 seaborn
 schedule

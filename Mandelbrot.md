@@ -68,7 +68,27 @@ This system uses **Fractal Geometry** and **Information Theory** to identify mar
 
 ---
 
-## 6. Fragility Score (Structural Market Weakness)
+## 6. Daily Pivot Support and Resistance
+
+The scanner displays **Pivot Support (S1)** and **Pivot Resistance (R1)** as classic daily floor pivots. They are calculated from the **last completed daily candle's** high, low, and close, not from the current intraday price:
+
+$$
+P = \frac{H + L + C}{3}
+$$
+
+$$
+S1 = 2P - H \qquad R1 = 2P - L
+$$
+
+Here, $P$ is the daily pivot, $H$ is the prior candle's high, $L$ is its low, and $C$ is its close. When the daily data includes a candle dated today, the scanner excludes it so a still-forming candle does not move the levels during the session. If there is no completed candle or the required OHLC values are unavailable, the levels are shown as unavailable.
+
+**Example:** If the prior candle had $H = 769.35$, $L = 764.71$, and $C = 767.03$, then $P = 767.03$, $S1 = 764.71$, and $R1 = 769.35$ (rounded to cents). This illustrates the calculation; displayed levels depend on the symbol's actual last completed daily candle.
+
+These are formula-based reference levels, not guarantees that price will reverse there. Consider them alongside the regime, volatility, and other risk signals; do not treat an S1 or R1 touch alone as a buy or sell signal.
+
+---
+
+## 7. Fragility Score (Structural Market Weakness)
 
 **What it measures:** Whether market internals are deteriorating beneath the current price action. Fragility is different from realized stress: a market can be structurally fragile before a large move appears in volatility or drawdown data.
 
@@ -98,7 +118,7 @@ For broad Canadian ETFs such as **XDIV**, **XEQT**, and **XIU**, the scanner doe
 
 ---
 
-## 7. Stress Score (Realized Market Stress)
+## 8. Stress Score (Realized Market Stress)
 
 **What it measures:** How extreme current realized market conditions are relative to their own recent history. Higher values mean more observed stress, not a forecast of a crash.
 
