@@ -5,30 +5,33 @@ on: [push]
 jobs:
   build-linux:
     runs-on: ubuntu-latest
-    strategy:
-      max-parallel: 5
 
     steps:
+    # 1. Check out your code
     - uses: actions/checkout@v4
-    - name: Set up Python 3.10
-      uses: actions/setup-python@v3
+
+    # 2. Setup Miniconda and automatically build your environment
+    - name: Setup Conda Environment
+      uses: conda-incubator/setup-miniconda@v3
       with:
-        python-version: '3.10'
-    - name: Add conda to system path
-      run: |
-        # $CONDA is an environment variable pointing to the root of the miniconda directory
-        echo $CONDA/bin >> $GITHUB_PATH
-    - name: Install dependencies
-      run: |
-        conda env update --file environment.yml --name base
+        activate-environment: my-env            # Name of the environment
+        environment-file: environment.yml       # Path to your environment file
+        auto-activate-base: false
+
+    # 3. Lint with flake8 (Note: Make sure flake8 and pytest are inside your environment.yml, 
+    #    or add a step to install them. It's faster to include them in environment.yml!)
     - name: Lint with flake8
+      shell: bash -el {0} # This special shell wrapper ensures conda is fully activated
       run: |
-        conda install flake8
+        conda install -y flake8
         # stop the build if there are Python syntax errors or undefined names
         flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
         # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
         flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+    # 4. Run tests
     - name: Test with pytest
+      shell: bash -el {0}
       run: |
-        conda install pytest
+        conda install -y pytest
         pytest
