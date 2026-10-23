@@ -61,8 +61,19 @@ def _published_at(article: dict[str, Any], content: dict[str, Any]) -> pd.Timest
     )
     if value is None:
         return pd.NaT
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return pd.NaT
+        try:
+            numeric = float(value)
+        except ValueError:
+            return pd.to_datetime(value, utc=True, errors="coerce")
+        unit = "ms" if abs(numeric) >= 1e12 else "s"
+        return pd.to_datetime(numeric, unit=unit, utc=True, errors="coerce")
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return pd.to_datetime(value, unit="s", utc=True, errors="coerce")
+        unit = "ms" if abs(float(value)) >= 1e12 else "s"
+        return pd.to_datetime(value, unit=unit, utc=True, errors="coerce")
     return pd.to_datetime(value, utc=True, errors="coerce")
 
 
@@ -113,9 +124,14 @@ def normalize_news_articles(
             continue
 
         related = content.get("relatedTickers") or article.get("relatedTickers") or []
+        if isinstance(related, str):
+            related = [related]
+        elif related is None:
+            related = []
         related_symbols = {
             str(item.get("ticker", "") if isinstance(item, dict) else item).upper()
             for item in related
+            if item is not None and item != ""
         }
         if related_symbols and symbol not in related_symbols:
             continue
@@ -127,11 +143,12 @@ def normalize_news_articles(
             or article.get("publisher")
             or {}
         )
-        provider_name = (
-            provider.get("displayName") or provider.get("name") or ""
-            if isinstance(provider, dict)
-            else str(provider)
-        )
+        if isinstance(provider, dict):
+            provider_name = str(provider.get("displayName") or provider.get("name") or "").strip()
+        elif isinstance(provider, str):
+            provider_name = provider.strip()
+        else:
+            provider_name = ""
         canonical_url = content.get("canonicalUrl") or article.get("canonicalUrl")
         clickthrough_url = content.get("clickThroughUrl") or article.get("clickThroughUrl")
         url = _nested_url(canonical_url) or _nested_url(clickthrough_url)
@@ -188,18 +205,27 @@ def fetch_market_news(
         raise ValueError("limit must be positive.")
 
     yahoo_error = None
-    import yfinance as yf
-
     try:
-        raw_articles = yf.Ticker(symbol).get_news(count=min(limit, 100), tab="all")
-    except (yf.exceptions.YFException, OSError) as exc:
+        import yfinance as yf
+    except ModuleNotFoundError as exc:
         yahoo_error = exc
         logger.warning(
-            "Yahoo Finance news unavailable; trying Google News RSS fallback | ticker=%s | error_type=%s",
+            "yfinance is not installed; trying Google News RSS fallback | ticker=%s | error_type=%s",
             symbol,
             type(exc).__name__,
         )
         raw_articles = []
+    else:
+        try:
+            raw_articles = yf.Ticker(symbol).get_news(count=min(limit, 100), tab="all")
+        except Exception as exc:  # pragma: no cover - yfinance exceptions vary by version
+            yahoo_error = exc
+            logger.warning(
+                "Yahoo Finance news unavailable; trying Google News RSS fallback | ticker=%s | error_type=%s",
+                symbol,
+                type(exc).__name__,
+            )
+            raw_articles = []
     if not raw_articles:
         try:
             raw_articles = _fetch_google_news_rss(symbol, limit)

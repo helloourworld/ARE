@@ -65,6 +65,22 @@ def test_normalize_yahoo_news_deduplicates_with_and_without_urls():
     assert len(news) == 2
 
 
+def test_normalize_yahoo_news_handles_millisecond_timestamps_and_missing_provider():
+    articles = [
+        {
+            "title": "Millisecond timestamp story",
+            "providerPublishTime": 1_726_000_000_000,
+            "relatedTickers": ["MSFT"],
+        },
+        {"title": "Missing provider story", "pubDate": "2026-10-20T14:00:00Z", "provider": None},
+    ]
+
+    news = normalize_news_articles(articles, "msft")
+
+    assert news["provider"].tolist() == ["", ""]
+    assert news["published_at"].dt.tz is not None
+
+
 def test_fetch_market_news_filters_by_lookback_and_future_date(monkeypatch):
     as_of = pd.Timestamp("2026-10-20T16:00:00Z")
     articles = [

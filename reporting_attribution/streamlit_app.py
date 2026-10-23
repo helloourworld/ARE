@@ -49,7 +49,7 @@ from pypfopt import (
 )
 
 # Local application modules
-from frontier_plots import plot_institutional_frontier
+from reporting_attribution.frontier_plots import plot_institutional_frontier
 from data_pipeline import get_daily_returns, get_price_history, get_price_history_with_benchmark, get_premarket_data, get_live_intraday, get_data_persistent, get_ohlcv_history_batch, get_fred_series_persistent, get_official_session_open
 from alpha_research.market_news import (
     DEFAULT_FINBERT_MODEL,
