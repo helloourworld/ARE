@@ -51,6 +51,7 @@ IB_YF_SUFFIX_MAP = {
 logger = logging.getLogger(__name__)
 STORAGE_TIMEZONE = "America/New_York"
 DATE_ONLY_INTERVALS = {"1d", "1wk", "1mo"}
+YF_INTRADAY_REFRESH_LOOKBACK_DAYS = {"1m": 7, "5m": 59}
 FRED_HIGH_YIELD_SERIES = "BAMLH0A0HYM2"
 FRED_INVESTMENT_GRADE_SERIES = "BAMLC0A0CM"
 
@@ -290,13 +291,19 @@ def _refresh_local_cache(local_df: pd.DataFrame, ticker: str, interval: str, fil
     
     # Ensure comparison with timezone-aware now
     now_local = pd.Timestamp.now(tz=STORAGE_TIMEZONE)
-    wait_time = timedelta(minutes=2) if interval == "1m" else timedelta(hours=12)
+    normalized_interval = str(interval).lower()
+    wait_time = timedelta(minutes=2) if normalized_interval == "1m" else timedelta(hours=12)
     
     if invalid_dates.empty and now_local - last_ts < wait_time:
         return local_df
 
     # Use the Timestamp object directly - _refresh_from_yf will handle conversion
-    start_date = max(last_ts, now_local - pd.Timedelta(days=7)) if interval == "1m" else last_ts
+    lookback_days = YF_INTRADAY_REFRESH_LOOKBACK_DAYS.get(normalized_interval)
+    start_date = (
+        max(last_ts, now_local - pd.Timedelta(days=lookback_days))
+        if lookback_days is not None
+        else last_ts
+    )
 
     new_data = _refresh_from_yf(ticker, start_date, interval)
     if new_data.empty:

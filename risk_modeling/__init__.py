@@ -16,9 +16,11 @@ from .rs_trend import (
     detect_rs_hook,
 )
 from data_pipeline.data_cache import get_data_persistent
+from .mandelbrot import calculate_historical_pivot_data
 
 __all__ = [
     "AlphaRiskEngine",
+    "calculate_historical_pivot_data",
     "calculate_professional_rs",
     "get_rs_signals",
     "calculate_mansfield_rs",

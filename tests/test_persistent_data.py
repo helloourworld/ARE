@@ -74,6 +74,41 @@ def test_get_data_persistent_initial_daily_download_uses_two_years(tmp_path, mon
     }]
 
 
+def test_get_data_persistent_refreshes_stale_5m_cache_within_yahoo_lookback(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "data"
+    cache_dir.mkdir()
+    cached = pd.DataFrame(
+        {"Open": [100.0], "High": [101.0], "Low": [99.0], "Close": [100.5], "Volume": [1000]},
+        index=pd.DatetimeIndex(["2026-06-01 10:00"], tz=data_cache.STORAGE_TIMEZONE),
+    )
+    cached.to_csv(cache_dir / "cache_AAPL_5m.csv")
+    refreshed = pd.DataFrame(
+        {"Open": [102.0], "High": [103.0], "Low": [101.0], "Close": [102.5], "Volume": [1200]},
+        index=pd.DatetimeIndex(["2026-10-20 14:55"], tz=data_cache.STORAGE_TIMEZONE),
+    )
+    yahoo = DummyYF(refreshed)
+
+    class FixedTimestamp(pd.Timestamp):
+        @classmethod
+        def now(cls, tz=None):
+            return cls("2026-10-20 15:00", tz=tz)
+
+    monkeypatch.setattr(data_cache, "DATA_DIR", cache_dir)
+    monkeypatch.setattr(data_cache, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(data_cache, "yf", yahoo)
+    monkeypatch.setattr(data_cache.pd, "Timestamp", FixedTimestamp)
+
+    result = data_cache.get_data_persistent("AAPL", interval="5m", period="60d")
+
+    assert yahoo.calls == [{
+        "ticker": "AAPL",
+        "period": None,
+        "interval": "5m",
+        "start": "2026-08-22",
+    }]
+    assert result["Close"].iloc[-1] == 102.5
+
+
 def test_get_ohlcv_history_batch_splits_and_persists_each_ticker(tmp_path, monkeypatch):
     cache_dir = tmp_path / "data"
     cache_dir.mkdir()

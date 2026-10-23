@@ -29,15 +29,24 @@ except ImportError:
             sys.path.insert(0, str(package_root))
         from fragility import FragilityConfig, calculate_fragility_score as calculate_production_fragility_score
 try:
-    from .stress import calculate_stress_score as calculate_production_stress_score
+    from .stress import (
+        StressConfig,
+        calculate_stress_score as calculate_production_stress_score,
+    )
 except ImportError:
     try:
-        from risk_modeling.stress import calculate_stress_score as calculate_production_stress_score
+        from risk_modeling.stress import (
+            StressConfig,
+            calculate_stress_score as calculate_production_stress_score,
+        )
     except ImportError:
         package_root = Path(__file__).resolve().parent.parent
         if str(package_root) not in sys.path:
             sys.path.insert(0, str(package_root))
-        from stress import calculate_stress_score as calculate_production_stress_score
+        from stress import (
+            StressConfig,
+            calculate_stress_score as calculate_production_stress_score,
+        )
 try:
     from ..data_pipeline.data_cache import (
         FRED_HIGH_YIELD_SERIES,
@@ -68,6 +77,8 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 logger = logging.getLogger(__name__)
+MIN_STRESS_OBSERVATIONS = 20
+DRAWDOWN_TROUGH_THRESHOLD = -0.05
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOG_DIR = REPO_ROOT / "logs"
@@ -396,6 +407,18 @@ def calculate_fragility_score(
     return result
 
 
+def _fragility_config_for_ticker(ticker, daily_observations):
+    config = FragilityConfig()
+    if str(ticker).upper() != "SPCX":
+        return config
+
+    minimum_observations = min(
+        config.min_observations,
+        max(2, daily_observations),
+    )
+    return FragilityConfig(min_observations=minimum_observations)
+
+
 def calculate_stress_score(
     data_1d,
     benchmark_df,
@@ -432,13 +455,39 @@ def calculate_stress_score(
     downside_momentum = history["daily_return"].rolling(20, min_periods=2).sum()
     credit_risk_premium = history["hy_spread"] - history["ig_spread"]
 
+    stress_histories = (
+        realized_vol.to_numpy(),
+        drawdown.reindex(history.index).to_numpy(),
+        history["vix"].to_numpy(),
+        history["hy_spread"].to_numpy(),
+        history["ig_spread"].to_numpy(),
+        credit_risk_premium.to_numpy(),
+    )
+    default_stress_config = StressConfig()
+    available_observations = min(
+        int(np.isfinite(values).sum()) for values in stress_histories
+    )
+    if available_observations < MIN_STRESS_OBSERVATIONS:
+        raise ValueError(
+            "Insufficient aligned observations for stress scoring: "
+            f"received {available_observations}, "
+            f"required at least {MIN_STRESS_OBSERVATIONS}."
+        )
+    stress_config = StressConfig(
+        min_observations=min(
+                default_stress_config.min_observations,
+            available_observations,
+        )
+    )
+
     return calculate_production_stress_score(
-        realized_vol_history=realized_vol.to_numpy(),
-        drawdown_history=drawdown.reindex(history.index).to_numpy(),
-        vix_history=history["vix"].to_numpy(),
-        hy_spread_history=history["hy_spread"].to_numpy(),
-        ig_spread_history=history["ig_spread"].to_numpy(),
-        credit_risk_premium_history=credit_risk_premium.to_numpy(),
+        realized_vol_history=stress_histories[0],
+        drawdown_history=stress_histories[1],
+        vix_history=stress_histories[2],
+        hy_spread_history=stress_histories[3],
+        ig_spread_history=stress_histories[4],
+        credit_risk_premium_history=stress_histories[5],
+        config=stress_config,
     )
 
 # ============================================================================
@@ -558,6 +607,112 @@ def _calculate_daily_pivot_levels(data_1d, current_session_date):
         "Support (S1)": float(2.0 * pivot - high),
         "Resistance (R1)": float(2.0 * pivot - low),
     }
+
+
+def calculate_historical_pivot_data(data_1d, earnings_dates=None):
+    """Calculate daily pivots and map earnings events to their first session."""
+    required_columns = {"High", "Low", "Close"}
+    if not required_columns.issubset(data_1d.columns):
+        missing = ", ".join(sorted(required_columns - set(data_1d.columns)))
+        raise ValueError(f"Daily pivot data is missing required columns: {missing}.")
+
+    columns = ["High", "Low", "Close"]
+    if "Open" in data_1d.columns:
+        columns.append("Open")
+    daily = data_1d.loc[:, columns].copy()
+    index = pd.DatetimeIndex(pd.to_datetime(daily.index, errors="coerce"))
+    valid_index = ~index.isna()
+    daily = daily.loc[valid_index]
+    index = index[valid_index]
+    if index.tz is not None:
+        index = index.tz_convert("UTC").tz_localize(None)
+    daily.index = index.normalize()
+    daily = daily[~daily.index.duplicated(keep="last")].sort_index()
+    for column in columns:
+        daily[column] = pd.to_numeric(daily[column], errors="coerce")
+    daily = daily.dropna(subset=["High", "Low", "Close"])
+    if daily.empty:
+        raise ValueError("No valid daily OHLC data is available for pivots.")
+
+    previous_pivot = (
+        daily["High"].shift(1)
+        + daily["Low"].shift(1)
+        + daily["Close"].shift(1)
+    ) / 3.0
+    daily["R1"] = 2.0 * previous_pivot - daily["Low"].shift(1)
+    daily["S1"] = 2.0 * previous_pivot - daily["High"].shift(1)
+    daily["Earnings Event"] = False
+    daily["Pre-Earnings High"] = np.nan
+    daily["Pre-Earnings Low"] = np.nan
+    daily["Drawdown Peak"] = daily["Close"].cummax()
+    daily["Drawdown"] = daily["Close"] / daily["Drawdown Peak"] - 1.0
+    daily["Drawdown Trough"] = False
+    daily["Drawdown Trough %"] = np.nan
+
+    peak = float(daily["Close"].iloc[0])
+    trough_position = 0
+    trough_drawdown = 0.0
+    for position, close in enumerate(daily["Close"].to_numpy()[1:], start=1):
+        close = float(close)
+        if close >= peak:
+            if trough_drawdown <= DRAWDOWN_TROUGH_THRESHOLD:
+                daily.iloc[
+                    trough_position, daily.columns.get_loc("Drawdown Trough")
+                ] = True
+                daily.iloc[
+                    trough_position, daily.columns.get_loc("Drawdown Trough %")
+                ] = trough_drawdown * 100.0
+            peak = close
+            trough_position = position
+            trough_drawdown = 0.0
+            continue
+
+        current_drawdown = close / peak - 1.0
+        if current_drawdown < trough_drawdown:
+            trough_position = position
+            trough_drawdown = current_drawdown
+
+    if trough_drawdown <= DRAWDOWN_TROUGH_THRESHOLD:
+        daily.iloc[
+            trough_position, daily.columns.get_loc("Drawdown Trough")
+        ] = True
+        daily.iloc[
+            trough_position, daily.columns.get_loc("Drawdown Trough %")
+        ] = trough_drawdown * 100.0
+
+    if isinstance(earnings_dates, pd.DataFrame):
+        event_values = earnings_dates.index
+    elif earnings_dates is None:
+        event_values = ()
+    else:
+        event_values = earnings_dates
+
+    for event_value in event_values:
+        event_time = pd.Timestamp(event_value)
+        if pd.isna(event_time):
+            continue
+        if event_time.tzinfo is None:
+            event_time = event_time.tz_localize("America/New_York")
+        else:
+            event_time = event_time.tz_convert("America/New_York")
+        event_day = event_time.normalize().tz_localize(None)
+        after_market_close = event_time.hour >= 16
+        event_position = daily.index.searchsorted(
+            event_day,
+            side="right" if after_market_close else "left",
+        )
+        if event_position == 0 or event_position >= len(daily):
+            continue
+
+        daily.iloc[event_position, daily.columns.get_loc("Earnings Event")] = True
+        daily.iloc[event_position, daily.columns.get_loc("Pre-Earnings High")] = (
+            daily["High"].iloc[event_position - 1]
+        )
+        daily.iloc[event_position, daily.columns.get_loc("Pre-Earnings Low")] = (
+            daily["Low"].iloc[event_position - 1]
+        )
+
+    return daily
 
 
 # ============================================================================
@@ -785,7 +940,16 @@ def scan_market(
     else:
         liquidity_signals = calculate_liquidity_signals(data_1d, benchmark_df)
 
-    fragility_threshold = float(FragilityConfig().critical_threshold)
+    fragility_config = _fragility_config_for_ticker(ticker_key, len(data_1d))
+    if ticker_key in BROAD_ETF_TICKERS:
+        fragility_config = FragilityConfig(
+            flow_weight=0.0,
+            breadth_weight=0.55,
+            hurst_weight=0.0,
+            concentration_weight=0.0,
+            drawdown_accel_weight=0.45,
+        )
+    fragility_threshold = float(fragility_config.critical_threshold)
 
     cash_cmf = liquidity_signals['cmf']
     fragility = calculate_fragility_score(
@@ -795,17 +959,7 @@ def scan_market(
         cmf=cash_cmf,
         breadth_slope=liquidity_signals['breadth_slope'],
         h_val=h_val,
-        config=(
-            FragilityConfig(
-                flow_weight=0.0,
-                breadth_weight=0.55,
-                hurst_weight=0.0,
-                concentration_weight=0.0,
-                drawdown_accel_weight=0.45,
-            )
-            if ticker_key in BROAD_ETF_TICKERS
-            else None
-        ),
+        config=fragility_config,
     )
     fragility_score = fragility["score"]
     if fragility["is_critical"]:

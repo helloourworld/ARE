@@ -85,6 +85,7 @@ def calculate_drawdown_analysis(tickers, period="5y", threshold=0.02):
     stats_rows = []
     event_rows = []
     series_data = {}
+    current_drawdowns = {}
 
     for ticker in dict.fromkeys(tickers):
         stock = get_data_persistent(ticker, interval="1d", period=period)
@@ -97,6 +98,7 @@ def calculate_drawdown_analysis(tickers, period="5y", threshold=0.02):
 
         running_peak = close.cummax()
         drawdown = close / running_peak - 1
+        current_drawdowns[ticker] = float(drawdown.iloc[-1])
         # Keep only drawdowns meeting the threshold in the displayed series.
         filtered_drawdown = drawdown.where(drawdown <= -threshold)
         series_data[ticker] = filtered_drawdown.rename(ticker)
@@ -153,7 +155,7 @@ def calculate_drawdown_analysis(tickers, period="5y", threshold=0.02):
         stats_rows.append({
             "Ticker": ticker,
             "Threshold": threshold,
-            "Current Drawdown": float(filtered_drawdown.iloc[-1]),
+            "Current Drawdown": current_drawdowns[ticker],
             "Average Drawdown": float(filtered_drawdown[filtered_drawdown < 0].mean()) if (filtered_drawdown < 0).any() else 0.0,
             "Average Event Drawdown": float(ticker_events["Maximum Drawdown"].mean()) if not ticker_events.empty else None,
             "Maximum Drawdown": float(ticker_events["Maximum Drawdown"].min()) if not ticker_events.empty else None,

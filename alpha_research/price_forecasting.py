@@ -11,6 +11,7 @@ Practical price forecasting tools:
 Example:
     python -m alpha_research.price_forecasting --ticker AAPL
     python -m alpha_research.price_forecasting --ticker MSFT --train-save-best --train-only --train-profile fast
+    python -m alpha_research.price_forecasting --train-all-configured --train-profile lean
 """
 
 from __future__ import annotations
@@ -449,6 +450,41 @@ def _load_saved_forecast_bundle(ticker: str, output_dir: Path | None = None) -> 
         return None
 
 
+def forecast_models_available(ticker: str, output_dir: Path | None = None) -> bool:
+    """Return whether compatible saved intraday and daily forecast models exist."""
+    return _load_saved_forecast_bundle(ticker, output_dir=output_dir) is not None
+
+
+def _configured_forecast_tickers(config_path: Path | None = None) -> list[str]:
+    """Return unique configured universe, benchmark, and external ticker symbols."""
+    import yaml
+
+    path = config_path if config_path is not None else REPO_ROOT / "config.yaml"
+    with path.open(encoding="utf-8") as config_file:
+        config = yaml.safe_load(config_file)
+    if not isinstance(config, dict):
+        raise ValueError(f"Invalid securities configuration in {path}.")
+
+    tickers = set()
+    configured_groups = [config.get("external_tickers", [])]
+    universe = config.get("universe", {})
+    if not isinstance(universe, dict):
+        raise ValueError(f"Invalid universe configuration in {path}.")
+    configured_groups.extend(universe.values())
+
+    for group in configured_groups:
+        if not isinstance(group, list):
+            continue
+        for ticker in group:
+            if not isinstance(ticker, str) or not ticker.strip():
+                raise ValueError(f"Invalid ticker in securities configuration {path}.")
+            tickers.add(ticker.strip().upper())
+
+    if not tickers:
+        raise ValueError(f"No securities configured in {path}.")
+    return sorted(tickers)
+
+
 def train_and_save_best_models(
     ticker: str,
     intraday_period: str = "60d",
@@ -467,8 +503,8 @@ def train_and_save_best_models(
     )
 
     profile_name = str(profile).strip().lower()
-    if profile_name not in {"fast", "full"}:
-        raise ValueError("profile must be either 'fast' or 'full'.")
+    if profile_name not in {"fast", "full", "lean"}:
+        raise ValueError("profile must be 'lean', 'fast', or 'full'.")
 
     out_dir = Path(output_dir) if output_dir is not None else MODEL_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -482,7 +518,9 @@ def train_and_save_best_models(
         daily_depth_grid = (4, 5)
         daily_lr_grid = (0.03, 0.04)
         daily_iter_grid = (350, 500)
-    else:
+        intra_search_step = 20
+        daily_search_step = 5
+    elif profile_name == "full":
         intra_depth_grid = (3, 4, 5)
         intra_lr_grid = (0.03, 0.05)
         intra_iter_grid = (300, 450, 600)
@@ -490,6 +528,18 @@ def train_and_save_best_models(
         daily_depth_grid = (4, 5, 6)
         daily_lr_grid = (0.03, 0.04, 0.05)
         daily_iter_grid = (450, 700, 900)
+        intra_search_step = 20
+        daily_search_step = 5
+    else:
+        intra_depth_grid = (4,)
+        intra_lr_grid = (0.05,)
+        intra_iter_grid = (180,)
+
+        daily_depth_grid = (4,)
+        daily_lr_grid = (0.04,)
+        daily_iter_grid = (250,)
+        intra_search_step = 500
+        daily_search_step = 50
 
     benchmark_ticker = _benchmark_ticker_for(ticker)
 
@@ -527,7 +577,7 @@ def train_and_save_best_models(
         X=X_intra,
         y=y_intra,
         train_min=160,
-        step=20,
+        step=intra_search_step,
         direction_ref=None,
         max_depth_grid=intra_depth_grid,
         learning_rate_grid=intra_lr_grid,
@@ -595,6 +645,7 @@ def train_and_save_best_models(
     daily_target = daily_ohlcv["Close"].pct_change(1).shift(-1)
     daily_dataset = daily_features.copy()
     daily_dataset["target"] = daily_target
+    daily_dataset["close_price"] = daily_ohlcv["Close"]
     daily_dataset = daily_dataset.dropna()
 
     if len(daily_dataset) < 150:
@@ -614,7 +665,7 @@ def train_and_save_best_models(
         X=X_daily,
         y=y_daily,
         train_min=140,
-        step=5,
+        step=daily_search_step,
         direction_ref=None,
         max_depth_grid=daily_depth_grid,
         learning_rate_grid=daily_lr_grid,
@@ -871,15 +922,6 @@ def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval:
     if ohlcv.empty:
         raise ValueError(f"No intraday data returned for {ticker}.")
 
-    X, targets = _build_intraday_training_data(ohlcv)
-    y = targets["close_to_go_return"]
-    y_low = targets["low_to_go_return"]
-    y_high = targets["high_to_go_return"]
-    if len(X) < 200:
-        raise ValueError(
-            f"Not enough intraday training rows for {ticker}. Need at least 200, got {len(X)}."
-        )
-
     saved_bundle = _load_saved_forecast_bundle(ticker)
     if saved_bundle is not None:
         artifact = saved_bundle["intraday_artifact"]
@@ -887,8 +929,7 @@ def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval:
         model = artifact["model"]
         low_model = artifact["low_model"]
         high_model = artifact["high_model"]
-        feature_columns = list(artifact.get(
-            "feature_columns", list(X.columns)))
+        feature_columns = artifact.get("feature_columns")
 
         live = _to_ny_datetime_index(ohlcv).sort_index()
         live["session"] = live.index.date
@@ -938,7 +979,9 @@ def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval:
             ]
         )
 
-        x_live = x_live.reindex(columns=feature_columns)
+        x_live = x_live.reindex(
+            columns=feature_columns if feature_columns is not None else x_live.columns
+        )
         pred_ret = float(model.predict(x_live)[0])
         pred_close = current_close * (1.0 + pred_ret)
         pred_low_return = float(low_model.predict(x_live)[0])
@@ -961,9 +1004,18 @@ def forecast_intraday_close(ticker: str, intraday_period: str = "60d", interval:
             predicted_high=pred_high,
             predicted_return_to_close=pred_ret,
             training_rows=int(manifest.get("intraday", {}).get(
-                "training_rows", len(X))) if isinstance(manifest, dict) else len(X),
+                "training_rows", 0)) if isinstance(manifest, dict) else 0,
             validation_metrics={
                 k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))},
+        )
+
+    X, targets = _build_intraday_training_data(ohlcv)
+    y = targets["close_to_go_return"]
+    y_low = targets["low_to_go_return"]
+    y_high = targets["high_to_go_return"]
+    if len(X) < 200:
+        raise ValueError(
+            f"Not enough intraday training rows for {ticker}. Need at least 200, got {len(X)}."
         )
 
     split = int(len(X) * 0.8)
@@ -1727,11 +1779,16 @@ def main() -> None:
         help="When used with --train-save-best, skip immediate forecast run.",
     )
     parser.add_argument(
+        "--train-all-configured",
+        action="store_true",
+        help="Train and save models for every ticker in config.yaml.",
+    )
+    parser.add_argument(
         "--train-profile",
         type=str,
         default="full",
-        choices=["fast", "full"],
-        help="Hyperparameter search profile: fast or full (default: full).",
+        choices=["lean", "fast", "full"],
+        help="Search profile: lean for batch runs, fast, or full (default: full).",
     )
     parser.add_argument(
         "--train-skip-pipeline",
@@ -1756,6 +1813,41 @@ def main() -> None:
         help="Minimum edge threshold for trade decision (default: 0.0025)",
     )
     args = parser.parse_args()
+
+    if args.train_all_configured:
+        tickers = _configured_forecast_tickers()
+        failures = {}
+        for ticker in tickers:
+            print(f"\n=== Training configured security: {ticker} ===", flush=True)
+            try:
+                training = train_and_save_best_models(
+                    ticker=ticker,
+                    intraday_period=args.intraday_period,
+                    intraday_interval=args.intraday_interval,
+                    daily_period=args.daily_period,
+                    output_dir=Path(args.models_dir),
+                    profile=args.train_profile,
+                    use_pipeline=not args.train_skip_pipeline,
+                    verbose=not args.train_quiet,
+                )
+                print(
+                    f"Completed {ticker}: {training['manifest_path']}",
+                    flush=True,
+                )
+            except Exception as exc:
+                failures[ticker] = f"{type(exc).__name__}: {exc}"
+                print(f"Failed {ticker}: {failures[ticker]}", flush=True)
+
+        print(
+            f"\nTraining summary: {len(tickers) - len(failures)}/{len(tickers)} "
+            "securities completed.",
+            flush=True,
+        )
+        if failures:
+            for ticker, error in failures.items():
+                print(f"  {ticker}: {error}", flush=True)
+            raise SystemExit(1)
+        return
 
     if args.train_save_best:
         training = train_and_save_best_models(

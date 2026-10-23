@@ -1,3 +1,5 @@
+import sys
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -17,6 +19,58 @@ def _ohlcv(index, close):
         },
         index=index,
     )
+
+
+def test_configured_forecast_tickers_combines_and_deduplicates_groups(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "universe:\n"
+        "  core: [aapl, SPY]\n"
+        "  benchmarks: [QQQ, SPY]\n"
+        "external_tickers: [MSFT, AAPL]\n",
+        encoding="utf-8",
+    )
+
+    assert forecasting._configured_forecast_tickers(config_path) == [
+        "AAPL",
+        "MSFT",
+        "QQQ",
+        "SPY",
+    ]
+
+
+def test_train_all_configured_calls_trainer_for_each_ticker(monkeypatch):
+    trained_tickers = []
+    monkeypatch.setattr(sys, "argv", [
+        "price_forecasting",
+        "--train-all-configured",
+        "--train-profile",
+        "lean",
+    ])
+    monkeypatch.setattr(
+        forecasting, "_configured_forecast_tickers", lambda: ["AAPL", "SPY"]
+    )
+
+    def record_training(ticker, **kwargs):
+        trained_tickers.append((ticker, kwargs["profile"]))
+        return {"manifest_path": f"models/{ticker}_manifest.json"}
+
+    monkeypatch.setattr(forecasting, "train_and_save_best_models", record_training)
+
+    forecasting.main()
+
+    assert trained_tickers == [("AAPL", "lean"), ("SPY", "lean")]
+
+
+def test_forecast_models_available_checks_for_compatible_bundle(monkeypatch):
+    monkeypatch.setattr(
+        forecasting,
+        "_load_saved_forecast_bundle",
+        lambda ticker, output_dir=None: {"ticker": ticker} if ticker == "SAVED" else None,
+    )
+
+    assert forecasting.forecast_models_available("SAVED")
+    assert not forecasting.forecast_models_available("MISSING")
 
 
 @pytest.mark.parametrize("use_saved_model", [False, True])
@@ -171,6 +225,12 @@ def test_intraday_forecast_returns_session_low_and_high(monkeypatch, use_saved_m
         "_load_saved_forecast_bundle",
         lambda ticker: bundle if use_saved_model else None,
     )
+    if use_saved_model:
+        monkeypatch.setattr(
+            forecasting,
+            "_build_intraday_training_data",
+            lambda _: pytest.fail("Saved models should skip training-data preparation"),
+        )
     monkeypatch.setattr(forecasting, "_load_current_price_1m", lambda *args, **kwargs: current_price)
     monkeypatch.setattr(
         forecasting,
@@ -196,3 +256,79 @@ def test_intraday_forecast_returns_session_low_and_high(monkeypatch, use_saved_m
     assert result.predicted_low <= result.predicted_close
     assert result.predicted_high >= float(observed_session["High"].max())
     assert result.predicted_high >= result.predicted_close
+
+
+def test_lean_training_profile_uses_sparse_single_candidate_search(monkeypatch, tmp_path):
+    intraday_index = pd.date_range("2026-01-01", periods=300, freq="5min")
+    intraday_features = pd.DataFrame(
+        {"feature": np.linspace(0.0, 1.0, len(intraday_index))},
+        index=intraday_index,
+    )
+    intraday_ohlcv = _ohlcv(
+        intraday_index,
+        np.linspace(100.0, 120.0, len(intraday_index)),
+    )
+    intraday_targets = pd.DataFrame(
+        {
+            "close_to_go_return": np.linspace(-0.01, 0.01, len(intraday_index)),
+            "low_to_go_return": np.linspace(-0.02, 0.0, len(intraday_index)),
+            "high_to_go_return": np.linspace(0.0, 0.02, len(intraday_index)),
+        },
+        index=intraday_index,
+    )
+    daily_ohlcv = _ohlcv(
+        pd.bdate_range("2025-01-01", periods=200),
+        np.linspace(100.0, 120.0, 200),
+    )
+    daily_index = forecasting._to_ny_datetime_index(daily_ohlcv).index
+    daily_features = pd.DataFrame(
+        {"feature": np.linspace(0.0, 1.0, len(daily_index))},
+        index=daily_index,
+    )
+    search_calls = []
+
+    class ConstantRegressor:
+        def __init__(self, **kwargs):
+            pass
+
+        def fit(self, X, y, sample_weight=None):
+            return self
+
+    def record_search(**kwargs):
+        search_calls.append(kwargs)
+        return (
+            {"max_depth": 4, "learning_rate": 0.04, "max_iter": 250},
+            {"mae": 0.0, "rmse": 0.0, "mape": 0.0, "directional_acc": 1.0, "windows": 1.0},
+        )
+
+    monkeypatch.setattr(
+        forecasting,
+        "_load_ohlcv",
+        lambda ticker, interval, **kwargs: (
+            daily_ohlcv if interval == "1d" else intraday_ohlcv
+        ),
+    )
+    monkeypatch.setattr(
+        forecasting,
+        "_build_intraday_training_data",
+        lambda _: (intraday_features, intraday_targets),
+    )
+    monkeypatch.setattr(
+        forecasting,
+        "_build_daily_features",
+        lambda *_args, **_kwargs: daily_features,
+    )
+    monkeypatch.setattr(forecasting, "_benchmark_ticker_for", lambda _: None)
+    monkeypatch.setattr(forecasting, "_search_best_hgb_params", record_search)
+    monkeypatch.setattr(forecasting, "HistGradientBoostingRegressor", ConstantRegressor)
+    monkeypatch.setattr(forecasting, "dump", lambda *_args, **_kwargs: None)
+
+    forecasting.train_and_save_best_models(
+        "TEST",
+        output_dir=tmp_path,
+        profile="lean",
+        verbose=False,
+    )
+
+    assert [call["step"] for call in search_calls] == [500, 50]
+    assert [len(call["max_depth_grid"]) for call in search_calls] == [1, 1]

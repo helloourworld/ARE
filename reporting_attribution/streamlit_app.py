@@ -60,6 +60,7 @@ from risk_modeling import AlphaRiskEngine, calculate_mansfield_rs, monitor_mean_
 from risk_modeling.mandelbrot import (
     FRED_HIGH_YIELD_SERIES,
     FRED_INVESTMENT_GRADE_SERIES,
+    calculate_historical_pivot_data,
     scan_market,
 )
 from risk_modeling.market_breadth import (
@@ -68,7 +69,12 @@ from risk_modeling.market_breadth import (
 )
 from risk_modeling.bolling_bands import compute_rolling_vpin, compute_rolling_cvd
 from data_pipeline.data_cache import DATA_DIR
-from alpha_research.price_forecasting import run_all, RiskRulesConfig
+from alpha_research.price_forecasting import (
+    forecast_models_available,
+    run_all,
+    RiskRulesConfig,
+    train_and_save_best_models,
+)
 from alpha_research.Port_Stock_dd import (
     calculate_drawdown_analysis,
     calculate_drawdown_stats,
@@ -101,6 +107,14 @@ def get_scan_intraday_data(ticker):
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_scan_daily_data(ticker):
     return get_data_persistent(ticker, interval="1d", period="2y")
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_scan_earnings_dates(ticker):
+    earnings = yf.Ticker(ticker).get_earnings_dates(limit=12)
+    if earnings is None or earnings.empty:
+        return []
+    return [timestamp.isoformat() for timestamp in earnings.index]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -300,6 +314,139 @@ def build_mean_reversion_chart(ticker, intraday_data, support, resistance):
     figure.update_yaxes(title_text="Volume", row=2, col=1)
     figure.update_yaxes(title_text="RSI", range=[0, 100], row=3, col=1)
     figure.update_xaxes(title_text="Time (ET)", row=3, col=1)
+    return figure
+
+
+def build_historical_pivot_chart(ticker, daily_data, earnings_dates=None):
+    """Show daily R1/S1 history and earnings-session breakout reference levels."""
+    history = calculate_historical_pivot_data(daily_data, earnings_dates)
+    figure = go.Figure()
+    figure.add_trace(
+        go.Candlestick(
+            x=history.index,
+            open=history["Open"] if "Open" in history.columns else history["Close"],
+            high=history["High"],
+            low=history["Low"],
+            close=history["Close"],
+            name="Daily price",
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=history.index,
+            y=history["R1"],
+            mode="lines",
+            name="Daily pivot R1",
+            line={"color": "#d62728", "dash": "dash"},
+            line_shape="hv",
+            connectgaps=False,
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=history.index,
+            y=history["S1"],
+            mode="lines",
+            name="Daily pivot S1",
+            line={"color": "#2ca02c", "dash": "dash"},
+            line_shape="hv",
+            connectgaps=False,
+        )
+    )
+
+    breakout = (
+        history["Close"].gt(history["R1"])
+        & history["Close"].shift(1).le(history["R1"].shift(1))
+    ).fillna(False)
+    if breakout.any():
+        figure.add_trace(
+            go.Scatter(
+                x=history.index[breakout],
+                y=history.loc[breakout, "High"],
+                mode="markers",
+                name="Close crossed above R1",
+                marker={"color": "#ff7f0e", "symbol": "triangle-up", "size": 10},
+            )
+        )
+
+    drawdown_troughs = history.loc[history["Drawdown Trough"]]
+    if not drawdown_troughs.empty:
+        figure.add_trace(
+            go.Scatter(
+                x=drawdown_troughs.index,
+                y=drawdown_troughs["Close"],
+                mode="markers+text",
+                name="Drawdown trough (5%+)",
+                text=[date.strftime("%Y-%m-%d") for date in drawdown_troughs.index],
+                textposition="bottom center",
+                customdata=drawdown_troughs["Drawdown Trough %"],
+                hovertemplate=(
+                    "%{x|%Y-%m-%d}<br>Close: %{y:.2f}"
+                    "<br>Drawdown: %{customdata:.2f}%<extra></extra>"
+                ),
+                marker={"color": "#b2182b", "symbol": "triangle-down", "size": 11},
+            )
+        )
+
+    latest = history.iloc[-1]
+    figure.add_trace(
+        go.Scatter(
+            x=[history.index[-1]],
+            y=[latest["Close"]],
+            mode="markers+text",
+            name="Latest close drawdown",
+            text=[f"Current {latest['Drawdown']:.1%}"],
+            textposition="top center",
+            customdata=[[latest["Drawdown"], latest["Drawdown Peak"]]],
+            hovertemplate=(
+                "%{x|%Y-%m-%d}<br>Latest close: %{y:.2f}"
+                "<br>Drawdown: %{customdata[0]:.2%}"
+                "<br>Peak close: %{customdata[1]:.2f}<extra></extra>"
+            ),
+            marker={"color": "#1f77b4", "symbol": "circle", "size": 10},
+        )
+    )
+
+    earnings_events = history.loc[history["Earnings Event"]]
+    for event_date, event in earnings_events.iterrows():
+        forward_dates = history.index[history.index >= event_date]
+        for label, column, color in (
+            ("Pre-earnings high", "Pre-Earnings High", "#9467bd"),
+            ("Pre-earnings low", "Pre-Earnings Low", "#8c564b"),
+        ):
+            level = event[column]
+            if not np.isfinite(level):
+                continue
+            figure.add_trace(
+                go.Scatter(
+                    x=forward_dates,
+                    y=np.full(len(forward_dates), level),
+                    mode="lines",
+                    name=f"{label} ({event_date:%Y-%m-%d})",
+                    line={"color": color, "dash": "dot", "width": 1},
+                )
+            )
+
+    if not earnings_events.empty:
+        figure.add_trace(
+            go.Scatter(
+                x=earnings_events.index,
+                y=history.loc[earnings_events.index, "High"],
+                mode="markers",
+                name="First session after earnings",
+                marker={"color": "#111111", "symbol": "star", "size": 12},
+            )
+        )
+
+    figure.update_layout(
+        title=f"{ticker} daily pivots and earnings breakout levels",
+        height=650,
+        hovermode="x unified",
+        xaxis_rangeslider_visible=False,
+        legend={"orientation": "h", "y": 1.02, "x": 0},
+    )
+    figure.update_yaxes(title_text="Price")
+    figure.update_xaxes(title_text="Date")
     return figure
 
 
@@ -1456,6 +1603,48 @@ with tab3:
                     "VWAP resets each session; Bollinger Bands use 20 bars and 2 standard deviations; "
                     "RSI uses 14 bars. These are context indicators, not standalone trade signals."
                 )
+            try:
+                earnings_dates = get_scan_earnings_dates(alert_ticker)
+            except (yf.exceptions.YFException, OSError) as exc:
+                logging.getLogger(__name__).warning(
+                    "Could not load earnings dates | ticker=%s | error_type=%s",
+                    alert_ticker,
+                    type(exc).__name__,
+                )
+                earnings_dates = []
+                st.info(
+                    "Earnings dates are unavailable; the historical daily pivot chart "
+                    "will still be shown."
+                )
+            try:
+                historical_pivot_figure = build_historical_pivot_chart(
+                    alert_ticker,
+                    chart_daily_data,
+                    earnings_dates,
+                )
+            except ValueError as exc:
+                st.warning(f"Historical pivot chart unavailable: {exc}")
+            else:
+                st.plotly_chart(historical_pivot_figure, width="stretch")
+                latest_daily = calculate_historical_pivot_data(chart_daily_data)
+                latest_drawdown = latest_daily.iloc[-1]
+                st.metric(
+                    f"Drawdown at latest daily close ({latest_daily.index[-1]:%Y-%m-%d})",
+                    f"{latest_drawdown['Drawdown']:.2%}",
+                    delta=f"from peak close ${latest_drawdown['Drawdown Peak']:.2f}",
+                    delta_color="off",
+                )
+                st.caption(
+                    "Daily R1/S1 are recalculated from the prior session and displayed historically. "
+                    "Orange markers show closes crossing above R1. Earnings events are mapped to the "
+                    "first trading session after release; dotted purple/brown lines extend the prior "
+                    "session high/low as reference levels through the latest bar. Red markers label "
+                    "the trough date of each peak-to-peak drawdown of at least 5%; the current "
+                    "unrecovered drawdown is marked at its deepest close so far. The blue marker and "
+                    "metric show drawdown from the running peak at the latest daily close."
+                )
+                if not earnings_dates:
+                    st.caption("Yahoo Finance did not return earnings dates for this ticker.")
             st.write(f"**Daily Return (Session Baseline):** {result['Day %']:.2f}%")
             st.write(f"**Daily Return (Net):** {result.get('Day % Net', float('nan')):.2f}%")
             render_metric_with_threshold(
@@ -1868,6 +2057,61 @@ with tab5:
             fc_daily_budget = st.slider("Daily Tail-Risk Budget %", min_value=0.10, max_value=5.00, value=1.50, step=0.05) / 100.0
         with r3:
             fc_min_edge = st.slider("Min Edge %", min_value=0.05, max_value=2.00, value=0.25, step=0.05) / 100.0
+
+        st.caption(
+            "Pre-training uses the full profile for the current ticker universe. "
+            "Compatible saved models are reused; this can take a long time for missing models."
+        )
+        if st.button("Pre-train Forecast Models", key="pretrain_forecast_models"):
+            progress = st.progress(0, text="Checking saved forecast models...")
+            status = st.empty()
+            trained = []
+            reused = []
+            failures = []
+            for index, ticker in enumerate(forecast_universe, start=1):
+                progress.progress(
+                    (index - 1) / len(forecast_universe),
+                    text=f"Preparing {ticker} ({index}/{len(forecast_universe)})",
+                )
+                try:
+                    if forecast_models_available(ticker):
+                        reused.append(ticker)
+                        status.info(
+                            f"{ticker}: compatible models already exist; skipping training."
+                        )
+                    else:
+                        status.info(
+                            f"Training full-profile intraday and daily models for {ticker} "
+                            f"({index}/{len(forecast_universe)})..."
+                        )
+                        train_and_save_best_models(
+                            ticker=ticker,
+                            intraday_period=fc_intraday_period,
+                            intraday_interval=fc_intraday_interval,
+                            daily_period="3y",
+                            profile="full",
+                            use_pipeline=True,
+                            verbose=False,
+                        )
+                        trained.append(ticker)
+                except Exception as exc:
+                    failures.append((ticker, exc))
+                finally:
+                    progress.progress(
+                        index / len(forecast_universe),
+                        text=f"Processed {ticker} ({index}/{len(forecast_universe)})",
+                    )
+
+            if trained:
+                st.success(f"Trained models for: {', '.join(trained)}")
+            if reused:
+                st.info(f"Reused existing compatible models for: {', '.join(reused)}")
+            if failures:
+                st.error(f"Pre-training failed for {len(failures)} ticker(s):")
+                for ticker, exc in failures:
+                    st.error(f"{ticker}: {exc}")
+            elif not trained:
+                st.success("All tickers already have compatible saved models.")
 
         if st.button("Run Forecast & Action", key="run_forecast_action"):
             try:
