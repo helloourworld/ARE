@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import yfinance as yf
 from pathlib import Path
 from numpy.linalg import inv
 import sys

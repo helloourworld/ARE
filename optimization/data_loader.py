@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import yfinance as yf
 from pathlib import Path
 from scipy.stats import norm
 from datetime import datetime, timedelta

@@ -120,11 +120,11 @@ st.session_state.conf_df = edited_df
 if st.button("Run Individualized Optimization"):
     with st.spinner("Analyzing Variance-Covariance Matrix..."):
         # Fetching Data (2026 'Close' fix)
+        df = pd.DataFrame()
         for t in st.session_state.universe:
             _df = get_data_persistent(t)[['Close']].dropna()
             _df.columns = [t]
-            # print(_df)
-            df = pd.concat([df, _df], axis=1) if 'df' in locals() else _df
+            df = pd.concat([df, _df], axis=1)
         
         returns = df.pct_change(fill_method=None).dropna()
         
