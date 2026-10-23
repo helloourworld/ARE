@@ -36,7 +36,6 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import statsmodels.api as sm
-import streamlit.components.v1 as components
 import yfinance as yf
 import yaml
 from sklearn.covariance import LedoitWolf
@@ -827,7 +826,7 @@ def update_browser_tab_title():
 
         bench_current = float(bench_series.iloc[-1])
         title_text = f"{10} {bench_current:,.2f}"
-        components.html(
+        st.html(
             f"""
             <script>
                 try {{
@@ -839,11 +838,10 @@ def update_browser_tab_title():
                 }} catch (e) {{}}
             </script>
             """,
-            height=0,
-            scrolling=False,
+            unsafe_allow_javascript=True,
         )
     except Exception:
-        components.html(
+        st.html(
             """
             <script>
                 try {
@@ -854,8 +852,7 @@ def update_browser_tab_title():
                 } catch (e) {}
             </script>
             """,
-            height=0,
-            scrolling=False,
+            unsafe_allow_javascript=True,
         )
 
 # Run browser title updater in background

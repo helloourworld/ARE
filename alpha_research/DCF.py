@@ -232,5 +232,4 @@ if __name__ == "__main__":
     arguments = parser.parse_args()
     run_valuation_suite(arguments.ticker.upper(), arguments.recovery_fcf)
 
-"""
-python alpha_research\DCF.py INTC --recovery-fcf=-2000,1000,4000,6000,8000"""
+# Example: python alpha_research\DCF.py INTC --recovery-fcf=-2000,1000,4000,6000,8000
