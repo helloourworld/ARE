@@ -88,6 +88,16 @@ from plotly.subplots import make_subplots
 
 # Configure the page before creating any Streamlit elements.
 st.set_page_config(page_title="Alpha Risk Engine (ARE)", page_icon="🤖", layout="wide")
+st.markdown(
+    """
+    <style>
+    [data-testid="stMainBlockContainer"] {
+        padding-top: 0.75rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -817,7 +827,7 @@ def update_browser_tab_title():
 
         bench_current = float(bench_series.iloc[-1])
         title_text = f"{10} {bench_current:,.2f}"
-        st.iframe(
+        components.html(
             f"""
             <script>
                 try {{
@@ -829,10 +839,11 @@ def update_browser_tab_title():
                 }} catch (e) {{}}
             </script>
             """,
-
+            height=0,
+            scrolling=False,
         )
     except Exception:
-        st.iframe(
+        components.html(
             """
             <script>
                 try {
@@ -843,7 +854,8 @@ def update_browser_tab_title():
                 } catch (e) {}
             </script>
             """,
-
+            height=0,
+            scrolling=False,
         )
 
 # Run browser title updater in background
