@@ -62,19 +62,10 @@ def get_sp500_tickers():
         sectors["Symbol"] = sectors["Symbol"].str.replace(".", "-", regex=False)
 
         return tickers, sectors
-    except Exception:
-        # If the automated fetch fails (network, 403, parsing), fall back to
-        # a small curated subset so the dashboard and tests can still run.
-        sample = [
-            "AAPL", "MSFT", "GOOG", "AMZN", "NVDA", "JPM", "V", "JNJ",
-            "WMT", "PG", "DIS", "MA", "BAC", "HD", "INTC", "CSCO",
-        ]
-        sectors = pd.DataFrame({
-            "Symbol": sample,
-            "Security": sample,
-            "GICS Sector": ["Technology"] * len(sample),
-        })
-        return sample, sectors
+    except Exception as exc:
+        return [], pd.DataFrame(
+            {"Error": [f"Unable to load S&P 500 constituents: {exc}"]}
+        )
 
 
 # -----------------------------
@@ -134,45 +125,8 @@ def download_etfs(period="2y"):
 
 # -------- Append current price data --------
 def append_current_prices(close_df, tickers):
-    """Fetch current prices for all tickers and append as today's row if not already present."""
-    try:
-        today = pd.Timestamp.now().normalize()
-        last_date = close_df.index[-1] if len(close_df) > 0 else None
-
-        # Only fetch if today's data isn't already in the dataframe
-        if last_date is None or last_date.normalize() < today:
-            # Fetch current price (1d data from yesterday to today to catch market close)
-            current_data = yf.download(
-                tickers,
-                start=(today - pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
-                end=(today + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
-                interval="1d",
-                auto_adjust=True,
-                progress=False,
-                threads=True,
-                # Let yfinance manage its own session (curl_cffi required for recent yfinance)
-            )
-
-            if isinstance(current_data.columns, pd.MultiIndex):
-                current_close = current_data["Close"].copy()
-            else:
-                current_close = current_data[["Close"]].copy()
-
-            # Align columns with historical data
-            current_close = current_close.reindex(columns=close_df.columns, fill_value=np.nan)
-
-            # Append only the most recent row if it's a new date
-            if len(current_close) > 0:
-                latest_current_row = current_close.iloc[-1:]
-                latest_current_row.index = latest_current_row.index.normalize()
-
-                if last_date is None or latest_current_row.index[0] > last_date.normalize():
-                    close_df = pd.concat([close_df, latest_current_row])
-
-        return close_df
-    except Exception as e:
-        # If current price fetch fails, return historical data as-is
-        return close_df
+    """Return completed historical closes only; never append a partial session bar."""
+    return close_df.copy()
 
 # -----------------------------
 # Breadth calculations
@@ -190,8 +144,19 @@ def calculate_breadth(close):
     net_advancers = advancers - decliners
     ad_line = net_advancers.cumsum()
 
-    # A/D ratio (advancers / decliners). Replace 0 with NaN to avoid inf values
-    ad_ratio = advancers / decliners.replace(0, np.nan)
+    # Use positive infinity for a session with no decliners; this preserves
+    # the signal as strongly bullish and does not turn the latest row into NaN.
+    ad_ratio = advancers.div(decliners.replace(0, np.nan))
+    ad_ratio = ad_ratio.mask((decliners == 0) & (advancers > 0), np.inf)
+    ad_3day_average = ad_ratio.rolling(3, min_periods=3).mean()
+    ad_positive_3day_count = (ad_ratio > 1.5).rolling(3, min_periods=3).sum()
+    ad_negative_3day_count = (ad_ratio < 0.67).rolling(3, min_periods=3).sum()
+    ad_positive_confirmation = (
+        (ad_3day_average > 1.5) | (ad_positive_3day_count >= 2)
+    )
+    ad_negative_confirmation = (
+        (ad_3day_average < 0.67) | (ad_negative_3day_count >= 2)
+    )
 
     # Moving averages for participation measures. These are full series to
     # allow computing percent above MA each day.
@@ -217,6 +182,11 @@ def calculate_breadth(close):
         "Unchanged": unchanged,
         "Net Advancers": net_advancers,
         "A/D Ratio": ad_ratio,
+        "3-Day A/D Average": ad_3day_average,
+        "3-Day Positive A/D Count": ad_positive_3day_count,
+        "3-Day Negative A/D Count": ad_negative_3day_count,
+        "A/D Positive Confirmation": ad_positive_confirmation,
+        "A/D Negative Confirmation": ad_negative_confirmation,
         "A/D Line": ad_line,
         "% Above 20DMA": pct_above_20,
         "% Above 50DMA": pct_above_50,
@@ -269,7 +239,9 @@ def breadth_signal(latest, spy_series=None):
     Scoring rules (each criterion contributes ±1):
     1. % Above 50DMA   > 0.60 → +1   |  < 0.40 → -1
     2. % Above 200DMA  > 0.55 → +1   |  < 0.35 → -1  (tighter — 200DMA is structural)
-    3. A/D Ratio       > 1.5  → +1   |  < 0.67 → -1
+    3. A/D confirmation requires a 3-day average > 1.5 (or < 0.67),
+       or at least two of the last three daily A/D ratios above 1.5
+       (or below 0.67).
     4. 52W High/Low    net >  0  → +1  |  net < 0 → -1  (normalised by total)
     5. SPY trend       price > 50DMA > 200DMA → +1
                        price < 50DMA           → -1
@@ -308,14 +280,44 @@ def breadth_signal(latest, spy_series=None):
         details.append(f"➖ {pct_200:.1%} stocks above 200DMA (neutral)")
 
     # 3. A/D Ratio
-    if ad_ratio > 1.5:
+    ad_positive_confirmed = bool(
+        latest["A/D Positive Confirmation"]
+        if "A/D Positive Confirmation" in latest
+        else ad_ratio > 1.5
+    )
+    ad_negative_confirmed = bool(
+        latest["A/D Negative Confirmation"]
+        if "A/D Negative Confirmation" in latest
+        else ad_ratio < 0.67
+    )
+    ad_3day = latest.get("3-Day A/D Average")
+    ad_3day_count = latest.get("3-Day Positive A/D Count")
+    ad_negative_3day_count = latest.get("3-Day Negative A/D Count")
+
+    if ad_positive_confirmed:
         score += 1
-        details.append(f"✅ A/D Ratio {ad_ratio:.2f} (>1.5 — buyers dominate)")
-    elif ad_ratio < 0.67:
+        average_text = f"{ad_3day:.2f}" if pd.notna(ad_3day) else "N/A"
+        count_text = f"{int(ad_3day_count)} of 3" if pd.notna(ad_3day_count) else "current"
+        details.append(
+            f"✅ 3-day A/D confirmed bullish: current {ad_ratio:.2f}, "
+            f"3-day average {average_text}, positive days {count_text}"
+        )
+    elif ad_negative_confirmed:
         score -= 1
-        details.append(f"❌ A/D Ratio {ad_ratio:.2f} (<0.67 — sellers dominate)")
+        average_text = f"{ad_3day:.2f}" if pd.notna(ad_3day) else "N/A"
+        negative_count_text = (
+            f"{int(ad_negative_3day_count)} of 3"
+            if pd.notna(ad_negative_3day_count)
+            else "current"
+        )
+        details.append(
+            f"❌ 3-day A/D confirmed bearish: current {ad_ratio:.2f}, "
+            f"3-day average {average_text}, negative days {negative_count_text}"
+        )
     else:
-        details.append(f"➖ A/D Ratio {ad_ratio:.2f} (neutral)")
+        details.append(
+            f"➖ A/D not confirmed by 3-day breadth (current {ad_ratio:.2f})"
+        )
 
     # 4. 52W High-Low Net
     hl_net = int(new_highs) - int(new_lows)
@@ -401,6 +403,11 @@ if __name__ == "__main__":
     # Load data
     # -----------------------------
     tickers, sector_map = get_sp500_tickers()
+    if not tickers:
+        error = sector_map.iloc[0]["Error"] if not sector_map.empty else "Unable to load S&P 500 constituents."
+        st.error(error)
+        st.warning("S&P 500 breadth calculation stopped; no degraded fallback is used.")
+        st.stop()
     close = download_prices(tickers, period=period)
     etf_close = download_etfs(period=period)
 
@@ -411,7 +418,7 @@ if __name__ == "__main__":
     breadth = calculate_breadth(close)
     sector_breadth = calculate_sector_breadth(close, sector_map)
 
-    latest = breadth.dropna().iloc[-1]
+    latest = breadth.iloc[-1]
     latest_date = breadth.dropna().index[-1].date()
 
     spy_series = etf_close["SPY"].dropna() if "SPY" in etf_close.columns else None

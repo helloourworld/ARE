@@ -50,7 +50,7 @@ def test_get_data_persistent_uses_existing_cache(tmp_path, monkeypatch):
     assert result.index.tz is None
 
 
-def test_get_data_persistent_initial_daily_download_uses_two_years(tmp_path, monkeypatch):
+def test_get_data_persistent_initial_daily_download_uses_since_2000(tmp_path, monkeypatch):
     cache_dir = tmp_path / "data"
     cache_dir.mkdir()
     yahoo = DummyYF(pd.DataFrame(
@@ -68,10 +68,59 @@ def test_get_data_persistent_initial_daily_download_uses_two_years(tmp_path, mon
     assert not result.empty
     assert yahoo.calls == [{
         "ticker": "NEW",
-        "period": "2y",
+        "period": None,
         "interval": "1d",
-        "start": None,
+        "start": "2000-01-01",
     }]
+
+
+def test_index_fund_initial_download_uses_inception_dates(monkeypatch):
+    assert data_cache._daily_history_start("SPY", "1d") == "1993-01-29"
+    assert data_cache._daily_history_start("QQQ", "1d") == "1999-03-10"
+
+
+def test_existing_daily_cache_is_backfilled_to_2000_and_preserves_newer_rows(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "data"
+    cache_dir.mkdir()
+    existing = pd.DataFrame(
+        {
+            "Open": [40.0, 50.0],
+            "High": [41.0, 51.0],
+            "Low": [39.0, 49.0],
+            "Close": [40.5, 50.5],
+            "Volume": [1000, 1100],
+        },
+        index=pd.to_datetime(["2024-01-01", "2024-01-02"]),
+    )
+    existing.to_csv(cache_dir / "cache_AAPL_1d.csv")
+
+    yahoo_payload = pd.DataFrame(
+        {
+            "Open": [10.0, 40.0, 60.0],
+            "High": [11.0, 41.0, 61.0],
+            "Low": [9.0, 39.0, 59.0],
+            "Close": [10.5, 40.5, 60.5],
+            "Volume": [100, 1000, 1200],
+        },
+        index=pd.to_datetime(["2000-01-03", "2024-01-01", "2024-01-03"]),
+    )
+    yahoo = DummyYF(yahoo_payload)
+
+    monkeypatch.setattr(data_cache, "DATA_DIR", cache_dir)
+    monkeypatch.setattr(data_cache, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(data_cache, "yf", yahoo)
+
+    result = data_cache.get_data_persistent("AAPL", interval="1d", period="max")
+
+    assert yahoo.calls == [{
+        "ticker": "AAPL",
+        "period": None,
+        "interval": "1d",
+        "start": "2000-01-01",
+    }]
+    assert result.index.min() == pd.Timestamp("2000-01-03")
+    assert result.loc[pd.Timestamp("2024-01-02"), "Close"] == 50.5
+    assert result.loc[pd.Timestamp("2024-01-03"), "Close"] == 60.5
 
 
 def test_get_data_persistent_refreshes_stale_5m_cache_within_yahoo_lookback(tmp_path, monkeypatch):
@@ -195,7 +244,7 @@ def test_get_data_persistent_redownloads_daily_row_with_missing_ohlc(tmp_path, m
         "ticker": "AAPL",
         "period": None,
         "interval": "1d",
-        "start": "2026-09-21",
+        "start": "2000-01-01",
     }]
 
 

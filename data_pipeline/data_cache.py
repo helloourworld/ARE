@@ -38,6 +38,11 @@ except Exception:
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_ROOT / "data"
+DAILY_HISTORY_START = "2000-01-01"
+DAILY_INCEPTION_STARTS = {
+    "SPY": "1993-01-29",
+    "QQQ": "1999-03-10",
+}
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 IB_CLIENT_AVAILABLE = EClient is not None and EWrapper is not None and Contract is not None
@@ -54,6 +59,12 @@ DATE_ONLY_INTERVALS = {"1d", "1wk", "1mo"}
 YF_INTRADAY_REFRESH_LOOKBACK_DAYS = {"1m": 7, "5m": 59}
 FRED_HIGH_YIELD_SERIES = "BAMLH0A0HYM2"
 FRED_INVESTMENT_GRADE_SERIES = "BAMLC0A0CM"
+
+
+def _daily_history_start(ticker: str, interval: str) -> str:
+    if str(interval).lower() in DATE_ONLY_INTERVALS:
+        return DAILY_INCEPTION_STARTS.get(str(ticker).upper(), DAILY_HISTORY_START)
+    return ""
 
 
 def _normalize_index_for_interval(index, interval: str):
@@ -179,7 +190,7 @@ def _normalize_tickers(tickers):
     return list(tickers) if tickers else []
 
 
-def _load_close_series(tickers, interval="1d", period="2y", force_refresh=False):
+def _load_close_series(tickers, interval="1d", period="max", force_refresh=False):
     """Load closing price series for symbols through the persistent cache.
 
     Each ticker is loaded via get_data_persistent, so this method inherits the
@@ -272,8 +283,38 @@ def _refresh_from_yf(ticker: str, start_date, interval: str) -> pd.DataFrame:
     )
 
 
-def _refresh_local_cache(local_df: pd.DataFrame, ticker: str, interval: str, file_path: Path) -> pd.DataFrame:
+def _refresh_local_cache(
+    local_df: pd.DataFrame,
+    ticker: str,
+    interval: str,
+    file_path: Path,
+    force_refresh: bool = False,
+) -> pd.DataFrame:
     daily_like = str(interval).lower() in DATE_ONLY_INTERVALS
+    if daily_like and not local_df.empty:
+        oldest = pd.Timestamp(local_df.index.min())
+        target_history_start = _daily_history_start(ticker, interval)
+        history_start = pd.Timestamp(target_history_start)
+        if getattr(oldest, "tzinfo", None) is not None:
+            history_start = history_start.tz_localize(oldest.tzinfo)
+        else:
+            history_start = history_start.tz_localize(None)
+        if oldest > history_start:
+            new_data = yf.download(
+                ticker,
+                start=target_history_start,
+                period=None,
+                interval=interval,
+                prepost=True,
+                progress=False,
+            )
+            if not new_data.empty:
+                new_data = new_data.dropna(how="all")
+                new_data = _normalize_yf_df(new_data, interval=interval)
+                combined = pd.concat([local_df, new_data])
+                combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+                return _cache_dataframe(combined, file_path)
+
     invalid_dates = _invalid_ohlc_dates(local_df, interval)
     if not invalid_dates.empty:
         first_invalid = invalid_dates[0]
@@ -294,7 +335,7 @@ def _refresh_local_cache(local_df: pd.DataFrame, ticker: str, interval: str, fil
     normalized_interval = str(interval).lower()
     wait_time = timedelta(minutes=2) if normalized_interval == "1m" else timedelta(hours=12)
     
-    if invalid_dates.empty and now_local - last_ts < wait_time:
+    if not force_refresh and invalid_dates.empty and now_local - last_ts < wait_time:
         return local_df
 
     # Use the Timestamp object directly - _refresh_from_yf will handle conversion
@@ -319,15 +360,23 @@ def _refresh_local_cache(local_df: pd.DataFrame, ticker: str, interval: str, fil
     return _cache_dataframe(combined, file_path)
 
 
-def _fetch_yf_initial(ticker: str, interval: str, period: str) -> pd.DataFrame:
-    fetch_period = "7d" if interval == "1m" else period
+def _fetch_yf_initial(ticker: str, interval: str, period: str | None = None) -> pd.DataFrame:
+    fetch_period = "7d" if interval == "1m" else None
+    fetch_start = None if str(interval).lower() not in DATE_ONLY_INTERVALS else _daily_history_start(ticker, interval)
     logger.debug(
-        "Initializing Yahoo download | ticker=%s interval=%s period=%s",
+        "Initializing Yahoo download | ticker=%s interval=%s start=%s",
         ticker,
         interval,
-        fetch_period,
+        fetch_start,
     )
-    return yf.download(ticker, period=fetch_period, interval=interval, prepost=True, progress=False)
+    return yf.download(
+        ticker,
+        start=fetch_start,
+        period=fetch_period,
+        interval=interval,
+        prepost=True,
+        progress=False,
+    )
 
 
 def _map_interval_to_ib_barsize(interval: str) -> str | None:
@@ -539,7 +588,7 @@ def get_data_from_ib(ticker: str, interval: str = "1d", period: str = "2y") -> p
     return df[~df.index.duplicated(keep="last")].sort_index()
 
 
-def get_data_persistent(ticker, interval="1d", period="2y", force_refresh=False):
+def get_data_persistent(ticker, interval="1d", period="max", force_refresh=False):
     """Load OHLCV data from the local cache, refreshing or fetching as needed.
 
     Workflow:
@@ -550,15 +599,21 @@ def get_data_persistent(ticker, interval="1d", period="2y", force_refresh=False)
     """
     safe_ticker = str(ticker).replace("/", "_").replace("=", "_")
     file_path = _get_cache_path(f"cache_{safe_ticker}_{interval}.csv")
-    initial_period = "2y" if str(interval).lower() in DATE_ONLY_INTERVALS else period
+    initial_period = period
 
     try:
-        if file_path.exists() and not force_refresh:
+        if file_path.exists():
             local_df = _load_cached_csv(file_path, interval=interval)
             if local_df.empty:
                 return local_df
 
-            refreshed_df = _refresh_local_cache(local_df, ticker, interval, file_path)
+            refreshed_df = _refresh_local_cache(
+                local_df,
+                ticker,
+                interval,
+                file_path,
+                force_refresh=force_refresh,
+            )
             if not refreshed_df.empty:
                 return refreshed_df
             return local_df
@@ -657,7 +712,7 @@ def get_daily_returns(tickers, benchmark, start_date):
     """
     tickers = _normalize_tickers(tickers)
     all_tickers = list(set(tickers + [benchmark]))
-    price_data = _load_close_series(all_tickers, interval="1d", period="5y", force_refresh=False)
+    price_data = _load_close_series(all_tickers, interval="1d", period="max", force_refresh=False)
     if price_data.empty:
         return pd.DataFrame()
 
@@ -667,7 +722,7 @@ def get_daily_returns(tickers, benchmark, start_date):
     start_ts = normalize_timestamp_for_index(start_date, price_data.index)
     if price_data.index.min() > start_ts:
         price_data = _load_close_series(
-            all_tickers, interval="1d", period="5y", force_refresh=True
+            all_tickers, interval="1d", period="max", force_refresh=True
         )
         if price_data.empty:
             return pd.DataFrame()
@@ -696,7 +751,7 @@ def get_daily_returns(tickers, benchmark, start_date):
     return returns
 
 
-def get_price_history(tickers, period="2y", interval="1d"):
+def get_price_history(tickers, period="max", interval="1d"):
     """
     Fetch price history for technical analysis.
     Uses persistent cache with automatic updates.
@@ -712,7 +767,7 @@ def get_price_history(tickers, period="2y", interval="1d"):
     return _load_close_series(tickers, interval=interval, period=period, force_refresh=False)
 
 
-def get_price_history_with_benchmark(tickers, benchmark, period="2y", interval="1d"):
+def get_price_history_with_benchmark(tickers, benchmark, period="max", interval="1d"):
     """
     Fetch price history including benchmark for RS analysis.
     Uses persistent cache with automatic updates.
@@ -729,7 +784,7 @@ def get_price_history_with_benchmark(tickers, benchmark, period="2y", interval="
     return _load_close_series(tickers + [benchmark], interval=interval, period=period, force_refresh=False)
 
 
-def get_ohlcv_history(tickers, period="2y", interval="1d", force_refresh=False):
+def get_ohlcv_history(tickers, period="max", interval="1d", force_refresh=False):
     """
     Fetch complete OHLCV data (not just Close).
     Uses persistent cache with automatic updates.
@@ -808,7 +863,32 @@ def get_live_intraday(tickers, period="2d", force_refresh=True):
     
     try:
         result = _load_close_series(tickers, interval="1m", period=period, force_refresh=force_refresh)
-        return result if not result.empty else None
+        if result is None or result.empty:
+            return None
+
+        freshest = {}
+        threshold = pd.Timedelta(minutes=5)
+        for ticker in result.columns:
+            valid = result[ticker].dropna()
+            if valid.empty:
+                continue
+            latest_ts = pd.Timestamp(valid.index[-1])
+            now = (
+                pd.Timestamp.now(tz=latest_ts.tz)
+                if latest_ts.tzinfo is not None
+                else pd.Timestamp.now()
+            )
+            if now - latest_ts <= threshold:
+                freshest[ticker] = result[ticker]
+            else:
+                logger.warning(
+                    "Live intraday column is stale | ticker=%s latest=%s",
+                    ticker,
+                    latest_ts.isoformat(),
+                )
+        if not freshest:
+            return None
+        return pd.DataFrame(freshest, index=result.index)
     except Exception as e:
         print(f"Live intraday error: {e}")
         return None
@@ -843,4 +923,4 @@ def force_refresh_ticker(ticker, interval="1d"):
     Returns:
         Updated DataFrame or empty DataFrame on error
     """
-    return get_data_persistent(ticker, interval=interval, period="2y", force_refresh=True)
+    return get_data_persistent(ticker, interval=interval, period="max", force_refresh=True)

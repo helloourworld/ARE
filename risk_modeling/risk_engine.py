@@ -42,10 +42,19 @@ class AlphaRiskEngine:
         Solves the 'Correlation > 1' problem using Ledoit-Wolf Shrinkage.
         Shrinks the sample covariance matrix towards a structured estimator.
         """
+        if self.returns is None or self.returns.empty:
+            raise ValueError("Cannot compute covariance without ingested return data.")
+        requested = list(dict.fromkeys(list(self.tickers) + [self.benchmark]))
+        available = [ticker for ticker in requested if ticker in self.returns.columns]
+        if len(available) < 2:
+            raise ValueError(
+                f"At least two return series are required; available: {available}"
+            )
+        aligned_returns = self.returns[available].dropna(how="all")
         lw = LedoitWolf()
-        lw.fit(self.returns)
+        lw.fit(aligned_returns.dropna())
         self.robust_cov = pd.DataFrame(
-            lw.covariance_, index=self.tickers + [self.benchmark], columns=self.tickers + [self.benchmark])
+            lw.covariance_, index=available, columns=available)
         print("Robust Covariance Matrix (Ledoit-Wolf) calculated.")
         return self.robust_cov
 

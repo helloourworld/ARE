@@ -585,6 +585,8 @@ def backtest_mandelbrot_strategy(
     stop_loss_pct=DEFAULT_STOP_LOSS_PCT,
     take_profit_pct=DEFAULT_TAKE_PROFIT_PCT,
     trailing_stop_pct=DEFAULT_TRAILING_STOP_PCT,
+    commission_bps=0.0,
+    slippage_bps=0.0,
 ):
     """Backtest the Streamlit-driven bot using historical 1m and 1d data.
 
@@ -690,17 +692,20 @@ def backtest_mandelbrot_strategy(
 
                 if entry_signal_streak >= ENTRY_CONFIRMATION_BARS:
                     amount = min(cash_balance, cash_balance * position_size_pct)
-                    qty = round(amount / price, 6)
+                    execution_price = price * (1.0 + float(slippage_bps) / 10000.0)
+                    commission_rate = float(commission_bps) / 10000.0
+                    qty = round(amount / (execution_price * (1.0 + commission_rate)), 6)
                     if qty > 0:
                         position_size = qty
-                        cash_balance -= qty * price
-                        entry_price = price
+                        notional = qty * execution_price
+                        cash_balance -= notional + (notional * commission_rate)
+                        entry_price = execution_price
                         peak_price = price
                         bars_in_position = 0
                         entry_signal_streak = 0
                         last_entry_signal = None
-                        trade_log.append({"timestamp": timestamp, "action": "BUY", "qty": qty, "price": price, "signal": signal, "reason": "CONFIRMED_ENTRY"})
-                        trade_lines.append(f"{timestamp} BUY  qty={qty} price={price:.2f} signal={signal} reason=CONFIRMED_ENTRY")
+                        trade_log.append({"timestamp": timestamp, "action": "BUY", "qty": qty, "price": execution_price, "signal": signal, "reason": "CONFIRMED_ENTRY"})
+                        trade_lines.append(f"{timestamp} BUY  qty={qty} price={execution_price:.2f} signal={signal} reason=CONFIRMED_ENTRY")
                         if verbose:
                             logger.info(trade_lines[-1])
             elif position_size == 0:
@@ -737,9 +742,12 @@ def backtest_mandelbrot_strategy(
                 can_exit_now = hard_exit or (bars_in_position >= min_hold_steps and has_soft_exit_confirmation)
 
                 if exit_reason is not None and can_exit_now:
-                    cash_balance += position_size * price
-                    trade_log.append({"timestamp": timestamp, "action": "SELL", "qty": position_size, "price": price, "signal": signal, "reason": exit_reason})
-                    trade_lines.append(f"{timestamp} SELL qty={position_size} price={price:.2f} signal={signal} reason={exit_reason}")
+                    execution_price = price * (1.0 - float(slippage_bps) / 10000.0)
+                    commission_rate = float(commission_bps) / 10000.0
+                    proceeds = position_size * execution_price
+                    cash_balance += proceeds - (proceeds * commission_rate)
+                    trade_log.append({"timestamp": timestamp, "action": "SELL", "qty": position_size, "price": execution_price, "signal": signal, "reason": exit_reason})
+                    trade_lines.append(f"{timestamp} SELL qty={position_size} price={execution_price:.2f} signal={signal} reason={exit_reason}")
                     if verbose:
                         logger.info(trade_lines[-1])
                     position_size = 0.0

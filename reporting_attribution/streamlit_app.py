@@ -911,8 +911,8 @@ with tab1:
 
     mb_breadth      = calculate_breadth(mb_close)
     mb_sector_df    = calculate_sector_breadth(mb_close, mb_sector_map)
-    mb_latest       = mb_breadth.dropna().iloc[-1]
-    mb_latest_date  = mb_breadth.dropna().index[-1].date()
+    mb_latest       = mb_breadth.iloc[-1]
+    mb_latest_date  = mb_breadth.index[-1].date()
     mb_spy_series   = mb_etf["SPY"].dropna() if "SPY" in mb_etf.columns else None
     mb_signal, mb_color, mb_score, mb_details = breadth_signal(mb_latest, mb_spy_series)
 

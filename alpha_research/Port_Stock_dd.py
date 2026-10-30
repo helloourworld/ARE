@@ -19,6 +19,50 @@ if str(repo_root) not in sys.path:
 
 from data_pipeline.data_cache import get_data_persistent
 
+
+def get_current_price(ticker):
+    """Return the latest market/current price, falling back to the cached close."""
+    try:
+        ticker_obj = yf.Ticker(ticker, session=session)
+        fast_info = getattr(ticker_obj, "fast_info", None)
+        if fast_info:
+            for key in ("last_price", "regular_market_price"):
+                value = fast_info.get(key) if hasattr(fast_info, "get") else getattr(fast_info, key, None)
+                if value is not None and float(value) > 0:
+                    return float(value)
+
+        info = ticker_obj.info or {}
+        for key in ("currentPrice", "regularMarketPrice", "postMarketPrice", "preMarketPrice"):
+            value = info.get(key)
+            if value is not None and float(value) > 0:
+                return float(value)
+    except Exception:
+        pass
+    return None
+
+
+def get_current_quote(ticker, max_age_minutes=15):
+    """Return a timestamped live quote or None when it is stale or partial."""
+    try:
+        ticker_obj = yf.Ticker(ticker, session=session)
+        info = ticker_obj.info or {}
+        price = get_current_price(ticker)
+        timestamp = info.get("regularMarketTime")
+        if timestamp is None or price is None:
+            return None
+        quote_time = pd.to_datetime(timestamp, unit="s", utc=True)
+        now = pd.Timestamp.now(tz="UTC")
+        if now - quote_time > pd.Timedelta(minutes=max_age_minutes):
+            return None
+        return {
+            "price": float(price),
+            "timestamp": quote_time,
+            "source": "regular_market",
+        }
+    except Exception:
+        return None
+
+
 def plot_multiple_stocks_from_cache(tickers, period="5y"):
     """Build the drawdown chart from the repository's persistent OHLCV cache."""
     tickers = list(dict.fromkeys(tickers))
@@ -42,8 +86,15 @@ def plot_multiple_stocks_from_cache(tickers, period="5y"):
             ax_price.axis("off")
             ax_dd.axis("off")
             continue
-
         drawdown = close / close.cummax() - 1
+        quote = get_current_quote(ticker)
+        live_price = quote["price"] if quote else None
+        live_peak = max(float(close.max()) if len(close) else 0.0, float(live_price) if live_price else 0.0)
+        live_drawdown = (
+            float(live_price) / live_peak - 1
+            if live_price and live_peak > 0
+            else float(drawdown.iloc[-1])
+        )
         ax_price.plot(close.index, close.values,
                       color="steelblue", linewidth=1.1)
         ax_price.set_title(ticker)
@@ -72,7 +123,7 @@ def plot_multiple_stocks_from_cache(tickers, period="5y"):
         ax_dd.set_ylabel("Drawdown")
         ax_dd.grid(True, alpha=0.3)
         ax_dd.set_title(
-            f"Current {drawdown.iloc[-1]:.1%} | Max {drawdown.min():.1%}")
+            f"Live Current {live_drawdown:.1%} | Max {drawdown.min():.1%}")
 
     fig.suptitle("Portfolio Drawdown Analysis", fontsize=14)
     fig.tight_layout(rect=[0, 0.03, 1, 0.97])
@@ -86,6 +137,7 @@ def calculate_drawdown_analysis(tickers, period="5y", threshold=0.02):
     event_rows = []
     series_data = {}
     current_drawdowns = {}
+    average_drawdowns = {}
 
     for ticker in dict.fromkeys(tickers):
         stock = get_data_persistent(ticker, interval="1d", period=period)
@@ -95,13 +147,23 @@ def calculate_drawdown_analysis(tickers, period="5y", threshold=0.02):
         close = pd.to_numeric(stock["Close"], errors="coerce").dropna()
         if close.empty:
             continue
-
         running_peak = close.cummax()
         drawdown = close / running_peak - 1
-        current_drawdowns[ticker] = float(drawdown.iloc[-1])
+        quote = get_current_quote(ticker)
+        live_price = quote["price"] if quote else None
+        live_peak = max(float(close.max()) if len(close) else 0.0, float(live_price) if live_price else 0.0)
+        current_drawdowns[ticker] = (
+            float(live_price) / live_peak - 1
+            if live_price and live_peak > 0
+            else float(drawdown.iloc[-1])
+        )
         # Keep only drawdowns meeting the threshold in the displayed series.
         filtered_drawdown = drawdown.where(drawdown <= -threshold)
         series_data[ticker] = filtered_drawdown.rename(ticker)
+        negative_drawdowns = filtered_drawdown[filtered_drawdown < 0]
+        average_drawdowns[ticker] = (
+            float(negative_drawdowns.mean()) if not negative_drawdowns.empty else 0.0
+        )
 
         # A drawdown event runs from the first close below its prior peak
         # through the first later close that reaches that peak again.
@@ -156,7 +218,7 @@ def calculate_drawdown_analysis(tickers, period="5y", threshold=0.02):
             "Ticker": ticker,
             "Threshold": threshold,
             "Current Drawdown": current_drawdowns[ticker],
-            "Average Drawdown": float(filtered_drawdown[filtered_drawdown < 0].mean()) if (filtered_drawdown < 0).any() else 0.0,
+            "Average Drawdown": average_drawdowns[ticker],
             "Average Event Drawdown": float(ticker_events["Maximum Drawdown"].mean()) if not ticker_events.empty else None,
             "Maximum Drawdown": float(ticker_events["Maximum Drawdown"].min()) if not ticker_events.empty else None,
             "Average Recovery Days": float(recovered_events["Recovery Trading Days"].mean()) if not recovered_events.empty else None,
@@ -235,6 +297,8 @@ def calculate_drawdown(ticker="SPY", start_date=None, window=180):
 
         print(
             f"Data range for {ticker}: {stock.index[0].date()} to {stock.index[-1].date()}")
+
+        close = pd.to_numeric(stock["Close"].squeeze(), errors="coerce").dropna()
 
         # Calculate rolling maximum
         rolling_max = stock['Close'].cummax()
@@ -366,7 +430,19 @@ def main(tickers=["AAPL", "intc", "GOOG", "nvda", "SPY"]):
                 print(f"No data received for {ticker}")
                 continue
 
-            stock.columns = stock.columns.droplevel(1)
+            if isinstance(stock.columns, pd.MultiIndex):
+                try:
+                    close_values = stock.xs("Close", axis=1, level=0)
+                except KeyError:
+                    continue
+                close_values.columns = ["Close"] if len(close_values.columns) == 1 else close_values.columns
+                if isinstance(close_values, pd.DataFrame) and "Close" in close_values:
+                    stock = close_values[["Close"]].copy()
+                else:
+                    stock = pd.DataFrame({"Close": pd.to_numeric(close_values.iloc[:, 0], errors="coerce")}, index=close_values.index)
+            else:
+                if "Close" not in stock:
+                    continue
             # Calculate drawdown (ensure 1D series)
             rolling_max = stock['Close'].expanding().max()
             rolling_max2 = np.maximum.accumulate(stock['Close'])

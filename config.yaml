@@ -11,7 +11,7 @@ universe:
   passive_em: [ZEM.TO]
   intl_hedged: [XEF.TO]
   us_tech: [MSFT, GOOG, AMZN, AAPL]
-  dividend_value: [CGDV]
+  dividend_value: [SCHD]
 
   benchmarks:
     - ACWI
@@ -24,7 +24,7 @@ defaults:
   selected_portfolio:
     - ACWI
     - PSI
-    - CGDV
+    - SCHD
     - AAPL
     - GOOG
     - AMZN
@@ -39,7 +39,7 @@ constraints:
   AAPL:    {min: 0.05, max: 0.20, target: 0.15}
   GOOG:    {min: 0.05, max: 0.20, target: 0.15}
   AMZN:    {min: 0.05, max: 0.20, target: 0.10}
-  CGDV: {min: 0.03, max: 0.10, target: 0.05}
+  SCHD: {min: 0.03, max: 0.10, target: 0.05}
 
 # Hyperparameters for Risk Engines
 parameters:
@@ -60,6 +60,8 @@ external_tickers:
   - MSFT
   - MRVL
   - SPY
+  - QQQ
+  - VOO
   - MRK
   - SOXX
   - SPCX
