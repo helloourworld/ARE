@@ -326,7 +326,7 @@ def build_mean_reversion_chart(ticker, intraday_data, support, resistance):
     return figure
 
 
-def build_historical_pivot_chart(ticker, daily_data, earnings_dates=None):
+def build_historical_pivot_chart(ticker, daily_data, earnings_dates=None, current_price=None):
     """Show daily R1/S1 history and earnings-session breakout reference levels."""
     history = calculate_historical_pivot_data(daily_data, earnings_dates)
     figure = go.Figure()
@@ -398,17 +398,28 @@ def build_historical_pivot_chart(ticker, daily_data, earnings_dates=None):
         )
 
     latest = history.iloc[-1]
+    try:
+        live_price = float(current_price)
+    except (TypeError, ValueError):
+        live_price = None
+    if live_price is not None and np.isfinite(live_price) and live_price > 0:
+        live_peak = max(float(history["Drawdown Peak"].iloc[-1]), live_price)
+        live_drawdown = live_price / live_peak - 1.0
+    else:
+        live_price = float(latest["Close"])
+        live_peak = float(latest["Drawdown Peak"])
+        live_drawdown = float(latest["Drawdown"])
     figure.add_trace(
         go.Scatter(
             x=[history.index[-1]],
-            y=[latest["Close"]],
+            y=[live_price],
             mode="markers+text",
-            name="Latest close drawdown",
-            text=[f"Current {latest['Drawdown']:.1%}"],
+            name="Current drawdown",
+            text=[f"Current {live_drawdown:.1%}"],
             textposition="top center",
-            customdata=[[latest["Drawdown"], latest["Drawdown Peak"]]],
+            customdata=[[live_drawdown, live_peak]],
             hovertemplate=(
-                "%{x|%Y-%m-%d}<br>Latest close: %{y:.2f}"
+                "%{x|%Y-%m-%d}<br>Current price: %{y:.2f}"
                 "<br>Drawdown: %{customdata[0]:.2%}"
                 "<br>Peak close: %{customdata[1]:.2f}<extra></extra>"
             ),
@@ -1630,6 +1641,7 @@ with tab3:
                     alert_ticker,
                     chart_daily_data,
                     earnings_dates,
+                    current_price=current_price,
                 )
             except ValueError as exc:
                 st.warning(f"Historical pivot chart unavailable: {exc}")
@@ -1637,10 +1649,20 @@ with tab3:
                 st.plotly_chart(historical_pivot_figure, width="stretch")
                 latest_daily = calculate_historical_pivot_data(chart_daily_data)
                 latest_drawdown = latest_daily.iloc[-1]
+                try:
+                    live_price = float(current_price)
+                except (TypeError, ValueError):
+                    live_price = None
+                if live_price is not None and np.isfinite(live_price) and live_price > 0:
+                    current_peak = max(float(latest_daily["Drawdown Peak"].iloc[-1]), live_price)
+                    current_drawdown = live_price / current_peak - 1.0
+                else:
+                    current_peak = float(latest_drawdown["Drawdown Peak"])
+                    current_drawdown = float(latest_drawdown["Drawdown"])
                 st.metric(
-                    f"Drawdown at latest daily close ({latest_daily.index[-1]:%Y-%m-%d})",
-                    f"{latest_drawdown['Drawdown']:.2%}",
-                    delta=f"from peak close ${latest_drawdown['Drawdown Peak']:.2f}",
+                    "Current Drawdown",
+                    f"{current_drawdown:.2%}",
+                    delta=f"from peak close ${current_peak:.2f}",
                     delta_color="off",
                 )
                 st.caption(
@@ -1650,7 +1672,7 @@ with tab3:
                     "session high/low as reference levels through the latest bar. Red markers label "
                     "the trough date of each peak-to-peak drawdown of at least 5%; the current "
                     "unrecovered drawdown is marked at its deepest close so far. The blue marker and "
-                    "metric show drawdown from the running peak at the latest daily close."
+                    "metric use the current price against the running peak."
                 )
                 if not earnings_dates:
                     st.caption("Yahoo Finance did not return earnings dates for this ticker.")

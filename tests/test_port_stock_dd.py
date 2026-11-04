@@ -45,3 +45,12 @@ def test_live_price_is_separate_from_cached_history():
     assert close.iloc[-1] == 92.07
     assert historical_drawdown.iloc[-1] == pytest.approx(-0.3467432950191571, abs=1e-6)
     assert live_drawdown == pytest.approx(-0.5407975024833263, abs=1e-6)
+
+
+def test_calculate_current_drawdown_uses_live_price_and_peak():
+    close = pd.Series([100.0, 140.94, 92.07])
+
+    drawdown, peak = Port_Stock_dd.calculate_current_drawdown(close, 64.72)
+
+    assert peak == 140.94
+    assert drawdown == pytest.approx(64.72 / 140.94 - 1, abs=1e-12)

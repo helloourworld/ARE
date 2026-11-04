@@ -20,6 +20,32 @@ if str(repo_root) not in sys.path:
 from data_pipeline.data_cache import get_data_persistent
 
 
+def calculate_current_drawdown(close, current_price):
+    """Calculate drawdown from the peak close, including a current/live price."""
+    close_values = pd.to_numeric(
+        close.squeeze() if isinstance(close, pd.DataFrame) else pd.Series(close),
+        errors="coerce",
+    ).dropna()
+    if close_values.empty:
+        return None, None
+
+    peak_close = float(close_values.max())
+    live_peak = peak_close
+    live_price = None
+    if current_price is not None:
+        try:
+            live_price = float(current_price)
+        except (TypeError, ValueError):
+            live_price = None
+        if live_price is not None and np.isfinite(live_price) and live_price > 0:
+            live_peak = max(peak_close, live_price)
+            return live_price / live_peak - 1.0, live_peak
+
+    latest_close = float(close_values.iloc[-1])
+    live_peak = max(peak_close, latest_close)
+    return latest_close / live_peak - 1.0, live_peak
+
+
 def get_current_price(ticker):
     """Return the latest market/current price, falling back to the cached close."""
     try:
@@ -89,12 +115,7 @@ def plot_multiple_stocks_from_cache(tickers, period="5y"):
         drawdown = close / close.cummax() - 1
         quote = get_current_quote(ticker)
         live_price = quote["price"] if quote else None
-        live_peak = max(float(close.max()) if len(close) else 0.0, float(live_price) if live_price else 0.0)
-        live_drawdown = (
-            float(live_price) / live_peak - 1
-            if live_price and live_peak > 0
-            else float(drawdown.iloc[-1])
-        )
+        live_drawdown, _ = calculate_current_drawdown(close, live_price)
         ax_price.plot(close.index, close.values,
                       color="steelblue", linewidth=1.1)
         ax_price.set_title(ticker)
@@ -151,12 +172,8 @@ def calculate_drawdown_analysis(tickers, period="5y", threshold=0.02):
         drawdown = close / running_peak - 1
         quote = get_current_quote(ticker)
         live_price = quote["price"] if quote else None
-        live_peak = max(float(close.max()) if len(close) else 0.0, float(live_price) if live_price else 0.0)
-        current_drawdowns[ticker] = (
-            float(live_price) / live_peak - 1
-            if live_price and live_peak > 0
-            else float(drawdown.iloc[-1])
-        )
+        live_drawdown, _ = calculate_current_drawdown(close, live_price)
+        current_drawdowns[ticker] = live_drawdown
         # Keep only drawdowns meeting the threshold in the displayed series.
         filtered_drawdown = drawdown.where(drawdown <= -threshold)
         series_data[ticker] = filtered_drawdown.rename(ticker)
@@ -311,8 +328,12 @@ def calculate_drawdown(ticker="SPY", start_date=None, window=180):
         max_drawdown_date = drawdown.idxmin().values[0]
 
         # Calculate current drawdown
-        current_drawdown = drawdown.iloc[-1].values[0]
         current_date = pd.to_datetime(drawdown.index[-1])
+        quote = get_current_quote(ticker)
+        current_price = quote["price"] if quote else None
+        current_drawdown, _ = calculate_current_drawdown(close, current_price)
+        if current_price is None:
+            current_price = float(close.iloc[-1])
 
         # Print results
         print(f"\n{ticker} Drawdown Analysis:")
@@ -345,11 +366,6 @@ def calculate_drawdown(ticker="SPY", start_date=None, window=180):
         ax1.grid(True)
 
         # Plot current price point
-        ticker_obj = yf.Ticker(ticker, session=session)
-        print(ticker_obj.info.get("preMarketPrice"))
-        current_price = ticker_obj.info.get("preMarketPrice") if ticker_obj.info.get(
-            "preMarketPrice") else ticker_obj.info.get("last_price")
-
         price_annotation = f"Current\n${current_price:.2f}"
         if current_price > 1000:
             price_annotation = f"Current\n${current_price:,.0f}"
@@ -358,7 +374,7 @@ def calculate_drawdown(ticker="SPY", start_date=None, window=180):
         else:
             pass
         # Plot current price point
-        ax1.plot(current_date, stock['Close'].iloc[-1], 'ro', markersize=10)
+        ax1.plot(current_date, current_price, 'ro', markersize=10)
         ax1.annotate(price_annotation,
                      xy=(current_date, current_price),
                      xytext=(+40, 30),
@@ -457,12 +473,11 @@ def main(tickers=["AAPL", "intc", "GOOG", "nvda", "SPY"]):
             )
 
             # Get current values (ensure scalar values)
-            ticker_obj = yf.Ticker(ticker, session=session)
-            # print(ticker_obj.info.get("preMarketPrice") )
-            current_price = ticker_obj.info.get("preMarketPrice") if ticker_obj.info.get(
-                "preMarketPrice") else ticker_obj.history(
-                period='1d').iloc[-1]['Close']
-            current_drawdown = float(drawdown.iloc[-1])
+            quote = get_current_quote(ticker)
+            current_price = quote["price"] if quote else None
+            current_drawdown, _ = calculate_current_drawdown(stock["Close"], current_price)
+            if current_price is None:
+                current_price = float(stock["Close"].iloc[-1])
             current_date = drawdown.index[-1]
 
             # Calculate max drawdown and its date (ensure scalar values)
