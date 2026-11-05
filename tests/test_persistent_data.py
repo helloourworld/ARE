@@ -74,6 +74,39 @@ def test_get_data_persistent_initial_daily_download_uses_since_2000(tmp_path, mo
     }]
 
 
+def test_get_data_persistent_handles_mixed_timezone_download_index(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "data"
+    cache_dir.mkdir()
+    yahoo = DummyYF(pd.DataFrame(
+        {
+            "Open": [10.0, 11.0],
+            "High": [11.0, 12.0],
+            "Low": [9.0, 10.0],
+            "Close": [10.5, 11.5],
+            "Volume": [1000, 1100],
+        },
+        index=pd.Index(
+            ["2026-03-06 15:00:00-05:00", "2026-03-09 15:00:00-04:00"],
+            dtype=object,
+        ),
+    ))
+
+    monkeypatch.setattr(data_cache, "DATA_DIR", cache_dir)
+    monkeypatch.setattr(data_cache, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(data_cache, "yf", yahoo)
+    monkeypatch.setattr(data_cache, "IB_FALLBACK_ENABLED", False)
+
+    result = data_cache.get_data_persistent("AAPL", interval="1m", period="7d")
+
+    assert result["Close"].tolist() == [10.5, 11.5]
+    assert str(result.index.tz) == data_cache.STORAGE_TIMEZONE
+    assert result.index.tolist() == [
+        pd.Timestamp("2026-03-06 15:00:00", tz=data_cache.STORAGE_TIMEZONE),
+        pd.Timestamp("2026-03-09 15:00:00", tz=data_cache.STORAGE_TIMEZONE),
+    ]
+    assert (cache_dir / "cache_AAPL_1m.csv").exists()
+
+
 def test_index_fund_initial_download_uses_inception_dates(monkeypatch):
     assert data_cache._daily_history_start("SPY", "1d") == "1993-01-29"
     assert data_cache._daily_history_start("QQQ", "1d") == "1999-03-10"

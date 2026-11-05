@@ -114,7 +114,12 @@ def _normalize_yf_df(df: pd.DataFrame, interval: str = "1d") -> pd.DataFrame:
     
     # Coerce index to datetime, then normalize it for the requested interval.
     if not isinstance(df.index, pd.DatetimeIndex):
-        coerced_index = pd.to_datetime(df.index, errors="coerce")
+        try:
+            coerced_index = pd.to_datetime(df.index, errors="coerce")
+        except ValueError as exc:
+            if "Mixed timezones detected" not in str(exc):
+                raise
+            coerced_index = pd.to_datetime(df.index, errors="coerce", utc=True)
         valid_mask = ~coerced_index.isna()
         df = df.loc[valid_mask].copy()
         coerced_index = coerced_index[valid_mask]
